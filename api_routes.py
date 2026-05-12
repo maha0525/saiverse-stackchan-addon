@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from saiverse.addon_deps import get_manager
@@ -36,6 +37,52 @@ from vessel_manager import VesselSession, get_vessel_manager  # noqa: E402
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_ADDON_DIR = Path(__file__).parent
+
+
+# ============================================================================
+# Static: Web Serial フラッシュ用 setup ページ + ファームウェアバイナリ配信
+# ============================================================================
+
+@router.get("/setup", response_class=HTMLResponse)
+async def setup_ui_page() -> HTMLResponse:
+    """Web Serial による esptool-js フラッシュ用静的 HTML を返す。
+
+    AddonManager UI の Panel.tsx から `window.open(addonApiBase + '/setup')`
+    で開かれる。ユーザーは Chrome / Edge ブラウザで Stack-chan を USB 接続し、
+    このページからファームウェアを書き込む。
+    """
+    html_path = _ADDON_DIR / "setup_ui" / "index.html"
+    if not html_path.exists():
+        return HTMLResponse(
+            "<h1>setup_ui not bundled</h1>"
+            "<p>setup_ui/index.html がアドオンに同梱されていません。</p>",
+            status_code=404,
+        )
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+@router.get("/firmware.bin")
+async def firmware_binary() -> Response:
+    """配布用ファームウェアバイナリ。setup ページから fetch されて
+    esptool-js で書き込まれる。
+
+    ``firmware/dist/firmware.bin`` (PlatformIO ビルド成果物) があればそれを返す。
+    無ければ 404 + プレーンテキスト案内 (まだビルドされていない開発初期段階用)。
+    """
+    bin_path = _ADDON_DIR / "firmware" / "dist" / "firmware.bin"
+    if not bin_path.exists():
+        return Response(
+            content=(
+                "firmware.bin not bundled. "
+                "Run `pio run` in expansion_data/saiverse-stackchan-addon/firmware/ "
+                "and copy .pio/build/m5stack-cores3/firmware.bin to firmware/dist/."
+            ),
+            status_code=404,
+            media_type="text/plain",
+        )
+    return FileResponse(bin_path, media_type="application/octet-stream")
 
 
 # ============================================================================

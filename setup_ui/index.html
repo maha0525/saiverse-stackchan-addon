@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <title>Stack-chan ファーム書き込み</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+                "Helvetica Neue", Arial, sans-serif;
+            background: #1a1a1a;
+            color: #ddd;
+            margin: 0;
+            padding: 24px;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+        }
+        h1 {
+            font-size: 24px;
+            margin-top: 0;
+            color: #fff;
+        }
+        .info {
+            background: #222;
+            border: 1px solid #444;
+            padding: 12px 16px;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+        .info ol {
+            margin: 8px 0;
+            padding-left: 20px;
+        }
+        .controls {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 8px 16px;
+            font-size: 14px;
+            background: #264;
+            color: #fff;
+            border: 1px solid #4a8;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:disabled {
+            background: #333;
+            color: #666;
+            border-color: #444;
+            cursor: not-allowed;
+        }
+        #status {
+            padding: 8px 12px;
+            background: #222;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+        #status.ok {
+            background: #264;
+            color: #cfc;
+        }
+        #status.error {
+            background: #622;
+            color: #fcc;
+        }
+        #log {
+            background: #0d0d0d;
+            color: #9c9;
+            padding: 12px;
+            border-radius: 4px;
+            font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 360px;
+            overflow-y: auto;
+            border: 1px solid #333;
+        }
+        .progress {
+            background: #333;
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 8px 0;
+        }
+        .progress-bar {
+            background: #4a8;
+            height: 100%;
+            transition: width 0.3s;
+        }
+        .warn {
+            color: #fc6;
+        }
+        .unsupported {
+            background: #622;
+            color: #fcc;
+            padding: 16px;
+            border-radius: 4px;
+            border: 1px solid #844;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Stack-chan ファーム書き込み</h1>
+
+    <div class="info">
+        <strong>手順:</strong>
+        <ol>
+            <li>Stack-chan の電源を入れて USB-C で PC に接続</li>
+            <li>「シリアルポートを選択」を押し、ポップアップから USB Serial Device を選ぶ</li>
+            <li>「書き込み開始」を押す (完了まで 30 秒〜1 分)</li>
+            <li>完了後、Stack-chan が自動再起動 → AP モード "Stack-chan-Setup" が起動</li>
+            <li>スマホ等で AP に接続し、Wi-Fi 設定 + Vessel ID + Device Token を入力</li>
+        </ol>
+        <span class="warn">※ Chrome / Edge 等 Web Serial 対応ブラウザが必要。Firefox / Safari は非対応。</span>
+    </div>
+
+    <div id="unsupportedWarning" class="unsupported" style="display:none">
+        このブラウザは Web Serial API に対応していません。Chrome または Edge をお使いください。
+    </div>
+
+    <div class="controls">
+        <button id="connectBtn">シリアルポートを選択</button>
+        <button id="flashBtn" disabled>書き込み開始</button>
+        <button id="disconnectBtn" disabled>切断</button>
+    </div>
+
+    <div id="status">準備中...</div>
+    <div class="progress" style="display:none" id="progressBox">
+        <div class="progress-bar" id="progressBar" style="width: 0%"></div>
+    </div>
+
+    <pre id="log"></pre>
+</div>
+
+<script type="module">
+import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.4/lib/index.js?module";
+
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+const status = $("status");
+
+function setStatus(msg, cls = "") {
+    status.textContent = msg;
+    status.className = cls;
+}
+function appendLog(msg) {
+    log.textContent += msg;
+    log.scrollTop = log.scrollHeight;
+}
+function setProgress(pct) {
+    $("progressBox").style.display = "block";
+    $("progressBar").style.width = pct + "%";
+}
+
+if (!("serial" in navigator)) {
+    $("unsupportedWarning").style.display = "block";
+    $("connectBtn").disabled = true;
+    setStatus("Web Serial 非対応ブラウザ", "error");
+} else {
+    setStatus("シリアルポートを選択してください");
+}
+
+let transport = null;
+let esploader = null;
+
+const terminal = {
+    clean: () => { log.textContent = ""; },
+    writeLine: (data) => appendLog(data + "\n"),
+    write: (data) => appendLog(data),
+};
+
+$("connectBtn").addEventListener("click", async () => {
+    try {
+        const port = await navigator.serial.requestPort({});
+        transport = new Transport(port, true);
+        esploader = new ESPLoader({
+            transport,
+            baudrate: 921600,
+            terminal,
+            debugLogging: false,
+        });
+        setStatus("接続中...");
+        const chip = await esploader.main();
+        appendLog(`Detected chip: ${chip}\n`);
+        setStatus(`接続済み: ${chip}`, "ok");
+        $("connectBtn").disabled = true;
+        $("flashBtn").disabled = false;
+        $("disconnectBtn").disabled = false;
+    } catch (err) {
+        setStatus("接続失敗: " + (err?.message ?? err), "error");
+        appendLog("[ERROR] " + (err?.stack ?? err) + "\n");
+    }
+});
+
+$("flashBtn").addEventListener("click", async () => {
+    if (!esploader) return;
+    try {
+        setStatus("ファームウェアダウンロード中...");
+        const binResp = await fetch("../firmware.bin");
+        if (!binResp.ok) {
+            throw new Error(`firmware.bin not available (HTTP ${binResp.status}). サーバ側でファームウェアがまだビルド/配置されていない可能性があります。`);
+        }
+        const binArrayBuffer = await binResp.arrayBuffer();
+        appendLog(`firmware.bin loaded: ${binArrayBuffer.byteLength} bytes\n`);
+
+        // ESPLoader.write_flash は string データを期待 (バイト列を string にする)
+        const binString = arrayBufferToBinaryString(binArrayBuffer);
+
+        setStatus("書き込み中... (中断しないでください)");
+        $("flashBtn").disabled = true;
+
+        await esploader.writeFlash({
+            fileArray: [
+                {
+                    data: binString,
+                    address: 0x10000, // app partition 開始アドレス (default_8MB.csv)
+                },
+            ],
+            flashSize: "keep",
+            flashMode: "keep",
+            flashFreq: "keep",
+            eraseAll: false,
+            compress: true,
+            reportProgress: (fileIndex, written, total) => {
+                const pct = Math.round((written / total) * 100);
+                setProgress(pct);
+                setStatus(`書き込み中: ${pct}% (${written}/${total} bytes)`);
+            },
+        });
+
+        setProgress(100);
+        setStatus("書き込み完了。デバイスをリセットしています...", "ok");
+        await esploader.hardReset();
+        setStatus("完了! Stack-chan が再起動して AP モードに入ります。", "ok");
+    } catch (err) {
+        setStatus("書き込み失敗: " + (err?.message ?? err), "error");
+        appendLog("[ERROR] " + (err?.stack ?? err) + "\n");
+        $("flashBtn").disabled = false;
+    }
+});
+
+$("disconnectBtn").addEventListener("click", async () => {
+    try {
+        if (transport) {
+            await transport.disconnect();
+        }
+    } catch (err) {
+        appendLog("[disconnect] " + (err?.message ?? err) + "\n");
+    } finally {
+        transport = null;
+        esploader = null;
+        $("connectBtn").disabled = false;
+        $("flashBtn").disabled = true;
+        $("disconnectBtn").disabled = true;
+        setStatus("切断しました");
+    }
+});
+
+function arrayBufferToBinaryString(buffer) {
+    // esptool-js writeFlash は binary string を要求する
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const slice = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, slice);
+    }
+    return binary;
+}
+</script>
+</body>
+</html>

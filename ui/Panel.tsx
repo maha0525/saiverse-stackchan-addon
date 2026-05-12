@@ -167,9 +167,17 @@ export default function StackchanVesselPanel({ addonApiBase }: AddonPanelProps) 
                             <span style={panelStyles.tokenValue}>{pairResult.building_id}</span>
                         </div>
                     </div>
-                    <button onClick={() => setPairResult(null)} style={panelStyles.tokenCloseBtn}>
-                        閉じる
-                    </button>
+                    <div style={{ display: "flex", gap: "6px", marginTop: "6px" }}>
+                        <button
+                            onClick={() => window.open(`${addonApiBase}/setup`, "_blank")}
+                            style={panelStyles.tokenFlashBtn}
+                        >
+                            ファーム書き込みページを開く
+                        </button>
+                        <button onClick={() => setPairResult(null)} style={panelStyles.tokenCloseBtn}>
+                            閉じる
+                        </button>
+                    </div>
                 </div>
             )}
 
@@ -303,12 +311,20 @@ const panelStyles: Record<string, React.CSSProperties> = {
         color: "#fff",
     },
     tokenCloseBtn: {
-        marginTop: "6px",
-        padding: "2px 8px",
+        padding: "4px 10px",
         fontSize: "11px",
         background: "#1a3a2a",
         color: "#cfc",
         border: "1px solid #4a8",
+        borderRadius: "3px",
+        cursor: "pointer",
+    },
+    tokenFlashBtn: {
+        padding: "4px 10px",
+        fontSize: "11px",
+        background: "#246",
+        color: "#cdf",
+        border: "1px solid #48a",
         borderRadius: "3px",
         cursor: "pointer",
     },
