@@ -75,4 +75,9 @@ def on_persona_speak(
         "stackchan speak_hook: forwarding audio to vessel_id=%s persona=%s msg=%s",
         target_session.vessel_id, persona_id, message_id,
     )
-    start_streaming(message_id, target_session.ws, target_session.event_loop)
+    start_streaming(
+        message_id,
+        target_session.ws,
+        target_session.event_loop,
+        vessel_id=target_session.vessel_id,
+    )

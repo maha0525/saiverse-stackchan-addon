@@ -26,7 +26,6 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include "MP3DecoderHelix.h"  // Phase 2: MP3 → PCM デコーダ
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
@@ -52,42 +51,58 @@ unsigned long lastPingMs = 0;
 uint32_t pingSeq = 0;
 
 // ============================================================================
-// Phase 2: MP3 ストリーミング再生 (FreeRTOS 別タスク分離)
+// Phase 2 (PCM 直送版): ストリーミング再生
 // ============================================================================
-// voice-tts → audio_stream_bridge → WS binary frame → 本ファームで MP3 受信 →
-// libhelix MP3 デコーダ → コールバックで PCM を取得 → M5.Speaker.playRaw()
-// で I2S 出力。
+// voice-tts は PCM (signed 16-bit little-endian) を audio_stream_bridge 経由で
+// WS binary frame として送ってくる。本ファームは MP3 decode を介さず、PCM を
+// 直接 M5.Speaker.playRaw に渡す。
 //
-// 重要: WStype_BIN ハンドラ内で直接 mp3Decoder.write() + M5.Speaker.playRaw()
-// を呼ぶと、デコード/再生がメインタスクを長時間占有して WebSocketsClient.loop()
-// が回らなくなる。すると WebSocket の keepalive が破綻してサーバ側から接続を
-// 切られる (実機テストで WARNING ログ "Unexpected ASGI message 'websocket.send'
-// after sending 'websocket.close'" として観測された)。
+// 旧設計 (MP3 + libhelix) は frame sync 失敗で「途中で切れて次が始まる」
+// 問題があったため廃止。voice-tts 本体の sounddevice 経路と同じ「PCM を直接
+// 再生する」アプローチに合わせた。
 //
-// 対策: WStype_BIN は受信バイトをリングバッファに push するだけの軽量処理に
-// 留め、Core 0 上の別タスク (audioPlaybackTask) で「リングバッファから読む →
-// MP3 デコード → I2S 出力」を行う。これで Core 1 (Arduino loop) は WebSocket
-// 処理に専念できる。
+// スレッド設計:
+//   - WStype_BIN ハンドラ (Core 1 / Arduino loop): ringbuf に push するだけ
+//   - audioPlaybackTask (Core 0): ringbuf から PCM を取り出して playRaw に渡す
+//
+// playRaw の制約:
+//   M5.Speaker.playRaw は data を内部コピーせず ポインタだけ保存する
+//   (Speaker_Class.cpp:1029、hpp の @attention 明示)。受信した PCM を直接
+//   渡すと、ringbuf の循環で同じアドレスが上書きされて壊れる。
+//   → 自前の rotation buffer (4 個) にコピーしてから渡す。
+//   M5.Speaker は 1 channel あたり slot=2 (current + next) なので 4 buffer
+//   で余裕。
 
 static bool audioPlaying = false;
 static RingbufHandle_t audioRingBuf = nullptr;
 static TaskHandle_t audioTaskHandle = nullptr;
 static constexpr size_t AUDIO_RINGBUF_SIZE = 32 * 1024;  // 32 KB
 
-// libhelix のデコードコールバック (Core 0 上の audioPlaybackTask で呼ばれる)
-// signature: typedef void (*MP3DataCallback)(MP3FrameInfo&, short*, size_t, void*)
-// MP3FrameInfo はグローバル名前空間 (libhelix:: 修飾なし)
-static void onMP3Decoded(MP3FrameInfo &info, short *pcm, size_t len, void * /*ref*/) {
-    // len はバイト単位。short (= int16_t) のサンプル数は / 2
-    const size_t samples = len / sizeof(short);
-    M5.Speaker.playRaw(pcm, samples, info.samprate,
-                       info.nChans == 2, 255, 0);
-}
+// audio_start で受信した PCM フォーマット (デフォルト: 32 kHz mono)。
+// voice-tts は GPT-SoVITS の出力に合わせて sample_rate を変える可能性が
+// あるので、毎回 audio_start で更新する。
+static volatile uint32_t currentSampleRate = 32000;
+static volatile uint8_t currentChannels = 1;
 
-libhelix::MP3DecoderHelix mp3Decoder(onMP3Decoded);
+// PCM rotation buffer (ringbuf → M5.Speaker.playRaw 受け渡し用)。
+// 1 buffer = 16384 samples = 32 KB (16-bit mono)。
+//
+// 重要: xRingbufferReceive (BYTEBUF) は **現時点で連続して取れる byte 列を
+// すべて** 返す挙動。bridge が 8 KB chunk を送っても、ringbuf に複数連続して
+// 溜まっている時は 16 KB / 22 KB / 32 KB 等まとめて取れる。1 buffer のサイズが
+// 小さいと超過分を truncate するしかなく、音が途切れる原因になる。
+// よって ringbuf 全体 (32 KB) と同じサイズに揃える。
+//
+// メモリ: 4 buffer × 32 KB = 128 KB (ESP32-S3 DRAM 512 KB のうち 25%)。
+// M5.Speaker は 1 channel あたり slot=2 (current + next) で、3 つ目以降は
+// wait する。4 buffer rotation で wait による pace と矛盾せず動く。
+static constexpr size_t PCM_ROT_COUNT = 4;
+static constexpr size_t PCM_ROT_MAX_SAMPLES = 16384;  // = 32 KB
+static int16_t pcmRotBuf[PCM_ROT_COUNT][PCM_ROT_MAX_SAMPLES];
+static size_t pcmRotIdx = 0;
 
-// Core 0 で動くオーディオ処理タスク。リングバッファから WS 受信バイトを
-// 取り出して MP3 デコーダに流し続ける。
+// Core 0 で動くオーディオ処理タスク。ringbuf から PCM bytes を取り出して
+// playRaw に流す。
 static void audioPlaybackTask(void * /*param*/) {
     while (true) {
         if (!audioPlaying || audioRingBuf == nullptr) {
@@ -95,12 +110,32 @@ static void audioPlaybackTask(void * /*param*/) {
             continue;
         }
         size_t itemSize = 0;
-        // 50ms タイムアウト付きで受信。データが無ければ次の loop へ
         uint8_t *data = (uint8_t *)xRingbufferReceive(
             audioRingBuf, &itemSize, pdMS_TO_TICKS(50)
         );
         if (data != nullptr && itemSize > 0) {
-            mp3Decoder.write(data, itemSize);
+            // PCM 16-bit、sample 数 = byte 数 / 2
+            size_t sampleCount = itemSize / sizeof(int16_t);
+            if (sampleCount > PCM_ROT_MAX_SAMPLES) {
+                // 想定 (8KB chunk = 4096 samples) を超えた場合の保護
+                Serial.printf(
+                    "[audio] chunk too large: %u samples (max=%u), truncate\n",
+                    (unsigned)sampleCount, (unsigned)PCM_ROT_MAX_SAMPLES
+                );
+                sampleCount = PCM_ROT_MAX_SAMPLES;
+            }
+            int16_t *dst = pcmRotBuf[pcmRotIdx];
+            memcpy(dst, data, sampleCount * sizeof(int16_t));
+            pcmRotIdx = (pcmRotIdx + 1) % PCM_ROT_COUNT;
+
+            // M5.Speaker.playRaw シグネチャ:
+            //   playRaw(data, array_len, sample_rate, stereo, repeat=1, channel=-1, stop=false)
+            // - array_len は int16_t 個数 (sample 数)
+            // - channel=0 固定で連続再生 (slot=2 の wait で自動 pace)
+            M5.Speaker.playRaw(
+                dst, sampleCount, currentSampleRate,
+                currentChannels == 2, 1, 0
+            );
             vRingbufferReturnItem(audioRingBuf, (void *)data);
         }
     }
@@ -193,18 +228,50 @@ static void onWsMessage(uint8_t *payload, size_t length) {
         Serial.printf("[ws] <- echo_reply: %s\n", text);
         displayStatus("Echo reply:", String(text));
     } else if (strcmp(type, "audio_start") == 0) {
-        // Phase 2: TTS 発話開始通知 → MP3 デコーダ初期化、以後 WStype_BIN を受け入れる
+        // Phase 2 (PCM 直送): 発話開始通知 + PCM フォーマット
+        // 期待 JSON: {type, message_id, sample_rate, channels, format="pcm_s16le"}
         const char *msgId = doc["message_id"] | "?";
-        Serial.printf("[ws] <- audio_start msg=%s\n", msgId);
-        mp3Decoder.begin();
+        uint32_t sr = doc["sample_rate"] | 32000;
+        uint8_t ch = doc["channels"] | 1;
+        const char *fmt = doc["format"] | "pcm_s16le";
+
+        // 割り込み再生: 既に再生中なら前の発話を中断する
+        // (1) audioPlaying=false で audio task を一時停止
+        // (2) ring buffer を空にする
+        // (3) M5.Speaker.stop で I2S DMA の再生中音を停止
+        // この間に新 sample_rate / channels を設定してから audioPlaying=true で再開
+        if (audioPlaying) {
+            Serial.println("[audio] interrupting current playback");
+            audioPlaying = false;
+            // audio task が次の iter で wait に入るまで少し待つ
+            // (xRingbufferReceive 50ms timeout 内に入っている可能性)
+            delay(5);
+            // ring buffer drain
+            if (audioRingBuf != nullptr) {
+                size_t itemSize = 0;
+                while (true) {
+                    uint8_t *data = (uint8_t *)xRingbufferReceive(
+                        audioRingBuf, &itemSize, 0  // no wait
+                    );
+                    if (data == nullptr) break;
+                    vRingbufferReturnItem(audioRingBuf, (void *)data);
+                }
+            }
+            // I2S DMA の再生中バッファを停止 (channel=0 のみ)
+            M5.Speaker.stop(0);
+        }
+
+        currentSampleRate = sr;
+        currentChannels = ch;
+        Serial.printf("[ws] <- audio_start msg=%s sr=%u ch=%u fmt=%s\n",
+                      msgId, (unsigned)sr, (unsigned)ch, fmt);
         audioPlaying = true;
         displayStatus("Speaking...", String("msg: ") + String(msgId).substring(0, 12));
     } else if (strcmp(type, "audio_end") == 0) {
-        // Phase 2: TTS 発話終了通知 → MP3 デコーダを閉じてアイドル状態へ
+        // Phase 2 (PCM 直送): 発話終了通知 → アイドル状態へ
         const char *msgId = doc["message_id"] | "?";
         Serial.printf("[ws] <- audio_end msg=%s\n", msgId);
         audioPlaying = false;
-        mp3Decoder.end();
     } else if (strcmp(type, "error") == 0) {
         const char *code = doc["code"] | "?";
         const char *reason = doc["reason"] | "?";
@@ -235,11 +302,10 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
             onWsMessage(payload, length);
             break;
         case WStype_BIN:
-            // Phase 2: TTS MP3 chunk (audio_start 後、audio_end までの binary)
-            // WS ハンドラはメインタスクで動くため、ここでデコードまでやると
-            // WebSocketsClient.loop() が回らなくなり接続が切れる。
-            // リングバッファに push するだけに留め、Core 0 の audioPlaybackTask
-            // でデコード + I2S 出力を行う。
+            // Phase 2 (PCM 直送): PCM 16-bit chunk (audio_start 後、audio_end までの binary)
+            // WS ハンドラはメインタスクで動くため、ここで playRaw まで呼ぶと
+            // WebSocketsClient.loop() が回らなくなる。ring buffer に push する
+            // だけに留め、Core 0 の audioPlaybackTask が playRaw に渡す。
             if (audioPlaying && audioRingBuf != nullptr) {
                 if (xRingbufferSend(audioRingBuf, payload, length,
                                     pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -306,6 +372,14 @@ static bool setupWebSocket() {
     }
     webSocket.onEvent(onWsEvent);
     webSocket.setReconnectInterval(RECONNECT_INTERVAL_MS);
+    // WebSocket protocol-level ping/pong (binary opcode 0x9 / 0xA、JSON の
+    // sendPing とは別系統)。library 自身が定期的に ping を送り、pong を待つ。
+    // アイドル時の TCP 半生半死状態を library レベルで検知して disconnect →
+    // setReconnectInterval により自動再接続が走るようにする。
+    //
+    // 引数: ping_interval (15s) / pong_timeout (3s) / disconnect_timeout_count (2)
+    // = 15 秒ごとに ping、3 秒以内に pong 返らなければ失敗、2 回連続失敗で切断
+    webSocket.enableHeartbeat(15000, 3000, 2);
     return true;
 }
 
@@ -476,6 +550,23 @@ void loop() {
     if (isAuthenticated && (millis() - lastPingMs > PING_INTERVAL_MS)) {
         sendPing();
         lastPingMs = millis();
+    }
+
+    // 10 秒ごとに状態 dump (disconnect 前後の状況を後から追跡できるよう)
+    static unsigned long lastDebugLogMs = 0;
+    constexpr unsigned long DEBUG_LOG_INTERVAL_MS = 10000;
+    if (millis() - lastDebugLogMs > DEBUG_LOG_INTERVAL_MS) {
+        Serial.printf(
+            "[debug] uptime=%lus auth=%d audio=%d ws_conn=%d "
+            "ringbuf_free=%u heap_free=%u\n",
+            millis() / 1000,
+            (int)isAuthenticated,
+            (int)audioPlaying,
+            (int)webSocket.isConnected(),
+            audioRingBuf ? (unsigned)xRingbufferGetCurFreeSize(audioRingBuf) : 0u,
+            (unsigned)ESP.getFreeHeap()
+        );
+        lastDebugLogMs = millis();
     }
 
     // 設定リセット: 画面長押し (5 秒)
