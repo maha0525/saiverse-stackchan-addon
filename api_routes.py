@@ -41,7 +41,12 @@ LOGGER = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_ADDON_DIR = Path(__file__).parent
+# addon_loader の spec_from_file_location 経由ロードでは __file__ が
+# 相対 path や非正規化 path になる可能性がある。.resolve() で確実に
+# 絶対化 + 正規化して、firmware/dist/firmware.bin 等の path 解決を
+# 安定させる。
+_ADDON_DIR = Path(__file__).resolve().parent
+LOGGER.info("stackchan-addon: _ADDON_DIR resolved to %s", _ADDON_DIR)
 
 
 # ============================================================================
@@ -75,10 +80,11 @@ async def firmware_binary() -> Response:
     無ければ 404 + プレーンテキスト案内 (まだビルドされていない開発初期段階用)。
     """
     bin_path = _ADDON_DIR / "firmware" / "dist" / "firmware.bin"
+    LOGGER.info("firmware_binary: looking for %s (exists=%s)", bin_path, bin_path.exists())
     if not bin_path.exists():
         return Response(
             content=(
-                "firmware.bin not bundled. "
+                f"firmware.bin not found at: {bin_path}\n\n"
                 "Run `pio run` in expansion_data/saiverse-stackchan-addon/firmware/ "
                 "and copy .pio/build/m5stack-cores3/firmware.bin to firmware/dist/."
             ),
