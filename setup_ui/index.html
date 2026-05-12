@@ -278,7 +278,9 @@ $("flashBtn").addEventListener("click", async () => {
 
         setProgress(100);
         setStatus("書き込み完了。デバイスをリセットしています...", "ok");
-        await esploader.hardReset();
+        // v0.6.0 で hardReset() は削除され after("hard_reset") に統合された
+        // (PR #211 "Allow custom reset in after function")
+        await esploader.after("hard_reset");
         setStatus("完了! Stack-chan が再起動して AP モードに入ります。", "ok");
     } catch (err) {
         setStatus("書き込み失敗: " + (err?.message ?? err), "error");
