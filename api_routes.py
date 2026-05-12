@@ -335,7 +335,25 @@ async def vessel_endpoint(ws: WebSocket) -> None:
             event_loop=asyncio.get_running_loop(),
             firmware_version=firmware_version,
         )
-        vm.register_session(session)
+        old_session = vm.register_session(session)
+        if old_session is not None:
+            # 同じ vessel_id で既存 session が生き残っていた (TCP half-open 等で
+            # 古い vessel_endpoint task の receive_text が WebSocketDisconnect を
+            # 検知できていないケース)。古い WS を強制 close して、古い task の
+            # receive 待ちを叩き起こす。
+            LOGGER.info(
+                "vessel_endpoint: closing stale session ws vessel_id=%s",
+                vessel_id,
+            )
+            try:
+                await old_session.ws.close(
+                    code=1001, reason="replaced by new connection"
+                )
+            except Exception:
+                LOGGER.debug(
+                    "vessel_endpoint: close of stale ws failed (may already be closed)",
+                    exc_info=True,
+                )
 
         await ws.send_json({
             "type": "welcome",
@@ -382,5 +400,7 @@ async def vessel_endpoint(ws: WebSocket) -> None:
         except Exception:
             LOGGER.debug("vessel_endpoint: close failed in error handler")
     finally:
-        if vessel_id:
-            vm.unregister_session(vessel_id)
+        if vessel_id and session is not None:
+            # session 引数付きで unregister すると、上書きされた古い session が
+            # 終了時に新 session を誤って消すのを防ぐ。
+            vm.unregister_session(vessel_id, session)

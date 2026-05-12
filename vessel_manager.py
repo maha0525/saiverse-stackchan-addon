@@ -243,16 +243,47 @@ class VesselManager:
 
     # ----- Session management (in-memory) -----
 
-    def register_session(self, session: VesselSession) -> None:
+    def register_session(self, session: VesselSession) -> VesselSession | None:
+        """新しい session を登録する。同じ vessel_id の既存 session があれば
+        上書きする。古い session が返るので、呼び出し側で WebSocket を close
+        するなどの後処理に使える (古い task の receive ループから抜けさせる)。
+
+        Returns:
+            上書きされた古い session (なければ None)
+        """
         with self._lock:
+            old = self._sessions.get(session.vessel_id)
             self._sessions[session.vessel_id] = session
+        if old is not None and old is not session:
+            LOGGER.warning(
+                "VesselManager: session replaced (old session still alive?) "
+                "vessel_id=%s",
+                session.vessel_id,
+            )
         LOGGER.info(
             "VesselManager: session registered vessel_id=%s building_id=%s",
             session.vessel_id, session.building_id,
         )
+        return old if (old is not None and old is not session) else None
 
-    def unregister_session(self, vessel_id: str) -> None:
+    def unregister_session(
+        self, vessel_id: str, session: Optional[VesselSession] = None
+    ) -> None:
+        """session を登録解除する。
+
+        session 引数を渡した場合、現在登録されている session が一致するときだけ
+        削除する (上書き済みの古い session が finally で誤って新 session を消す
+        のを防ぐ)。session 引数なしは backwards-compat の挙動 (無条件削除)。
+        """
         with self._lock:
+            current = self._sessions.get(vessel_id)
+            if session is not None and current is not session:
+                LOGGER.info(
+                    "VesselManager: unregister skipped (not current session) "
+                    "vessel_id=%s",
+                    vessel_id,
+                )
+                return
             self._sessions.pop(vessel_id, None)
         LOGGER.info("VesselManager: session unregistered vessel_id=%s", vessel_id)
 
