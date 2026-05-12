@@ -214,7 +214,18 @@ $("flashBtn").addEventListener("click", async () => {
     if (!esploader) return;
     try {
         setStatus("ファームウェアダウンロード中...");
-        const binResp = await fetch("../firmware.bin");
+        // 相対 URL (../firmware.bin) だと Next.js Route Handler との組み合わせで
+        // 解決が想定とズレるケースがあるため、絶対 path で明示的にプロキシ経路に
+        // 投げる。setup ページの URL ベース (/api/addon/saiverse-stackchan-addon/)
+        // から firmware.bin を組み立てる。
+        const firmwareUrl = new URL(
+            "../firmware.bin",
+            window.location.href.endsWith("/")
+                ? window.location.href
+                : window.location.href + "/"
+        ).pathname;
+        appendLog(`fetching: ${firmwareUrl}\n`);
+        const binResp = await fetch(firmwareUrl);
         if (!binResp.ok) {
             throw new Error(`firmware.bin not available (HTTP ${binResp.status}). サーバ側でファームウェアがまだビルド/配置されていない可能性があります。`);
         }
