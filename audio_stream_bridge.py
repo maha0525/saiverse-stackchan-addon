@@ -17,7 +17,6 @@ WebSocket binary frame で転送するブリッジ。
 import asyncio
 import logging
 import threading
-import time
 from queue import Empty
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -83,38 +82,26 @@ def _streaming_worker(
     if _audio_subscribe is None:
         return
     try:
-        # voice-tts と本 hook が同じ persona_speak イベントで並行起動するため、
-        # 本 worker が subscribe を呼んだ時点で voice-tts 側の TTS 合成がまだ
-        # start していない (= audio_stream._STREAMS に msg_id がない) ことがある。
-        # その場合 voice-tts の subscribe() は None を返す。
-        # 第一チャンクが yield されて stream が start するまで poll で待つ
-        # (engine 初回 load なら 10-20 秒、2 回目以降は 0.5-1 秒)。
-        queue = None
-        retry_interval = 0.1
-        max_wait = 30.0
-        elapsed = 0.0
-        while elapsed < max_wait:
-            queue = _audio_subscribe(message_id)
-            if queue is not None:
-                break
-            time.sleep(retry_interval)
-            elapsed += retry_interval
-
+        # voice-tts の audio_stream.subscribe() は subscribe-before-open 対応版
+        # (PR: feat(audio_stream): support subscribe-before-open) なら、stream
+        # 未開始時でも placeholder context を作って Queue を返す。よってこの呼び出し
+        # 直後の Queue は (1) 空 (placeholder)、(2) 既に push 済みフレームを seed
+        # 済み、(3) closed なら + sentinel が入った状態、のいずれか。
+        # 古い voice-tts (subscribe-before-open 未対応) では stream 未開始の時
+        # None が返るため、その時は warning ログを出して終了する。
+        queue = _audio_subscribe(message_id)
         if queue is None:
             LOGGER.warning(
-                "audio_stream_bridge: subscribe still None after %.1fs msg_id=%s "
-                "(voice-tts may not have started the stream — TTS engine error?)",
-                elapsed, message_id,
+                "audio_stream_bridge: subscribe returned None msg_id=%s "
+                "(voice-tts が subscribe-before-open 未対応版か、message_id が空)",
+                message_id,
             )
             _send_json_threadsafe(
                 ws, loop, {"type": "audio_end", "message_id": message_id}
             )
             return
 
-        LOGGER.info(
-            "audio_stream_bridge: subscribed msg_id=%s (waited %.2fs)",
-            message_id, elapsed,
-        )
+        LOGGER.info("audio_stream_bridge: subscribed msg_id=%s", message_id)
 
         # S->D: 開始通知 (device がバッファ初期化等を準備するきっかけ)
         _send_json_threadsafe(
