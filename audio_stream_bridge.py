@@ -110,6 +110,7 @@ def _streaming_worker(
 
         chunk_count = 0
         total_bytes = 0
+        ws_alive = True
         while True:
             try:
                 chunk = queue.get(timeout=30.0)
@@ -128,14 +129,25 @@ def _streaming_worker(
                 )
                 break
 
-            _send_bytes_threadsafe(ws, loop, chunk)
+            # send 失敗 (例: device が WS を close した、ASGI 既に close 済み等) なら
+            # ループを抜けて以降の chunk は捨てる。これがないとサーバログに
+            # "Unexpected ASGI message 'websocket.send'..." が何十回も出る。
+            if not _send_bytes_threadsafe(ws, loop, chunk):
+                LOGGER.info(
+                    "audio_stream_bridge: ws send failed, abort msg_id=%s "
+                    "after chunks=%d bytes=%d (device likely disconnected)",
+                    message_id, chunk_count, total_bytes,
+                )
+                ws_alive = False
+                break
             chunk_count += 1
             total_bytes += len(chunk)
 
-        # S->D: 終端通知 (device がバッファを flush して再生終了するきっかけ)
-        _send_json_threadsafe(
-            ws, loop, {"type": "audio_end", "message_id": message_id}
-        )
+        # S->D: 終端通知 (ws が生きてる時だけ送る)
+        if ws_alive:
+            _send_json_threadsafe(
+                ws, loop, {"type": "audio_end", "message_id": message_id}
+            )
     except Exception:
         LOGGER.exception("audio_stream_bridge: worker error msg_id=%s", message_id)
 
@@ -160,13 +172,20 @@ def _send_bytes_threadsafe(
     ws: "WebSocket",
     loop: asyncio.AbstractEventLoop,
     data: bytes,
-) -> None:
-    """別スレッドから WebSocket.send_bytes() を実行する。"""
+) -> bool:
+    """別スレッドから WebSocket.send_bytes() を実行する。
+
+    Returns:
+        True: 送信成功
+        False: 送信失敗 (device disconnect / ASGI close 済み / timeout 等)
+    """
     try:
         future = asyncio.run_coroutine_threadsafe(ws.send_bytes(data), loop)
         future.result(timeout=5.0)
+        return True
     except Exception as e:
         LOGGER.warning(
             "audio_stream_bridge: send_bytes failed (%d bytes): %s",
             len(data), e,
         )
+        return False

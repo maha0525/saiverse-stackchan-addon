@@ -27,6 +27,9 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include "MP3DecoderHelix.h"  // Phase 2: MP3 → PCM デコーダ
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/ringbuf.h"
 
 // ============================================================================
 // 設定 / 状態
@@ -49,16 +52,29 @@ unsigned long lastPingMs = 0;
 uint32_t pingSeq = 0;
 
 // ============================================================================
-// Phase 2: MP3 ストリーミング再生
+// Phase 2: MP3 ストリーミング再生 (FreeRTOS 別タスク分離)
 // ============================================================================
 // voice-tts → audio_stream_bridge → WS binary frame → 本ファームで MP3 受信 →
 // libhelix MP3 デコーダ → コールバックで PCM を取得 → M5.Speaker.playRaw()
-// で I2S 出力。1 発話 = 1 ストリーム、audio_start / audio_chunk (binary) /
-// audio_end の 3 種メッセージ。
+// で I2S 出力。
+//
+// 重要: WStype_BIN ハンドラ内で直接 mp3Decoder.write() + M5.Speaker.playRaw()
+// を呼ぶと、デコード/再生がメインタスクを長時間占有して WebSocketsClient.loop()
+// が回らなくなる。すると WebSocket の keepalive が破綻してサーバ側から接続を
+// 切られる (実機テストで WARNING ログ "Unexpected ASGI message 'websocket.send'
+// after sending 'websocket.close'" として観測された)。
+//
+// 対策: WStype_BIN は受信バイトをリングバッファに push するだけの軽量処理に
+// 留め、Core 0 上の別タスク (audioPlaybackTask) で「リングバッファから読む →
+// MP3 デコード → I2S 出力」を行う。これで Core 1 (Arduino loop) は WebSocket
+// 処理に専念できる。
 
 static bool audioPlaying = false;
+static RingbufHandle_t audioRingBuf = nullptr;
+static TaskHandle_t audioTaskHandle = nullptr;
+static constexpr size_t AUDIO_RINGBUF_SIZE = 32 * 1024;  // 32 KB
 
-// libhelix のデコードコールバック (フレーム単位で呼ばれる)
+// libhelix のデコードコールバック (Core 0 上の audioPlaybackTask で呼ばれる)
 // signature: typedef void (*MP3DataCallback)(MP3FrameInfo&, short*, size_t, void*)
 // MP3FrameInfo はグローバル名前空間 (libhelix:: 修飾なし)
 static void onMP3Decoded(MP3FrameInfo &info, short *pcm, size_t len, void * /*ref*/) {
@@ -69,6 +85,26 @@ static void onMP3Decoded(MP3FrameInfo &info, short *pcm, size_t len, void * /*re
 }
 
 libhelix::MP3DecoderHelix mp3Decoder(onMP3Decoded);
+
+// Core 0 で動くオーディオ処理タスク。リングバッファから WS 受信バイトを
+// 取り出して MP3 デコーダに流し続ける。
+static void audioPlaybackTask(void * /*param*/) {
+    while (true) {
+        if (!audioPlaying || audioRingBuf == nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        size_t itemSize = 0;
+        // 50ms タイムアウト付きで受信。データが無ければ次の loop へ
+        uint8_t *data = (uint8_t *)xRingbufferReceive(
+            audioRingBuf, &itemSize, pdMS_TO_TICKS(50)
+        );
+        if (data != nullptr && itemSize > 0) {
+            mp3Decoder.write(data, itemSize);
+            vRingbufferReturnItem(audioRingBuf, (void *)data);
+        }
+    }
+}
 
 // ============================================================================
 // 画面表示ヘルパ
@@ -200,8 +236,18 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
             break;
         case WStype_BIN:
             // Phase 2: TTS MP3 chunk (audio_start 後、audio_end までの binary)
-            if (audioPlaying) {
-                mp3Decoder.write(payload, length);
+            // WS ハンドラはメインタスクで動くため、ここでデコードまでやると
+            // WebSocketsClient.loop() が回らなくなり接続が切れる。
+            // リングバッファに push するだけに留め、Core 0 の audioPlaybackTask
+            // でデコード + I2S 出力を行う。
+            if (audioPlaying && audioRingBuf != nullptr) {
+                if (xRingbufferSend(audioRingBuf, payload, length,
+                                    pdMS_TO_TICKS(50)) != pdTRUE) {
+                    Serial.printf(
+                        "[ws] ring buffer send timeout (%u bytes dropped)\n",
+                        (unsigned)length
+                    );
+                }
             }
             break;
         case WStype_ERROR:
@@ -351,6 +397,24 @@ void setup() {
     // Phase 2: M5.Speaker を有効化 (TTS ストリーミング再生用)
     M5.Speaker.begin();
     M5.Speaker.setVolume(200);  // 0-255、200 でほぼ最大
+
+    // Phase 2: オーディオ処理を Core 0 の別タスクに分離 (詳細はファイル上部の
+    // コメント参照)。リングバッファに WS 受信を入れて、別タスクでデコード/再生。
+    audioRingBuf = xRingbufferCreate(AUDIO_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
+    if (audioRingBuf == nullptr) {
+        Serial.println("[setup] failed to create audio ring buffer!");
+    } else {
+        xTaskCreatePinnedToCore(
+            audioPlaybackTask,
+            "audio_playback",
+            8192,        // stack size (bytes)
+            nullptr,     // task parameter
+            1,           // priority (低、main loop と同じ程度)
+            &audioTaskHandle,
+            0            // Core 0 (Arduino main loop は Core 1)
+        );
+        Serial.println("[setup] audio_playback task started on core 0");
+    }
 
     Serial.begin(115200);
     delay(200);
