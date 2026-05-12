@@ -125,7 +125,7 @@ static void onWsMessage(uint8_t *payload, size_t length) {
         displayStatus("Status: connected",
                       "building:",
                       String(buildingId),
-                      "BtnB=echo  BtnA(hold)=reset");
+                      "Touch screen 5s = reset");
     } else if (strcmp(type, "pong") == 0) {
         uint32_t seq = doc["seq"] | 0;
         Serial.printf("[ws] <- pong seq=%u\n", seq);
@@ -326,16 +326,25 @@ void setup() {
     setupWiFi();
 
     if (serverUrl.isEmpty() || vesselId.isEmpty() || deviceToken.isEmpty()) {
-        Serial.println("[setup] missing config, halting (hold BtnA 3s to reset)");
+        // ここに来るのは startConfigPortal が完了した直後で値が空のままだった
+        // ケース (ユーザーが入力せず終了した場合等)。通常フローでは到達しない。
+        Serial.println("[setup] missing config after setupWiFi, halting");
         displayStatus("Config missing",
-                      "Hold BtnA 3s",
+                      "Touch screen 5s",
                       "to reset & retry");
+        unsigned long touchStartMs = 0;
         while (true) {
             M5.update();
-            if (M5.BtnA.pressedFor(3000)) {
-                prefs.clear();
-                WiFi.disconnect(true, true);
-                ESP.restart();
+            auto t = M5.Touch.getDetail();
+            if (t.isPressed()) {
+                if (touchStartMs == 0) touchStartMs = millis();
+                else if (millis() - touchStartMs > 5000) {
+                    prefs.clear();
+                    WiFi.disconnect(true, true);
+                    ESP.restart();
+                }
+            } else {
+                touchStartMs = 0;
             }
             delay(50);
         }
@@ -359,19 +368,28 @@ void loop() {
         lastPingMs = millis();
     }
 
-    // 設定リセット: ボタン A 長押し
-    if (M5.BtnA.pressedFor(3000)) {
-        Serial.println("[setup] config reset triggered");
-        displayStatus("Resetting...", "All config will be cleared");
-        prefs.clear();
-        WiFi.disconnect(true, true);
-        delay(2000);
-        ESP.restart();
-    }
-
-    // ボタン B: テスト echo 送信 (実機検証用)
-    if (M5.BtnB.wasPressed() && isAuthenticated) {
-        sendEcho("hello from device");
+    // 設定リセット: 画面長押し (5 秒)
+    //
+    // CoreS3 には Core / Core2 のような物理ボタン A/B/C が無く、M5Unified の
+    // M5.config() デフォルトでは touch button (BtnA/B/C) も有効化されない。
+    // そのため Touch API で画面のどこを押されたかを直接見る。
+    // (Phase 5 で touch を「なでなで」入力として使う際は、リセット用の長押し
+    // 閾値とユーザータッチを区別する設計に拡張する)
+    static unsigned long touchStartMs = 0;
+    auto t = M5.Touch.getDetail();
+    if (t.isPressed()) {
+        if (touchStartMs == 0) {
+            touchStartMs = millis();
+        } else if (millis() - touchStartMs > 5000) {
+            Serial.println("[setup] config reset triggered by 5s touch");
+            displayStatus("Resetting...", "All config will be cleared");
+            prefs.clear();
+            WiFi.disconnect(true, true);
+            delay(2000);
+            ESP.restart();
+        }
+    } else {
+        touchStartMs = 0;
     }
 
     delay(5);

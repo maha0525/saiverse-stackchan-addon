@@ -277,11 +277,19 @@ $("flashBtn").addEventListener("click", async () => {
         });
 
         setProgress(100);
-        setStatus("書き込み完了。デバイスをリセットしています...", "ok");
+        setStatus("書き込み完了。デバイスのリセット指令を送ります...", "ok");
         // v0.6.0 で hardReset() は削除され after("hard_reset") に統合された
-        // (PR #211 "Allow custom reset in after function")
-        await esploader.after("hard_reset");
-        setStatus("完了! Stack-chan が再起動して AP モードに入ります。", "ok");
+        // (PR #211 "Allow custom reset in after function")。
+        // ただし ESP32-S3 内蔵 USB-CDC (M5Stack CoreS3 等) では DTR/RTS の
+        // ハードリセットが効かないケースがあるため、例外は握り潰してユーザーに
+        // 手動 Reset を案内する fallback メッセージを必ず出す。
+        await esploader.after("hard_reset").catch((e) => {
+            appendLog(`[after("hard_reset")] ${e?.message ?? e}\n`);
+        });
+        setStatus(
+            "書き込み完了！\nStack-chan が自動再起動しない場合は、本体側面の Reset ボタンを押してください。",
+            "ok"
+        );
     } catch (err) {
         setStatus("書き込み失敗: " + (err?.message ?? err), "error");
         appendLog("[ERROR] " + (err?.stack ?? err) + "\n");
