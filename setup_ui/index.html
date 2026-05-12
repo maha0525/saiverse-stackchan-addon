@@ -146,12 +146,13 @@
 </div>
 
 <script type="module">
-// esm.sh 経由でロード:
-// esptool-js は内部で atob-lite 等の CommonJS パッケージに依存しているため、
-// unpkg の ?module 変換だと "does not provide an export named 'default'"
-// エラーで停止する。esm.sh は CommonJS → ESM 変換 + 依存解決を一括で行うため、
-// 依存ツリー全体を ESM として正しくロードできる。
-import { ESPLoader, Transport } from "https://esm.sh/esptool-js@0.6.0";
+// esm.sh の ?bundle オプションを指定:
+// esptool-js は stub flasher (esp32 用 Base64 エンコードプログラム) を
+// 内部で atob デコードするが、esm.sh のデフォルト依存解決では
+// atob-lite が正しく置き換えられず "atob: not correctly encoded" エラー
+// になることがある。?bundle で esm.sh 側で全依存を 1 ファイルに bundle
+// してもらい、依存ツリー全体を確定状態で取得する。
+import { ESPLoader, Transport } from "https://esm.sh/esptool-js@0.6.0?bundle";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log");
