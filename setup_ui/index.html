@@ -193,7 +193,11 @@ $("connectBtn").addEventListener("click", async () => {
         transport = new Transport(port, true);
         esploader = new ESPLoader({
             transport,
-            baudrate: 921600,
+            // 921600 だと CoreS3 内蔵 USB-Serial の取りこぼしで
+            // "Failed to write compressed data to flash ... status 201,0"
+            // (deflate CRC 失敗) になることがあった。115200 に落として安定優先。
+            // 書き込み時間は伸びるが、初回セットアップは数分なので許容。
+            baudrate: 115200,
             terminal,
             debugLogging: false,
         });
@@ -254,9 +258,11 @@ $("flashBtn").addEventListener("click", async () => {
 
         await esploader.writeFlash({
             fileArray,
-            flashSize: "keep",
-            flashMode: "keep",
-            flashFreq: "keep",
+            // "keep" だと stub flasher が既存設定を判定しようとして失敗する
+            // ことがあるため、M5Stack CoreS3 (ESP32-S3, 16MB QIO) の値を明示。
+            flashSize: "16MB",
+            flashMode: "dio",
+            flashFreq: "80m",
             eraseAll: false,
             compress: true,
             reportProgress: (fileIndex, written, total) => {
