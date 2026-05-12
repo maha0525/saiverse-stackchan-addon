@@ -146,7 +146,12 @@
 </div>
 
 <script type="module">
-import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.0/lib/index.js";
+// esm.sh 経由でロード:
+// esptool-js は内部で atob-lite 等の CommonJS パッケージに依存しているため、
+// unpkg の ?module 変換だと "does not provide an export named 'default'"
+// エラーで停止する。esm.sh は CommonJS → ESM 変換 + 依存解決を一括で行うため、
+// 依存ツリー全体を ESM として正しくロードできる。
+import { ESPLoader, Transport } from "https://esm.sh/esptool-js@0.6.0";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log");
