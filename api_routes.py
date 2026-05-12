@@ -10,7 +10,10 @@ addon_loader が ``/api/addon/saiverse-stackchan-addon`` プレフィックス�
 
 詳細プロトコル: docs/intent/stackchan_vessel.md
 """
-from __future__ import annotations
+# 注: ``from __future__ import annotations`` は使わない。
+# Pydantic v2 が ``Optional[str]`` 等の forward ref を lazy 評価しようとして
+# 名前空間解決に失敗するため (PydanticUserError: not fully defined)。
+# 本ファイルの型ヒントは Pydantic モデルを含むため通常評価に倒す。
 
 import json
 import logging
