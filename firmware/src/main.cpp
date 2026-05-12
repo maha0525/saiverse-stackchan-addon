@@ -26,6 +26,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include "MP3DecoderHelix.h"  // Phase 2: MP3 → PCM デコーダ
 
 // ============================================================================
 // 設定 / 状態
@@ -46,6 +47,28 @@ String deviceToken;
 bool isAuthenticated = false;
 unsigned long lastPingMs = 0;
 uint32_t pingSeq = 0;
+
+// ============================================================================
+// Phase 2: MP3 ストリーミング再生
+// ============================================================================
+// voice-tts → audio_stream_bridge → WS binary frame → 本ファームで MP3 受信 →
+// libhelix MP3 デコーダ → コールバックで PCM を取得 → M5.Speaker.playRaw()
+// で I2S 出力。1 発話 = 1 ストリーム、audio_start / audio_chunk (binary) /
+// audio_end の 3 種メッセージ。
+
+static bool audioPlaying = false;
+
+// libhelix のデコードコールバック (フレーム単位で呼ばれる)
+// signature: typedef void (*MP3DataCallback)(MP3FrameInfo&, short*, size_t, void*)
+// MP3FrameInfo はグローバル名前空間 (libhelix:: 修飾なし)
+static void onMP3Decoded(MP3FrameInfo &info, short *pcm, size_t len, void * /*ref*/) {
+    // len はバイト単位。short (= int16_t) のサンプル数は / 2
+    const size_t samples = len / sizeof(short);
+    M5.Speaker.playRaw(pcm, samples, info.samprate,
+                       info.nChans == 2, 255, 0);
+}
+
+libhelix::MP3DecoderHelix mp3Decoder(onMP3Decoded);
 
 // ============================================================================
 // 画面表示ヘルパ
@@ -133,6 +156,19 @@ static void onWsMessage(uint8_t *payload, size_t length) {
         const char *text = doc["text"] | "";
         Serial.printf("[ws] <- echo_reply: %s\n", text);
         displayStatus("Echo reply:", String(text));
+    } else if (strcmp(type, "audio_start") == 0) {
+        // Phase 2: TTS 発話開始通知 → MP3 デコーダ初期化、以後 WStype_BIN を受け入れる
+        const char *msgId = doc["message_id"] | "?";
+        Serial.printf("[ws] <- audio_start msg=%s\n", msgId);
+        mp3Decoder.begin();
+        audioPlaying = true;
+        displayStatus("Speaking...", String("msg: ") + String(msgId).substring(0, 12));
+    } else if (strcmp(type, "audio_end") == 0) {
+        // Phase 2: TTS 発話終了通知 → MP3 デコーダを閉じてアイドル状態へ
+        const char *msgId = doc["message_id"] | "?";
+        Serial.printf("[ws] <- audio_end msg=%s\n", msgId);
+        audioPlaying = false;
+        mp3Decoder.end();
     } else if (strcmp(type, "error") == 0) {
         const char *code = doc["code"] | "?";
         const char *reason = doc["reason"] | "?";
@@ -161,6 +197,12 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
             break;
         case WStype_TEXT:
             onWsMessage(payload, length);
+            break;
+        case WStype_BIN:
+            // Phase 2: TTS MP3 chunk (audio_start 後、audio_end までの binary)
+            if (audioPlaying) {
+                mp3Decoder.write(payload, length);
+            }
             break;
         case WStype_ERROR:
             Serial.printf("[ws] error: %.*s\n", (int)length, (char *)payload);
@@ -305,6 +347,10 @@ void setup() {
     M5.Display.setRotation(1);
     M5.Display.setBrightness(80);
     M5.Display.setTextWrap(true);
+
+    // Phase 2: M5.Speaker を有効化 (TTS ストリーミング再生用)
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(200);  // 0-255、200 でほぼ最大
 
     Serial.begin(115200);
     delay(200);
