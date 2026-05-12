@@ -213,38 +213,47 @@ $("connectBtn").addEventListener("click", async () => {
 $("flashBtn").addEventListener("click", async () => {
     if (!esploader) return;
     try {
-        setStatus("ファームウェアダウンロード中...");
-        // 相対 URL (../firmware.bin) だと Next.js Route Handler との組み合わせで
-        // 解決が想定とズレるケースがあるため、絶対 path で明示的にプロキシ経路に
-        // 投げる。setup ページの URL ベース (/api/addon/saiverse-stackchan-addon/)
-        // から firmware.bin を組み立てる。
-        const firmwareUrl = new URL(
-            "../firmware.bin",
-            window.location.href.endsWith("/")
-                ? window.location.href
-                : window.location.href + "/"
-        ).pathname;
-        appendLog(`fetching: ${firmwareUrl}\n`);
-        const binResp = await fetch(firmwareUrl);
-        if (!binResp.ok) {
-            throw new Error(`firmware.bin not available (HTTP ${binResp.status}). サーバ側でファームウェアがまだビルド/配置されていない可能性があります。`);
-        }
-        const binArrayBuffer = await binResp.arrayBuffer();
-        appendLog(`firmware.bin loaded: ${binArrayBuffer.byteLength} bytes\n`);
+        // setup ページ URL からの相対パスを絶対 path として解決:
+        // ".." で 1 階層上 (= /api/addon/saiverse-stackchan-addon/) に上がって
+        // 各 .bin ファイルを取得する。
+        const baseUrl = window.location.href.endsWith("/")
+            ? window.location.href
+            : window.location.href + "/";
+        const fwUrl = (name) => new URL(`../${name}.bin`, baseUrl).pathname;
 
-        // ESPLoader.write_flash は string データを期待 (バイト列を string にする)
-        const binString = arrayBufferToBinaryString(binArrayBuffer);
+        // ESP32-S3 の書き込みには bootloader / partitions / firmware (app) の
+        // 3 つの bin が必要。それぞれ別アドレスに書く。
+        const targets = [
+            { name: "bootloader", address: 0x0000 },
+            { name: "partitions", address: 0x8000 },
+            { name: "firmware",   address: 0x10000 },
+        ];
+
+        const fileArray = [];
+        for (const t of targets) {
+            const url = fwUrl(t.name);
+            appendLog(`fetching ${t.name}.bin: ${url}\n`);
+            setStatus(`ダウンロード中: ${t.name}.bin`);
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                const text = await resp.text().catch(() => "");
+                throw new Error(
+                    `${t.name}.bin not available (HTTP ${resp.status}). ${text}`
+                );
+            }
+            const buf = await resp.arrayBuffer();
+            appendLog(`  ${t.name}.bin: ${buf.byteLength} bytes\n`);
+            fileArray.push({
+                data: arrayBufferToBinaryString(buf),
+                address: t.address,
+            });
+        }
 
         setStatus("書き込み中... (中断しないでください)");
         $("flashBtn").disabled = true;
 
         await esploader.writeFlash({
-            fileArray: [
-                {
-                    data: binString,
-                    address: 0x10000, // app partition 開始アドレス (default_8MB.csv)
-                },
-            ],
+            fileArray,
             flashSize: "keep",
             flashMode: "keep",
             flashFreq: "keep",
@@ -253,7 +262,11 @@ $("flashBtn").addEventListener("click", async () => {
             reportProgress: (fileIndex, written, total) => {
                 const pct = Math.round((written / total) * 100);
                 setProgress(pct);
-                setStatus(`書き込み中: ${pct}% (${written}/${total} bytes)`);
+                const fname = targets[fileIndex]?.name ?? "?";
+                setStatus(
+                    `書き込み中 (${fileIndex + 1}/${targets.length}): `
+                    + `${fname}.bin ${pct}% (${written}/${total} bytes)`
+                );
             },
         });
 

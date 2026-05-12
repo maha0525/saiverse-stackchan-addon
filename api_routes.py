@@ -71,27 +71,43 @@ async def setup_ui_page() -> HTMLResponse:
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
-@router.get("/firmware.bin")
-async def firmware_binary() -> Response:
-    """配布用ファームウェアバイナリ。setup ページから fetch されて
-    esptool-js で書き込まれる。
+def _firmware_response(name: str) -> Response:
+    """firmware/dist/<name>.bin を返す共通ハンドラ。
 
-    ``firmware/dist/firmware.bin`` (PlatformIO ビルド成果物) があればそれを返す。
-    無ければ 404 + プレーンテキスト案内 (まだビルドされていない開発初期段階用)。
+    ESP32-S3 は bootloader / partitions / firmware (app) の 3 bin を別アドレスに
+    書く必要があるため、setup ページは 3 endpoint をそれぞれ fetch する。
     """
-    bin_path = _ADDON_DIR / "firmware" / "dist" / "firmware.bin"
-    LOGGER.info("firmware_binary: looking for %s (exists=%s)", bin_path, bin_path.exists())
+    bin_path = _ADDON_DIR / "firmware" / "dist" / f"{name}.bin"
+    LOGGER.info("firmware_response: looking for %s (exists=%s)", bin_path, bin_path.exists())
     if not bin_path.exists():
         return Response(
             content=(
-                f"firmware.bin not found at: {bin_path}\n\n"
+                f"{name}.bin not found at: {bin_path}\n\n"
                 "Run `pio run` in expansion_data/saiverse-stackchan-addon/firmware/ "
-                "and copy .pio/build/m5stack-cores3/firmware.bin to firmware/dist/."
+                f"and copy .pio/build/m5stack-cores3/{name}.bin to firmware/dist/."
             ),
             status_code=404,
             media_type="text/plain",
         )
     return FileResponse(bin_path, media_type="application/octet-stream")
+
+
+@router.get("/firmware.bin")
+async def firmware_binary() -> Response:
+    """ESP32 アプリケーション本体 (アドレス 0x10000 に書き込む)"""
+    return _firmware_response("firmware")
+
+
+@router.get("/bootloader.bin")
+async def bootloader_binary() -> Response:
+    """ESP32 ブートローダー (アドレス 0x0000 に書き込む)"""
+    return _firmware_response("bootloader")
+
+
+@router.get("/partitions.bin")
+async def partitions_binary() -> Response:
+    """ESP32 パーティションテーブル (アドレス 0x8000 に書き込む)"""
+    return _firmware_response("partitions")
 
 
 # ============================================================================

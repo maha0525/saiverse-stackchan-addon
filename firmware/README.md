@@ -23,7 +23,23 @@ pip install platformio
 
 ## Web Serial 配布
 
-`pio run` で生成された `.pio/build/m5stack-cores3/firmware.bin` を `../dist/` にコピーし、リポジトリのリリースタグに同梱する。ユーザーはブラウザ (Chrome/Edge) の Web Serial ベースのフラッシュページから書き込める。
+ESP32-S3 の書き込みには **3 つの bin を別アドレスに書く必要がある**:
+
+| bin | アドレス | 役割 |
+|---|---|---|
+| `bootloader.bin` | `0x0000` | ESP32 起動ローダー |
+| `partitions.bin` | `0x8000` | パーティションテーブル |
+| `firmware.bin` | `0x10000` | アプリケーション本体 |
+
+`pio run` で生成された 3 つの bin を `../dist/` にコピーする (PowerShell or bash):
+
+```bash
+cp .pio/build/m5stack-cores3/bootloader.bin ../dist/
+cp .pio/build/m5stack-cores3/partitions.bin ../dist/
+cp .pio/build/m5stack-cores3/firmware.bin   ../dist/
+```
+
+リリースタグに同梱する場合も 3 つすべて配布する。ユーザーはブラウザ (Chrome/Edge) の Web Serial ベースのフラッシュページから一括書き込みできる。
 
 ## 動作フロー (Phase 1)
 
