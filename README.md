@@ -4,30 +4,115 @@ SAIVerse のペルソナを [Stack-chan](https://github.com/stack-chan/stack-cha
 
 Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作する。
 
+中核となる認知モデル: **Vessel Building 全体 = 身体、ペルソナ = 脳/魂**。マイクは耳、STT は聴覚野、スピーカーは口、TTS は発声、カメラは目、サーボは姿勢、タッチは触覚にマッピングされる。
+
 ## 状態
 
-**開発中 (Phase 1)** — WebSocket Gateway とペアリング HTTP API のサーバ側実装まで完了。ユーザー導入経路 (AddonManager UI ペアリングパネル / Web Serial ベースのファーム書き込み) とファームウェア (M5Unified + WebSocket クライアント) は順次追加予定。
+**Phase 1 + 2 完了** (2026-05-13 時点)。Phase 3 (音声入力 + ウェイクワード) 着手準備中。
+
+| Phase | 内容 | 状態 |
+|---|---|---|
+| 1 | ペアリング, WebSocket Gateway, テキスト往復, Web Serial ファーム書き込み | ✅ |
+| 2 | TTS ストリーミング再生 (voice-tts → Stack-chan の PCM 直送経路、割り込み再生) | ✅ |
+| 3 | 音声入力 (ESP-Skainet ウェイクワード + Whisper API STT) | 未着手 |
+| 4 | タッチ知覚 (なでなで) | 未着手 |
+| 5 | 身体ツール (サーボ・カメラ・画面) | 未着手 |
+| 6 | Avatar 連動 (口パク・表情) | 未着手 |
+
+## 現在動くこと
+
+- AddonManager UI からペアリングを発行し、Web Serial (Chrome / Edge) でファームウェアを書き込む
+- 起動時に Stack-chan が AP モードを立て、Wi-Fi SSID / パスワード / SAIVerse サーバ URL / vessel_id / device_token を設定
+- 設定保存後 Stack-chan が SAIVerse に WebSocket 接続し、画面に `connected building: ...` を表示
+- ペルソナを Vessel Building (capacity=1, `PHYSICAL_VESSEL_ID` 設定済み) に `move_to` すると、そのペルソナの発話が物理スピーカーから流れる
+- 発話中に次のプロンプトを送ると、前の発話が即座に中断され新発話に切り替わる (割り込み再生)
+- 連続発話・長時間アイドルでも WebSocket session は安定 (heartbeat + identity-aware unregister で TCP half-open 対策済み)
+
+## 対応ハードウェア
+
+- **M5Stack 製 StackChan AI Desktop Robot** (M5Core S3 ベース、SKU 11129)
+- https://www.switch-science.com/products/11129
+
+将来的に別機種 (眼鏡型ウェアラブル、別ロボット等) への対応も Vessel 共通仕様として検討する (`docs/issues/websocket_session_registry.md` 参照)。
+
+## 動作要件
+
+### SAIVerse 本体側
+
+- `Building` テーブルに `PHYSICAL_VESSEL_ID` カラム (本アドオンを使う SAIVerse バージョンで自動マイグレーション)
+- 既存のアドオン拡張点 (`server_hooks`, `api_routes.py` 自動マウント, `addon_paths.get_addon_storage_path`, `addon_deps.get_manager`)
+
+### 並列に必要なアドオン
+
+- **[saiverse-voice-tts](https://github.com/Nature109/saiverse-voice-tts)** (PR #3 マージ後の版): `audio_stream.subscribe_pcm` 等の PCM 経路と `subscribe-before-open` 対応が必要
+
+## セットアップ手順
+
+### 1. アドオン本体のインストール
+
+```bash
+cd ~/saiverse/expansion_data
+git clone <this repo url> saiverse-stackchan-addon
+```
+
+SAIVerse 再起動で自動ロードされる。
+
+### 2. ペアリング発行
+
+AddonManager UI で「Stack-chan Vessel」パネルを開き、紐付け先の Vessel Building を指定して「ペアリング発行」。`vessel_id` と `device_token` が表示される。
+
+### 3. ファーム書き込み
+
+同じパネルの「ファーム書き込み」ボタンから Web Serial フラッシャを開く。Stack-chan を USB で接続し、bootloader + partitions + firmware の 3 つのバイナリを書き込む (esptool-js が自動で順次フラッシュ)。
+
+### 4. Wi-Fi + サーバ設定 (AP モード)
+
+書き込み後 Stack-chan が `Stack-chan-Setup` という AP を立てる。スマホ等で接続し `192.168.4.1` を開いて以下を入力:
+
+- Wi-Fi SSID / パスワード
+- SAIVerse サーバ URL (例: `ws://192.168.1.10:8000/api/addon/saiverse-stackchan-addon/vessel`)
+- Vessel ID / Device Token (ペアリング発行時に表示されたもの)
+
+設定保存後 Stack-chan が自動再起動 → Wi-Fi 接続 → SAIVerse に WebSocket 接続。画面に `Status: connected building: <building_id>` が出れば成立。
+
+### 5. 動作確認
+
+エリス等のペルソナを Vessel Building に `move_to` してから話しかける。応答が Stack-chan の物理スピーカーから流れれば OK。
 
 ## 詳細設計
 
 設計思想・認知モデル・不変条件・ロードマップは SAIVerse 本体側の Intent Document を参照:
 
-[`docs/intent/stackchan_vessel.md`](https://github.com/maha0525/SAIVerse/blob/feature/memory-notes-and-organize/docs/intent/stackchan_vessel.md)
+[`docs/intent/stackchan_vessel.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_vessel.md)
 
-中核となる認知モデル: **Vessel Building 全体 = 身体、ペルソナ = 脳/魂**。マイクは耳、STT は聴覚野、スピーカーは口、TTS は発声、カメラは目、サーボは姿勢、タッチは触覚にマッピングされる。
+## トラブルシューティング
 
-## 対応ハードウェア
+### 接続できない / 声が出ない
 
-- **M5Stack 製 StackChan AI Desktop Robot** (M5Core2/CoreS3 ベース、SKU 11129)
-- https://www.switch-science.com/products/11129
+1. **サーバ側ログ**: `~/.saiverse/user_data/logs/<最新セッション>/backend.log` で `vessel_endpoint: ... connected` と `audio_stream_bridge:` 系のログを確認
+2. **Stack-chan のシリアル出力**: 当面は `temp/stackchan_serial_capture.py` (SAIVerse リポジトリ側、未公開ユーティリティ) で `stackchan_serial.log` に書き出す形。本格統合は別 issue で対応中
 
-将来的に別機種 (眼鏡型ウェアラブル、別ロボット等) への対応も Vessel 共通仕様として検討する。
+### 設定をリセットしたい
 
-## SAIVerse 本体側の要件
+Stack-chan の画面を **5 秒長押し** で全設定を消去 + 再起動。再度 AP モードに入って手順 4 から。
 
-- `Building` テーブルに `PHYSICAL_VESSEL_ID` カラム (本アドオンを使う SAIVerse バージョンで自動マイグレーション)
-- 既存のアドオン拡張点 (`server_hooks`, `api_routes.py` 自動マウント, `addon_paths.get_addon_storage_path`, `addon_deps.get_manager`)
-- 既存の voice-tts アドオンの `audio_stream` pub/sub (Phase 2 で TTS ストリーミングに相乗り)
+### よく見るログのキーワード
+
+| キーワード | 意味 |
+|---|---|
+| `[ws] connected` | サーバへの WebSocket 接続成立 |
+| `[ws] <- welcome` | サーバから認証成功 + Building 紐付け通知 |
+| `[ws] <- audio_start msg=... sr=32000 ch=1 fmt=pcm_s16le` | TTS ストリーミング開始 |
+| `[ws] ring buffer send timeout (... bytes dropped)` | 受信ペースが速すぎて ring buffer が溢れた (本来出ないはず、出たら pacing 調整必要) |
+| `[audio] chunk too large: ... truncate` | rotation buffer サイズ不足、起きたら main.cpp の `PCM_ROT_MAX_SAMPLES` 拡張要 |
+| `[audio] interrupting current playback` | 前発話を中断して新発話に切り替えた (= 割り込み正常動作) |
+
+## 関連ドキュメント
+
+- [`docs/intent/stackchan_vessel.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_vessel.md) — 設計の中核 (v0.4)
+- [`docs/issues/websocket_session_registry.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/issues/websocket_session_registry.md) — 物理 Vessel SDK 共通基盤化案件
+- [`docs/issues/stackchan_serial_log_integration.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/issues/stackchan_serial_log_integration.md) — シリアルログ統合案件
+- voice-tts PR #3: subscribe-before-open + PCM broadcast path
 
 ## ライセンス
 
