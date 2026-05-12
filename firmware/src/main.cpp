@@ -35,7 +35,7 @@ static const char *PREF_NAMESPACE = "stackchan";
 static const char *AP_NAME = "Stack-chan-Setup";
 static const unsigned long PING_INTERVAL_MS = 30000;
 static const unsigned long RECONNECT_INTERVAL_MS = 5000;
-static const String FIRMWARE_VERSION = "0.1.0";
+static const String FIRMWARE_VERSION = "0.2.0";
 
 Preferences prefs;
 WebSocketsClient webSocket;
