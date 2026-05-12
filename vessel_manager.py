@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 from saiverse.addon_paths import get_addon_storage_path
 
 if TYPE_CHECKING:
+    import asyncio
     from fastapi import WebSocket
 
 LOGGER = logging.getLogger(__name__)
@@ -47,10 +48,16 @@ class VesselRecord:
 
 @dataclass
 class VesselSession:
-    """接続中の Stack-chan device セッション。in-memory のみ、永続化しない。"""
+    """接続中の Stack-chan device セッション。in-memory のみ、永続化しない。
+
+    event_loop は server_hooks 等の別スレッドから WebSocket に送信する際
+    (asyncio.run_coroutine_threadsafe) に必要。Phase 2 の audio_stream_bridge
+    が利用する。
+    """
     vessel_id: str
     building_id: str
     ws: "WebSocket"
+    event_loop: Optional["asyncio.AbstractEventLoop"] = None
     connected_at: str = field(default_factory=_utcnow_iso)
     firmware_version: Optional[str] = None
 

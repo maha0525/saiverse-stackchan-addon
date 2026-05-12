@@ -15,6 +15,7 @@ addon_loader が ``/api/addon/saiverse-stackchan-addon`` プレフィックス�
 # 名前空間解決に失敗するため (PydanticUserError: not fully defined)。
 # 本ファイルの型ヒントは Pydantic モデルを含むため通常評価に倒す。
 
+import asyncio
 import json
 import logging
 import sys
@@ -331,6 +332,7 @@ async def vessel_endpoint(ws: WebSocket) -> None:
             vessel_id=vessel_id,
             building_id=record.building_id,
             ws=ws,
+            event_loop=asyncio.get_running_loop(),
             firmware_version=firmware_version,
         )
         vm.register_session(session)

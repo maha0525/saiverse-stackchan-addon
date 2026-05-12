@@ -2,6 +2,12 @@
     "name": "saiverse-stackchan-addon",
     "display_name": "Stack-chan Vessel",
     "description": "ペルソナを Stack-chan (M5Stack 製 AI Desktop Robot) の物理身体に降ろす Vessel 統合アドオン。Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作します。詳細設計: docs/intent/stackchan_vessel.md",
-    "version": "0.1.0",
-    "params_schema": []
+    "version": "0.2.0",
+    "params_schema": [],
+    "server_hooks": [
+        {
+            "event": "persona_speak",
+            "handler": "speak_hook:on_persona_speak"
+        }
+    ]
 }
