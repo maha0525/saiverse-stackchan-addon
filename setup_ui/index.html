@@ -193,11 +193,7 @@ $("connectBtn").addEventListener("click", async () => {
         transport = new Transport(port, true);
         esploader = new ESPLoader({
             transport,
-            // 921600 だと CoreS3 内蔵 USB-Serial の取りこぼしで
-            // "Failed to write compressed data to flash ... status 201,0"
-            // (deflate CRC 失敗) になることがあった。115200 に落として安定優先。
-            // 書き込み時間は伸びるが、初回セットアップは数分なので許容。
-            baudrate: 115200,
+            baudrate: 921600,
             terminal,
             debugLogging: false,
         });
@@ -247,8 +243,12 @@ $("flashBtn").addEventListener("click", async () => {
             }
             const buf = await resp.arrayBuffer();
             appendLog(`  ${t.name}.bin: ${buf.byteLength} bytes\n`);
+            // esptool-js v0.6.0 の breaking change: fileArray.data は
+            // binary string から Uint8Array に変わった (issue #233 / PR #235)。
+            // v0.5.x までの binary string を渡すと書き込み途中で
+            // "status 201,0" (deflate CRC 失敗) になる。
             fileArray.push({
-                data: arrayBufferToBinaryString(buf),
+                data: new Uint8Array(buf),
                 address: t.address,
             });
         }
@@ -304,17 +304,8 @@ $("disconnectBtn").addEventListener("click", async () => {
     }
 });
 
-function arrayBufferToBinaryString(buffer) {
-    // esptool-js writeFlash は binary string を要求する
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        const slice = bytes.subarray(i, i + chunkSize);
-        binary += String.fromCharCode.apply(null, slice);
-    }
-    return binary;
-}
+// esptool-js v0.5.x までは binary string を要求していた変換関数があったが、
+// v0.6.0 から Uint8Array が直接受け取れるため不要になった (issue #233)。
 </script>
 </body>
 </html>
