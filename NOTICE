@@ -1,0 +1,33 @@
+SAIVerse Stack-chan Vessel Addon
+Copyright 2026 maha0525
+
+Licensed under the Apache License, Version 2.0 (the "License").
+You may obtain a copy of the License at:
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This addon will depend on the following third-party software in
+future phases (Phase 2+: TTS streaming; Phase 5+: firmware integration):
+
+- Stack-chan (https://github.com/stack-chan/stack-chan)
+  Copyright Shinya Ishikawa
+  Licensed under the Apache License 2.0
+
+- Avatar (Stack-chan ecosystem)
+  Copyright Shinya Ishikawa
+  Licensed under the Apache License 2.0
+
+- M5Unified (https://github.com/m5stack/M5Unified)
+  Licensed under the MIT License
+
+- ESP-Skainet (https://github.com/espressif/esp-skainet)
+  Copyright Espressif Systems
+  Licensed under the Apache License 2.0
+
+- esptool-js (https://github.com/espressif/esptool-js)
+  Licensed under the GPL-2.0-or-later license
+  Used at build/install time only as a browser-based flasher,
+  no derived work is distributed with this addon.
+
+Specific upstream copyright notices and version pins will be added
+as these dependencies are actually integrated into the addon code or
+distributed firmware binaries.

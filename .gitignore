@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 動作検証・実験用の中間成果物
+temp/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python venv
+.venv/
+venv/
+
+# Firmware build artifacts (Phase 5+)
+firmware/.pio/
+firmware/.vscode/
+firmware/build/
