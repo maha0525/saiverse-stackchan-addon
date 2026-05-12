@@ -238,15 +238,47 @@ static void setupWiFi() {
     wm.addParameter(&customVessel);
     wm.addParameter(&customToken);
 
-    displayStatus("WiFi setup", "AP: " + String(AP_NAME),
-                  "(if not configured)");
+    // 初回起動 (Preferences が空) かどうか判定。
+    // 一つでも欠けていたら設定不完全とみなして初回扱いにする。
+    bool isFirstSetup =
+        serverUrl.isEmpty() || vesselId.isEmpty() || deviceToken.isEmpty();
 
-    bool connected = wm.autoConnect(AP_NAME);
-    if (!connected) {
-        Serial.println("[wifi] failed to connect, restarting...");
-        displayStatus("WiFi failed", "Restarting...");
-        delay(3000);
-        ESP.restart();
+    if (isFirstSetup) {
+        // WiFiManager v2.0.17 の autoConnect は ESP32 で `wifiIsSaved = true`
+        // を hardcoded workaround として持っており、保存設定が無くても
+        // connectWifi() で接続試行に入り、タイムアウト待ち (数十秒〜数分) に
+        // なってから AP モードを起動する。これだと初回セットアップの体験が
+        // ひどく悪いため、初回は startConfigPortal を直接呼んで AP モードを
+        // 即起動する (autoConnect の前段スキップ)。
+        Serial.println("[wifi] first setup -> starting AP mode immediately");
+        displayStatus("WiFi setup", "AP: " + String(AP_NAME),
+                      "Connect from phone",
+                      "192.168.4.1 in browser");
+
+        // 念のため SDK 内部の WiFi credentials も erase しておく
+        // (M5Stack 出荷時ファームが何か書いていた場合の保険)。
+        WiFi.disconnect(true, true);
+        delay(100);
+
+        bool configured = wm.startConfigPortal(AP_NAME);
+        if (!configured) {
+            Serial.println("[wifi] config portal exited without save, restart");
+            displayStatus("Setup cancelled", "Restarting in 3s");
+            delay(3000);
+            ESP.restart();
+        }
+    } else {
+        // 設定済み: 自動接続。
+        Serial.println("[wifi] saved config present, attempting autoConnect");
+        displayStatus("WiFi connecting...",
+                      "(fallback AP: " + String(AP_NAME) + ")");
+        bool connected = wm.autoConnect(AP_NAME);
+        if (!connected) {
+            Serial.println("[wifi] autoConnect failed, restarting");
+            displayStatus("WiFi failed", "Restarting in 3s");
+            delay(3000);
+            ESP.restart();
+        }
     }
 
     // 設定 UI で入力された値を Preferences に永続化
