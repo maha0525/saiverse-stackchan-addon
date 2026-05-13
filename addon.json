@@ -2,8 +2,51 @@
     "name": "saiverse-stackchan-addon",
     "display_name": "Stack-chan Vessel",
     "description": "ペルソナを Stack-chan (M5Stack 製 AI Desktop Robot) の物理身体に降ろす Vessel 統合アドオン。Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作します。詳細設計: docs/intent/stackchan_vessel.md",
-    "version": "0.2.0",
-    "params_schema": [],
+    "version": "0.3.0",
+    "params_schema": [
+        {
+            "key": "master_token",
+            "label": "Stack-chan 認証トークン (master)",
+            "description": "Stack-chan device が gateway の WebSocket に接続する際に提示する Bearer トークン。Phase 1' は手動で 32+ 文字のランダム文字列を入力（Phase 2' のペアリング UX で UI から自動生成・QR コード表示に拡張予定）。device 側にも AP モード設定 UI で同じ値を入力する。",
+            "type": "text",
+            "placeholder": "stackchan_xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+            "key": "pcm_token",
+            "label": "Stack-chan PCM 経路トークン",
+            "description": "SAIVerse の voice-tts → stackchan-mcp gateway の HTTP PCM endpoint (POST /pcm) 認証用 Bearer トークン。master_token と別建て（VISION_TOKEN の前例に倣う）。同じく Phase 2' で自動生成に拡張予定。",
+            "type": "text",
+            "placeholder": "pcm_xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+            "key": "gateway_host",
+            "label": "Gateway listen アドレス",
+            "description": "stackchan-mcp gateway が WebSocket / HTTP を listen するアドレス。通常は変更不要。",
+            "type": "text",
+            "default": "0.0.0.0"
+        },
+        {
+            "key": "gateway_ws_port",
+            "label": "Gateway WebSocket ポート",
+            "description": "device ↔ gateway の WebSocket 通信ポート。通常は変更不要。",
+            "type": "text",
+            "default": "8765"
+        },
+        {
+            "key": "gateway_capture_port",
+            "label": "Gateway HTTP ポート",
+            "description": "device → gateway の HTTP 通信ポート（画像 capture および PCM 受信）。通常は変更不要。",
+            "type": "text",
+            "default": "8766"
+        },
+        {
+            "key": "vision_host",
+            "label": "Gateway の LAN IP",
+            "description": "Stack-chan device から到達可能な、この SAIVerse ホストの IP アドレス。device が撮影画像を HTTP POST する宛先になる。`ip addr` や `ipconfig` で LAN 内 IP を確認して入力（例: 192.168.1.10）。",
+            "type": "text",
+            "placeholder": "192.168.x.x"
+        }
+    ],
     "server_hooks": [
         {
             "event": "persona_speak",

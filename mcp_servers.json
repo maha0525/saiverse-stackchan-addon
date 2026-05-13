@@ -1,0 +1,50 @@
+{
+    "_comment": "stackchan-mcp gateway を SAIVerse 本体の MCP client が subprocess として起動する設定。詳細は docs/intent/stackchan_vessel.md (SAIVerse 本体) §B / §D 参照。",
+    "_comment_command": "Elyth と同じく実行時取得方式 (= ユーザーは事前 install 不要)。Elyth は npx -y で npm registry から、こちらは uvx --from で git URL から取得。Phase 1'-4' 検証中は手元 fork (PR1/PR2/PR3 含む) の feature ブランチを指定。Phase 5' で上流 PR が merge されたら、command: 'uvx' / args: ['stackchan-mcp'] (= PyPI 公開版) に切り替える。",
+    "_comment_env": "master_token は device の WS 接続認証 (Authorization: Bearer)、pcm_token は voice-tts → gateway の HTTP PCM POST 認証 (VISION_TOKEN の前例に倣う)。両方 addon の AddonConfig から ${addon.X.Y} placeholder で解決。Phase 2' のペアリング UX でランダム生成 + 永続化を実装、Phase 1' は手動設定で動かす。",
+    "_comment_scope": "Vessel Building は capacity=1 で単一 persona、stackchan-mcp gateway も単一 device 想定なので global で 1 つの subprocess を共有。",
+    "_comment_spell_tools": "visible=true 15 個 (ペルソナが Vessel Building で使う物理身体ツール)、visible=false 6 個 (say は voice-tts に置換、listen は Phase 3' で別経路、get_status と診断系は管理者向け)。Phase 4' で各エントリに building_ids: ['<vessel_building_id>'] を追加して Vessel Building 内のみ visible に絞る (本体 MCP client への汎用拡張 A-3-c)。",
+    "mcpServers": {
+        "stackchan": {
+            "command": "uvx",
+            "args": [
+                "--from",
+                "git+https://github.com/maha0525/stackchan-mcp.git@feature/external-pcm-stream#subdirectory=gateway",
+                "stackchan-mcp"
+            ],
+            "env": {
+                "STACKCHAN_TOKEN": "${addon.saiverse-stackchan-addon.master_token}",
+                "STACKCHAN_PCM_TOKEN": "${addon.saiverse-stackchan-addon.pcm_token}",
+                "HOST": "${addon.saiverse-stackchan-addon.gateway_host}",
+                "WS_PORT": "${addon.saiverse-stackchan-addon.gateway_ws_port}",
+                "CAPTURE_PORT": "${addon.saiverse-stackchan-addon.gateway_capture_port}",
+                "VISION_HOST": "${addon.saiverse-stackchan-addon.vision_host}"
+            },
+            "scope": "global",
+            "timeout": 30,
+            "spell_tools": [
+                {"name": "move_head",          "display_name": "首を動かす",         "visible": true},
+                {"name": "take_photo",         "display_name": "写真を撮る",         "visible": true},
+                {"name": "set_avatar",         "display_name": "表情を変える",       "visible": true},
+                {"name": "set_mouth",          "display_name": "口形状を設定",       "visible": true},
+                {"name": "set_mouth_sequence", "display_name": "口パクシーケンス",   "visible": true},
+                {"name": "set_blink",          "display_name": "まばたき制御",       "visible": true},
+                {"name": "set_led",            "display_name": "LED を変える",       "visible": true},
+                {"name": "set_all_leds",       "display_name": "全 LED を変える",    "visible": true},
+                {"name": "set_leds",           "display_name": "複数 LED を変える",  "visible": true},
+                {"name": "clear_leds",         "display_name": "LED 消灯",           "visible": true},
+                {"name": "set_brightness",     "display_name": "画面輝度",           "visible": true},
+                {"name": "set_volume",         "display_name": "音量設定",           "visible": true},
+                {"name": "get_touch_state",    "display_name": "タッチ状態取得",     "visible": true},
+                {"name": "get_head_angles",    "display_name": "首の角度取得",       "visible": true},
+                {"name": "get_device_info",    "display_name": "デバイス情報取得",   "visible": true},
+                {"name": "get_status",         "visible": false},
+                {"name": "say",                "visible": false},
+                {"name": "listen",             "visible": false},
+                {"name": "gpio_test",          "visible": false},
+                {"name": "uart_diag",          "visible": false},
+                {"name": "check_vm_en",        "visible": false}
+            ]
+        }
+    }
+}
