@@ -336,10 +336,21 @@ class VesselManager:
     ) -> Optional[VesselRecord]:
         """ペルソナ + Building の組み合わせから vessel を逆引きする。
 
+        二段階で探す:
+
+        1. **persona 専用バインド** (`bound_persona_id = persona_id AND
+           bound_building_id = building_id`): この vessel は特定 persona に
+           bind されている、それ以外の persona は使えない
+        2. **persona 未指定バインド** (`bound_persona_id IS NULL AND
+           bound_building_id = building_id`): Vessel Building 内なら誰でも
+           使える状態 (Vessel Building は capacity=1 なので結果として
+           「Building にいる persona が使う」と同じ意味になる)
+
         speak_hook が「このペルソナがこの Building で物理身体に降りているか」
         を判定する用途。
         """
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            # 1. persona 専用バインドを優先
             row = conn.execute(
                 """
                 SELECT vessel_id, bound_building_id, bound_persona_id,
@@ -350,6 +361,20 @@ class VesselManager:
                 """,
                 (persona_id, building_id),
             ).fetchone()
+            # 2. persona 未指定 (NULL) でフォールバック
+            if row is None:
+                row = conn.execute(
+                    """
+                    SELECT vessel_id, bound_building_id, bound_persona_id,
+                           hardware_model, firmware_version, paired_at,
+                           last_seen_at
+                    FROM vessels
+                    WHERE bound_persona_id IS NULL
+                          AND bound_building_id = ?
+                    LIMIT 1
+                    """,
+                    (building_id,),
+                ).fetchone()
         if row is None:
             return None
         return VesselRecord(
