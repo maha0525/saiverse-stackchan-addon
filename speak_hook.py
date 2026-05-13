@@ -73,27 +73,104 @@ def _load_addon_params() -> dict:
         return {}
 
 
-def _pcm_iterator_from_queue(queue) -> Iterator[bytes]:
-    """voice-tts の subscribe_pcm が返す Queue から PCM chunks を yield する。
+def _wait_first_chunk(queue, timeout_s: float = 60.0) -> bytes | None:
+    """voice-tts subscribe_pcm の最初の chunk を取得する。
 
-    Queue は ``Optional[bytes]`` を要素に持ち、``None`` (sentinel) で終端する。
-    ``requests`` の ``data=`` に直接渡せる sync iterator として返す
-    (chunked transfer encoding は requests が自動的に行う)。
+    GPT-SoVITS の最初の chunk 生成には GPU で 10〜20 秒程度かかる
+    (= 観測例: 1221 文字で 15.94 秒)。speak_hook が subscribe_pcm 直後
+    に HTTP POST を開始すると、その 10〜20 秒は chunked transfer の
+    chunk が来ない idle 時間になり、device 側で「もう音が来ない」と
+    判定されて speaking → listening に勝手に戻ってしまう (= 観測例:
+    speaking 遷移から 18 秒で listening、結果として発話の冒頭だけ届い
+    て後は沈黙、というユーザー観察)。
+
+    そこで POST を始める前に最初の chunk が来るのを待つ。最初の chunk
+    が来てから POST を開始すれば、以降は voice-tts が PCM を実時間で
+    連続生成するので chunked transfer の idle 時間は短く済む (= フレー
+    ム間隔 = ms オーダー)。
+
+    ``None`` を返す場合: voice-tts が音を 1 つも流さず close した、
+    または queue idle が ``timeout_s`` を超えた。どちらも発話を諦める。
     """
     from queue import Empty
 
+    try:
+        first = queue.get(timeout=timeout_s)
+    except Empty:
+        LOGGER.warning(
+            "stackchan speak_hook: first chunk timeout (%.1fs), abort", timeout_s
+        )
+        return None
+    if first is None:
+        LOGGER.debug(
+            "stackchan speak_hook: voice-tts closed before first chunk, abort"
+        )
+        return None
+    if not first:
+        # 空 chunk は通常起きないが、来たら次の chunk を待たずに諦める。
+        # voice-tts 側のバグの可能性があるので WARNING で残す。
+        LOGGER.warning(
+            "stackchan speak_hook: empty first chunk received, abort"
+        )
+        return None
+    return first
+
+
+def _pcm_iterator_after_first(
+    first_chunk: bytes, queue, message_id: str = "?"
+) -> Iterator[bytes]:
+    """``_wait_first_chunk`` で先取りした最初の chunk + 続きの queue
+    を結合した sync iterator を返す。
+
+    POST 開始時点で確実に最初の chunk が yield されるので chunked
+    transfer の最初の data 送信までの idle が短く済む。以降は voice-tts
+    の連続生成 cadence (= 30 kHz mono 16-bit @ realtime = 60 KB/s) に
+    乗って chunk が流れる。
+
+    観測用ログ (Phase 1' 残課題「発話末尾切れ」検証用): voice-tts の
+    投入 pace が realtime かどうか、iterator が None sentinel まで
+    確実に最後まで yield しているか、POST body 終了 (= return) から
+    server response 返却までの遅延を測るための時刻情報を残す。
+    """
+    from queue import Empty
+    import time
+
+    start_t = time.monotonic()
+    total_bytes = len(first_chunk)
+    chunk_count = 1
+    LOGGER.debug(
+        "stackchan speak_hook[%s]: iter yield #%d t=+%.2fs bytes=%d cum=%d",
+        message_id, chunk_count, 0.0, len(first_chunk), total_bytes,
+    )
+    yield first_chunk
     while True:
         try:
             chunk = queue.get(timeout=120.0)
         except Empty:
             LOGGER.warning(
-                "stackchan speak_hook: PCM queue idle timeout, abort"
+                "stackchan speak_hook[%s]: PCM queue idle timeout at t=+%.2fs cum=%d, abort",
+                message_id, time.monotonic() - start_t, total_bytes,
             )
             return
         if chunk is None:
             # voice-tts 側で close_pcm_stream が呼ばれた = 発話終了
+            LOGGER.debug(
+                "stackchan speak_hook[%s]: None sentinel received at t=+%.2fs "
+                "chunks=%d cum=%d (= POST body end)",
+                message_id, time.monotonic() - start_t, chunk_count, total_bytes,
+            )
             return
         if chunk:
+            chunk_count += 1
+            total_bytes += len(chunk)
+            # 連続 chunk のログは uniform 間隔で間引く (= 多すぎ防止)。
+            # voice-tts の投入 pace を測れる粒度として 0.5 秒毎に出す。
+            elapsed = time.monotonic() - start_t
+            if chunk_count <= 3 or (chunk_count % 20 == 0):
+                LOGGER.debug(
+                    "stackchan speak_hook[%s]: iter yield #%d t=+%.2fs bytes=%d cum=%d",
+                    message_id, chunk_count, elapsed, len(chunk), total_bytes,
+                )
             yield chunk
 
 
@@ -110,6 +187,13 @@ def _post_pcm_in_background(
     voice-tts 側で open_pcm_stream が呼ばれてなくても Queue が確保される。
     開始タイミングは voice-tts と speak_hook の並行起動で前後する可能性が
     あるが、subscribe_pcm の Queue で吸収される。
+
+    重要: 最初の chunk が来るまで HTTP POST 自体を開始しない。voice-tts
+    の最初の chunk 生成は GPT-SoVITS で 10〜20 秒かかるので、POST を先
+    に開けてしまうと chunked transfer の冒頭で「データが来ない」期間が
+    長くなり、device 側が「もう音が来ない」と判定して speaking から
+    listening に戻ってしまう (詳細は ``_wait_first_chunk`` の docstring
+    参照)。
     """
     subscribe_pcm, _ = _load_voice_tts_subscribe()
     if subscribe_pcm is None:
@@ -121,6 +205,12 @@ def _post_pcm_in_background(
             "stackchan speak_hook: subscribe_pcm returned None msg_id=%s",
             message_id,
         )
+        return
+
+    # voice-tts が最初の chunk を生成し終えるまで block して待つ。GPU 計算
+    # 時間で 10〜20 秒程度かかる。この間 HTTP POST は開かない。
+    first_chunk = _wait_first_chunk(queue)
+    if first_chunk is None:
         return
 
     # requests は標準ライブラリじゃないが、SAIVerse 本体で広く使われている
@@ -143,15 +233,28 @@ def _post_pcm_in_background(
     if pcm_token:
         headers["Authorization"] = f"Bearer {pcm_token}"
 
+    import time as _time
+    post_start = _time.monotonic()
+    LOGGER.debug(
+        "stackchan speak_hook[%s]: POST start (= first chunk arrived, "
+        "starting requests.post)",
+        message_id,
+    )
     try:
         # chunked transfer encoding は requests が iterator を data= に
         # 渡されると自動的に有効化する。Transfer-Encoding: chunked が
         # 自動付与され、Content-Length は省略される。
+        # 最初の chunk は _wait_first_chunk で取得済みなので、ここに渡す
+        # iterator は最初の chunk + 残りを yield する形にする。
         resp = requests.post(
             pcm_url,
-            data=_pcm_iterator_from_queue(queue),
+            data=_pcm_iterator_after_first(first_chunk, queue, message_id),
             headers=headers,
             timeout=(5, 300),  # connect 5s, read 300s (発話最大 5 分想定)
+        )
+        LOGGER.debug(
+            "stackchan speak_hook[%s]: POST returned status=%d after %.2fs",
+            message_id, resp.status_code, _time.monotonic() - post_start,
         )
         if resp.status_code == 200:
             LOGGER.info(
@@ -167,9 +270,9 @@ def _post_pcm_in_background(
             )
     except requests.RequestException as exc:
         LOGGER.warning(
-            "stackchan speak_hook: PCM POST request error vessel_id=%s "
-            "msg_id=%s: %s",
-            vessel_id, message_id, exc,
+            "stackchan speak_hook[%s]: PCM POST request error after %.2fs "
+            "vessel_id=%s: %s",
+            message_id, _time.monotonic() - post_start, vessel_id, exc,
         )
     except Exception:
         LOGGER.exception(
