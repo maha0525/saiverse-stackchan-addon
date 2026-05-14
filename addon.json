@@ -58,6 +58,10 @@
         {
             "event": "persona_speak",
             "handler": "speak_hook:on_persona_speak"
+        },
+        {
+            "event": "persona_entered_building",
+            "handler": "avatar_loader:on_persona_entered_building"
         }
     ]
 }
