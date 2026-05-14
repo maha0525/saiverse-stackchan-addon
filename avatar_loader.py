@@ -48,7 +48,10 @@ ADDON_NAME = "saiverse-stackchan-addon"
 DEFAULT_SET_NAME = "default"
 MCP_QUALIFIED_SERVER = f"{ADDON_NAME}__stackchan"
 MCP_TOOL_LOAD_SET = "load_avatar_set"
-MCP_TOOL_SET_AVATAR = "self.display.set_avatar"
+# 注意: device 側 firmware は ``self.display.set_avatar`` で AddTool して
+# いるが、 gateway は SAIVerse の MCP client に対しては bare 名 ``set_avatar``
+# で再 expose している。 ここで呼ぶのは gateway の expose 名 = 短い方。
+MCP_TOOL_SET_AVATAR = "set_avatar"
 
 # load_avatar_set 全体のタイムアウト (HTTP 転送 + ESP32 PSRAM 書き込みを
 # 含む)。 MCP tool 側のデフォルトは 60 s、 こちらは余裕を見て 90 s。
@@ -172,7 +175,7 @@ async def _call_load_avatar_set(archive_path: str, mode: str) -> str:
 
 
 async def _call_set_avatar(face: str) -> str:
-    """gateway の ``self.display.set_avatar`` MCP tool を呼ぶ。
+    """gateway の ``set_avatar`` MCP tool を呼ぶ (gateway 側 expose 名)。
 
     face: ``idle``/``happy``/``thinking``/``sad``/``surprised``/
     ``embarrassed`` のいずれか、 もしくは ``off`` (= レイヤを隠す)。
