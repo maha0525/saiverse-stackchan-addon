@@ -47,11 +47,14 @@ LOGGER = logging.getLogger(__name__)
 ADDON_NAME = "saiverse-stackchan-addon"
 DEFAULT_SET_NAME = "default"
 MCP_QUALIFIED_SERVER = f"{ADDON_NAME}__stackchan"
-MCP_TOOL_NAME = "load_avatar_set"
+MCP_TOOL_LOAD_SET = "load_avatar_set"
+MCP_TOOL_SET_AVATAR = "self.display.set_avatar"
 
 # load_avatar_set 全体のタイムアウト (HTTP 転送 + ESP32 PSRAM 書き込みを
 # 含む)。 MCP tool 側のデフォルトは 60 s、 こちらは余裕を見て 90 s。
 _LOAD_TIMEOUT_SEC = 90.0
+# set_avatar(idle/off) は 1 回の WS frame 往復だけなので短めで OK。
+_SET_AVATAR_TIMEOUT_SEC = 10.0
 
 
 class AvatarSetLoader:
@@ -143,13 +146,8 @@ def _vessel_building_id() -> Optional[str]:
     return vbid if isinstance(vbid, str) and vbid else None
 
 
-async def _call_load_avatar_set(archive_path: str, mode: str) -> str:
-    """gateway の ``load_avatar_set`` MCP tool を呼ぶ (MCP loop 上で実行)。
-
-    本体 MCP client が起動済みの ``saiverse-stackchan-addon__stackchan``
-    インスタンス (= global scope) に直接 ``call_tool`` する。 接続未確立
-    なら ``RuntimeError``。
-    """
+async def _get_stackchan_conn():
+    """本体 MCP client から stackchan gateway 接続を引く。"""
     from tools.mcp_client import get_mcp_manager, _make_instance_key
 
     manager = get_mcp_manager()
@@ -159,13 +157,51 @@ async def _call_load_avatar_set(archive_path: str, mode: str) -> str:
     conn = manager._connections.get(instance_key)
     if conn is None:
         raise RuntimeError(
-            f"MCP server '{MCP_QUALIFIED_SERVER}' is not connected; "
-            "avatar load skipped"
+            f"MCP server '{MCP_QUALIFIED_SERVER}' is not connected"
         )
+    return conn
+
+
+async def _call_load_avatar_set(archive_path: str, mode: str) -> str:
+    """gateway の ``load_avatar_set`` MCP tool を呼ぶ (MCP loop 上で実行)。"""
+    conn = await _get_stackchan_conn()
     return await conn.call_tool(
-        MCP_TOOL_NAME,
+        MCP_TOOL_LOAD_SET,
         {"archive_path": archive_path, "mode": mode},
     )
+
+
+async def _call_set_avatar(face: str) -> str:
+    """gateway の ``self.display.set_avatar`` MCP tool を呼ぶ。
+
+    face: ``idle``/``happy``/``thinking``/``sad``/``surprised``/
+    ``embarrassed`` のいずれか、 もしくは ``off`` (= レイヤを隠す)。
+    """
+    conn = await _get_stackchan_conn()
+    return await conn.call_tool(MCP_TOOL_SET_AVATAR, {"face": face})
+
+
+def _run_async_on_mcp_loop(coro, timeout_sec: float) -> Optional[str]:
+    """sync 文脈から MCP loop の coro を呼んで結果を取る共通ヘルパ。
+
+    呼び出し元 (= addon_hooks の ThreadPoolExecutor worker) は ``_loop``
+    と別スレッドなので ``asyncio.run_coroutine_threadsafe`` で bridge する。
+    失敗時は WARNING を残して ``None`` を返す (= 呼び出し元は続行可能)。
+    """
+    import tools.mcp_client as _mcp
+
+    loop = _mcp._loop
+    if loop is None:
+        LOGGER.warning(
+            "avatar_loader: MCP event loop not initialized, MCP call skipped"
+        )
+        return None
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout=timeout_sec)
+    except Exception as exc:
+        LOGGER.warning("avatar_loader: MCP call failed: %s", exc)
+        return None
 
 
 def on_persona_entered_building(
@@ -177,82 +213,110 @@ def on_persona_entered_building(
     """``persona_entered_building`` server_hook ハンドラ。
 
     addon_hooks の ThreadPoolExecutor から呼ばれる (= 別スレッド)。
-    Vessel Building 以外への入室は早期 return、 該当時のみ avatar セット
-    を解決して gateway に転送する。
+    Vessel Building 以外への入室は早期 return、 該当時は
 
-    エラー (= avatar 未配置 / MCP 未接続 / load_avatar_set 失敗) は
-    すべて WARNING ログに留めて飲み込む。 ペルソナ移動自体は成功して
+      1. 該当ペルソナの avatar セットを (必要なら) gateway 経由で load
+      2. デバイスの face/eyes/mouth 状態を ``idle`` にリセット (= 前
+         ペルソナの ``happy`` 等が次ペルソナに引き継がれるのを防ぐ)
+
+    の 2 ステップを順に走らせる。 (2) はセットの有無に関わらず常に
+    実行する (= 状態リセットはセットを持っていないペルソナにも必要)。
+    エラーは全部 WARNING にして飲み込む — ペルソナ移動自体は成功して
     いる以上、 avatar の都合で例外を伝播させて移動経路を壊さない。
     """
     vessel_bid = _vessel_building_id()
     if not vessel_bid:
-        # Vessel Building ID が未設定 → addon の物理機能全体が無効状態。
         return
     if building_id != vessel_bid:
-        # Vessel Building 以外への入室は対象外。
         return
 
+    # 1. avatar セットを load (= 配置されてれば)。
     loader = get_avatar_loader()
     found = loader.find_persona_set(persona_id)
     if found is None:
         LOGGER.info(
             "avatar_loader: no avatar set on disk for persona=%s "
-            "(expected at %s) — skip auto-load",
+            "(expected at %s) — skip auto-load, will still reset face state",
             persona_id, loader.set_dir(persona_id),
         )
-        return
-    bin_path, manifest = found
-    mode = manifest.get("mode")
-    checksum = manifest.get("checksum") or ""
-    if mode not in ("layered", "matrix"):
-        LOGGER.warning(
-            "avatar_loader: invalid manifest mode for persona=%s: %r "
-            "(allowed: layered / matrix)",
-            persona_id, mode,
-        )
-        return
-    if not loader.is_load_required(persona_id, checksum):
-        LOGGER.info(
-            "avatar_loader: persona=%s already loaded (checksum=%s), skip",
-            persona_id, checksum,
-        )
-        return
+    else:
+        bin_path, manifest = found
+        mode = manifest.get("mode")
+        checksum = manifest.get("checksum") or ""
+        if mode not in ("layered", "matrix"):
+            LOGGER.warning(
+                "avatar_loader: invalid manifest mode for persona=%s: %r "
+                "(allowed: layered / matrix)",
+                persona_id, mode,
+            )
+        elif not loader.is_load_required(persona_id, checksum):
+            LOGGER.info(
+                "avatar_loader: persona=%s already loaded (checksum=%s), "
+                "skip transfer",
+                persona_id, checksum,
+            )
+        else:
+            LOGGER.info(
+                "avatar_loader: loading avatar for persona=%s mode=%s "
+                "(bin=%s, %d bytes)",
+                persona_id, mode, bin_path, bin_path.stat().st_size,
+            )
+            result = _run_async_on_mcp_loop(
+                _call_load_avatar_set(str(bin_path), mode),
+                timeout_sec=_LOAD_TIMEOUT_SEC,
+            )
+            if result is not None:
+                LOGGER.info(
+                    "avatar_loader: loaded avatar for persona=%s mode=%s "
+                    "result=%s",
+                    persona_id, mode, result,
+                )
+                loader.mark_loaded(persona_id, checksum)
 
-    # MCP loop に coro を投げて結果を待つ。 hook handler が走ってる
-    # ThreadPoolExecutor の worker thread は MCP loop と別なので
-    # asyncio.run_coroutine_threadsafe で bridge する。
-    # ``_loop`` は mcp_client の module-level binding (実行時に値が
-    # 変わるので、 import 時の binding ではなく属性アクセスで読む)。
-    import tools.mcp_client as _mcp
+    # 2. 状態リセット: 前ペルソナの face/mouth/blink 状態が device 側に
+    # 残ってる可能性があるので、 idle を明示的に打って初期化する。
+    # device 側の SetAvatarExpression は "off" → "idle" 遷移時にレイヤを
+    # 自動 unhide + 必要なら blink を復元するので、 退室時に "off" を
+    # 打った直後の入室でも正しく顔が出る。
+    LOGGER.info(
+        "avatar_loader: resetting device face to idle for persona=%s",
+        persona_id,
+    )
+    _run_async_on_mcp_loop(
+        _call_set_avatar("idle"), timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
+    )
 
-    loop = _mcp._loop
-    if loop is None:
-        LOGGER.warning(
-            "avatar_loader: MCP event loop not initialized, cannot load "
-            "avatar for persona=%s",
-            persona_id,
-        )
+
+def on_persona_exited_building(
+    persona_id: str,
+    building_id: str,
+    from_building_id: Optional[str] = None,
+    to_building_id: Optional[str] = None,
+    **_kwargs,
+) -> None:
+    """``persona_exited_building`` server_hook ハンドラ。
+
+    Vessel Building からの退室時に device の avatar レイヤを ``off`` で
+    隠す (= 誰も憑依していない時間は顔を表示し続けない)。 Vessel が
+    capacity=1 設計なので「退室 = vessel が空になる」が成立する前提。
+
+    ``set_avatar("off")`` は firmware 側で blink 状態を保存して停止し、
+    avatar lv_obj を ``LV_OBJ_FLAG_HIDDEN`` で隠すので、 LCD 自体は
+    xiaozhi-esp32 の下層 UI (WiFi 設定や OTA 画面など) が見える状態に
+    戻る。
+    """
+    vessel_bid = _vessel_building_id()
+    if not vessel_bid:
+        return
+    # building_id (= 退室元) と vessel ID を照合。 dispatcher 側で
+    # from_building_id にも同じ値を入れているがどちらでも OK。
+    if building_id != vessel_bid:
         return
 
     LOGGER.info(
-        "avatar_loader: loading avatar for persona=%s mode=%s "
-        "(bin=%s, %d bytes)",
-        persona_id, mode, bin_path, bin_path.stat().st_size,
+        "avatar_loader: vessel exit by persona=%s — hiding avatar layer",
+        persona_id,
     )
-    future = asyncio.run_coroutine_threadsafe(
-        _call_load_avatar_set(str(bin_path), mode), loop,
+    _run_async_on_mcp_loop(
+        _call_set_avatar("off"), timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
     )
-    try:
-        result = future.result(timeout=_LOAD_TIMEOUT_SEC)
-    except Exception as exc:
-        LOGGER.warning(
-            "avatar_loader: load_avatar_set failed for persona=%s: %s",
-            persona_id, exc,
-        )
-        return
-
-    LOGGER.info(
-        "avatar_loader: loaded avatar for persona=%s mode=%s result=%s",
-        persona_id, mode, result,
-    )
-    loader.mark_loaded(persona_id, checksum)

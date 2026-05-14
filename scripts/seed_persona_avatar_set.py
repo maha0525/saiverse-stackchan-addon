@@ -54,13 +54,23 @@ def _rotate_hue(
     return (int(r2 * 255), int(g2 * 255), int(b2 * 255))
 
 
-def _generate_tinted(mode: str, tint_hue_deg: float) -> bytes:
-    """Re-run the layered / matrix generator with hue-rotated palettes."""
-    if tint_hue_deg == 0.0:
-        if mode == "layered":
-            return _gen.generate_layered()
-        return _gen.generate_matrix()
+# Override the base generator's neutral-grey idle ((150, 150, 150), sat=0)
+# with a low-saturation cool grey so that the ``--tint-hue`` rotation
+# actually changes the visible colour. HSV hue rotation is a no-op on a
+# zero-saturation pixel, which made two seeded personas indistinguishable
+# on the idle face. (150, 165, 195) has hue ≈ 213° (cool blue-grey), sat
+# ≈ 23 %, which still reads as "calm idle" but rotates to a warm beige
+# at 180°.
+_IDLE_BASELINE_RGB = (150, 165, 195)
 
+
+def _generate_tinted(mode: str, tint_hue_deg: float) -> bytes:
+    """Re-run the layered / matrix generator with hue-rotated palettes.
+
+    Also patches the idle baseline so that idle is hue-rotatable even at
+    ``tint_hue_deg=0`` (= explicit cool-grey vs. the generator's default
+    pure-grey). See the ``_IDLE_BASELINE_RGB`` comment for why.
+    """
     # The generators read FACE_COLORS / EYES_COLORS / MOUTH_COLORS from
     # the module's globals, so monkey-patch them for the duration of this
     # call and restore afterwards.
@@ -70,10 +80,12 @@ def _generate_tinted(mode: str, tint_hue_deg: float) -> bytes:
         "MOUTH_COLORS": dict(_gen.MOUTH_COLORS),
     }
     try:
-        for table_name in ("FACE_COLORS", "EYES_COLORS", "MOUTH_COLORS"):
-            table = getattr(_gen, table_name)
-            for key, rgb in list(table.items()):
-                table[key] = _rotate_hue(rgb, tint_hue_deg)
+        _gen.FACE_COLORS["idle"] = _IDLE_BASELINE_RGB
+        if tint_hue_deg != 0.0:
+            for table_name in ("FACE_COLORS", "EYES_COLORS", "MOUTH_COLORS"):
+                table = getattr(_gen, table_name)
+                for key, rgb in list(table.items()):
+                    table[key] = _rotate_hue(rgb, tint_hue_deg)
         if mode == "layered":
             return _gen.generate_layered()
         return _gen.generate_matrix()
