@@ -45,6 +45,13 @@
             "description": "Stack-chan device から到達可能な、この SAIVerse ホストの IP アドレス。device が撮影画像を HTTP POST する宛先になる。`ip addr` や `ipconfig` で LAN 内 IP を確認して入力（例: 192.168.1.10）。",
             "type": "text",
             "placeholder": "192.168.x.x"
+        },
+        {
+            "key": "vessel_building_id",
+            "label": "Vessel Building ID",
+            "description": "Stack-chan に紐付ける Vessel Building の ID。物理身体ツール (move_head / take_photo 等) はこの Building 内に居るペルソナにのみ visible になる (SAIVerse 本体 A-3-c の Building 単位 visibility)。SAIVerse の Building 編集 UI で対象 Vessel Building の BUILDINGID を確認して入力。**未設定の場合、物理身体ツールはどの Building でも visible にならない** ので設定必須。",
+            "type": "text",
+            "placeholder": "b_vessel_stackchan"
         }
     ],
     "server_hooks": [
