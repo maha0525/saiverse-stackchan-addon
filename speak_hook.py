@@ -513,8 +513,40 @@ def on_persona_speak(
         message_id: 発話メッセージの ID (voice-tts の audio_stream key)
         **_kwargs: text_raw / text_for_voice / pulse_id / source / metadata 等。
             本ハンドラでは使用しないが、本体側 payload が増えても壊れないよう受ける。
+
+    Pipeline Streaming (= LLM streaming 中の文区切り sub-speak) を考慮した
+    sub_seq 制御:
+
+    SAIVerse 本体は 1 発話を文区切りごとに分割して persona_speak hook を
+    連発する (= sub_seq=1, 2, 3, ..., N + is_final=True)。 本 hook はそれ
+    ぞれの発火で HTTP POST を新規発行してしまうと、 voice-tts の
+    ``subscribe_pcm`` が 「既存 frames を全部 queue に dump する」 仕様 と
+    あいまって、 同じ初期音声が複数の POST から並行送信される (= device
+    側で同じ箇所がループ再生される / Connection aborted が連発する) 現象
+    が出る。 観測例: 284 sub-speak → 同じ初期 35840 bytes chunk を 284 個
+    の POST が独立に yield。
+
+    対策として 「同 msg_id では sub_seq=1 のみ POST を発行」 する。 voice-tts
+    の audio_stream registry は同 msg_id 内で 1 subscriber に対して全 sub-text
+    の合成音声を順次 broadcast するので、 sub_seq=1 で開始した 1 POST 内に
+    後続の sub-text の音声もそのまま流れる (= 連結合成)。 sub_seq>=2 と
+    is_final=True での POST は不要。
+
+    ``sub_seq is None`` (= 旧 emit_speak 経路、 1 message=1 job 互換) は
+    sub_seq=1 と同じく POST を発行する。
     """
     if not persona_id or not message_id or not building_id:
+        return
+
+    sub_seq = _kwargs.get("sub_seq")
+    is_final = _kwargs.get("is_final", True)
+    if isinstance(sub_seq, int) and sub_seq >= 2:
+        LOGGER.debug(
+            "stackchan speak_hook: skipping sub_seq=%d is_final=%s msg=%s "
+            "(= already POSTing since sub_seq=1; voice-tts audio_stream "
+            "delivers later chunks to the existing subscriber)",
+            sub_seq, is_final, message_id,
+        )
         return
 
     vm = get_vessel_manager()
