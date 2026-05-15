@@ -14,16 +14,20 @@ voice-tts も同じ persona_speak hook を持つので両方が並行起動す�
   - 本 hook: 同じ audio_stream に subscribe (= 音源利用) → HTTP POST で gateway
 合成は voice-tts 側で 1 回しか走らない (二重合成にならない)。
 
-連続再生 (Phase 1: FIFO wait):
+連続再生 (Phase 1 FIFO wait + Phase 2 pulse-aware preempt):
     新しい persona_speak が来た時、 同じ vessel に向けて流れている既存 POST
-    があれば **その完了を待ってから** 新 POST を開始する (= preempt しない)。
-    これで 「同 pulse 内で連発した発話」 が全て途切れず順次再生される。
-    待ち合わせは ``_ActivePostState.completed`` を使い、 register は dict
-    末尾置換で chain する (= 3 連発も 1 → 2 → 3 の順に正しく流れる)。
+    があれば pulse_id を比較して挙動を切り替える:
+      - 同 pulse (= スペル前後の連続発話等) → 旧 POST の完了を **待ってから**
+        新 POST 開始 (= 順次再生で 1 つも切らない)
+      - 別 pulse (= ユーザー新ターン等の割り込み) → 旧 POST に abort signal
+        を立てて短時間 wait → 即新 POST 開始 (= ユーザー操作の即時反映)
+      - 片方/両方 pulse_id 不明 → 保守的に FIFO wait に倒す
 
-    旧 「常時 preempt」 動作は ``abort_requested`` event の経路を残しつつ
-    無効化してある (Phase 1 では誰も .set() しない)。 Phase 2 で pulse_id
-    比較を入れて 「同 pulse → wait / 別 pulse → preempt」 で発動させる。
+    register は dict 末尾置換で chain する (= 3 連発の同 pulse でも 1 → 2 → 3
+    の順に正しく流れる)。 別 pulse 発火時は abort signal が iterator に
+    届くと requests.post の body が終端、 gateway 側 ``tts_lock`` が解放され、
+    新 POST が即座に lock を取れる。 v0.4 の ``archive/audio_stream_bridge.py``
+    の ``_active_workers`` パターンの再構成。
 
 詳細設計: docs/intent/voice_tts_playback_queue.md (= Phase 1)、
 docs/intent/stackchan_vessel.md (SAIVerse 本体側) v0.5 §C-1
@@ -60,18 +64,16 @@ _VOICE_TTS_SAMPLE_RATE = 32000
 class _ActivePostState:
     """1 vessel に対して進行中の POST の状態。
 
-    Phase 1 (現状) では FIFO wait で順次再生される (= ``abort_requested``
-    は誰も .set() しない)。 Phase 2 で pulse_id を比較し、 別 pulse の
-    persona_speak が来た時のみ ``abort_requested`` を立てて旧 POST を
-    preempt する設計に拡張する予定。
-
     Field の意味:
       - ``message_id``: voice-tts の audio_stream key、 ログ識別用
       - ``pulse_id``: 発話を生んだ pulse 識別子 (Phase 2 の preempt 判定軸)
-      - ``abort_requested``: 立てると iterator が yield を止めて
-        requests.post の body を終端させ、 gateway が ``tts_lock`` を解放
+      - ``abort_requested``: 別 pulse 着信時に新 POST 側が .set() する。
+        旧 POST の iterator が検出すると yield を止めて requests.post の
+        body を終端させ、 gateway が ``tts_lock`` を解放。 同 pulse FIFO
+        では誰も .set() しない (= 旧 POST は自然完了を待つ)
       - ``completed``: thread が finally まで抜けた合図 (= POST が成功 /
-        失敗 / 早期 return のいずれでも立つ)、 後続 POST の wait 解除に使う
+        失敗 / 早期 return / abort のいずれでも立つ)、 後続 POST の wait
+        解除に使う
     """
     message_id: str
     pulse_id: Optional[str] = None
@@ -301,11 +303,12 @@ def _post_pcm_in_background(
 ) -> None:
     """別スレッドで HTTP POST を実行 (= server_hook を block しない)。
 
-    Phase 1 (FIFO wait): ``prev_state`` が non-None なら、 まずその
-    completed を待つ (= 直前 POST が完全に終わるまで自分は POST しない)。
-    timeout は 1 発話の最大想定再生時間 (= 5 分) + マージン。 タイムアウト
-    したら警告だけ残して進む (= 何かが詰まっていても次の発話を永遠に
-    block しないための安全弁)。
+    Phase 2 (pulse-aware): ``prev_state`` がある場合、 pulse_id を比較して
+    挙動を切り替える:
+      - 同 pulse (or 片方/両方 unknown) → FIFO wait (= 600s 上限で旧完了
+        を待つ。 timeout は 5 分発話 + 余裕の安全弁)
+      - 別 pulse → 旧 state に abort signal を立てて短時間 (= 5s) wait し、
+        旧 POST の解放を待ってから新 POST 開始 (= ユーザー新ターン即時反映)
 
     voice-tts の subscribe_pcm は subscribe-before-open 対応なので、まだ
     voice-tts 側で open_pcm_stream が呼ばれてなくても Queue が確保される。
@@ -319,9 +322,9 @@ def _post_pcm_in_background(
     listening に戻ってしまう (詳細は ``_wait_first_chunk`` の docstring
     参照)。
 
-    ``state.abort_requested`` が立った場合 (= Phase 2 の別 pulse preempt)、
-    first chunk 待ち中なら諦めて return、 既に POST 中なら iterator が
-    止まって body 終端する。 Phase 1 では誰も .set() しないので発火しない。
+    ``state.abort_requested`` が立った場合 (= 自分が更に新しい pulse に
+    preempt された場合)、 first chunk 待ち中なら諦めて return、 既に POST
+    中なら iterator が止まって body 終端する。
 
     関数末尾の finally で必ず ``_clear_active_post`` を呼ぶので
     ``state.completed`` は確実に立つ (= 次の persona_speak が待ち合わせ
@@ -330,24 +333,59 @@ def _post_pcm_in_background(
     import time as _time
 
     try:
-        # Phase 1: FIFO wait — 直前 POST が完了するまで block する。
         if prev_state is not None:
-            _PREV_WAIT_TIMEOUT = 600.0  # 10 分: 5 分発話 + 余裕
-            wait_start = _time.monotonic()
-            if not prev_state.completed.wait(timeout=_PREV_WAIT_TIMEOUT):
-                LOGGER.warning(
-                    "stackchan speak_hook[%s]: prev POST did not complete "
-                    "within %.0fs vessel_id=%s prev_msg=%s — proceeding "
-                    "anyway (gateway lock may still be held)",
-                    message_id, _PREV_WAIT_TIMEOUT, vessel_id,
-                    prev_state.message_id,
+            _is_cross_pulse = (
+                state.pulse_id is not None
+                and prev_state.pulse_id is not None
+                and state.pulse_id != prev_state.pulse_id
+            )
+            if _is_cross_pulse:
+                # Phase 2 別 pulse preempt: 旧 POST に abort 立てて短時間 wait。
+                # iterator が abort を見れば即 return → finally で completed
+                # が立つので、 通常は 5s 以内に完了する。 timeout したら警告
+                # だけ残して新 POST に進む (= gateway lock が残ってる可能性
+                # があるが、 ユーザー応答性を優先する)。
+                prev_state.abort_requested.set()
+                _PREEMPT_WAIT_TIMEOUT = 5.0
+                wait_start = _time.monotonic()
+                LOGGER.info(
+                    "stackchan speak_hook[%s]: preempting prev pulse=%s "
+                    "(new pulse=%s) vessel_id=%s prev_msg=%s",
+                    message_id, prev_state.pulse_id, state.pulse_id,
+                    vessel_id, prev_state.message_id,
                 )
+                if not prev_state.completed.wait(timeout=_PREEMPT_WAIT_TIMEOUT):
+                    LOGGER.warning(
+                        "stackchan speak_hook[%s]: prev POST did not abort "
+                        "within %.1fs vessel_id=%s prev_msg=%s — proceeding "
+                        "(gateway lock may still be held)",
+                        message_id, _PREEMPT_WAIT_TIMEOUT, vessel_id,
+                        prev_state.message_id,
+                    )
+                else:
+                    LOGGER.debug(
+                        "stackchan speak_hook[%s]: prev POST aborted after "
+                        "%.2fs wait, starting our turn",
+                        message_id, _time.monotonic() - wait_start,
+                    )
             else:
-                LOGGER.debug(
-                    "stackchan speak_hook[%s]: prev POST completed after "
-                    "%.2fs wait, starting our turn",
-                    message_id, _time.monotonic() - wait_start,
-                )
+                # Phase 1 同 pulse FIFO wait: 旧 POST の自然完了を待つ。
+                _PREV_WAIT_TIMEOUT = 600.0  # 10 分: 5 分発話 + 余裕
+                wait_start = _time.monotonic()
+                if not prev_state.completed.wait(timeout=_PREV_WAIT_TIMEOUT):
+                    LOGGER.warning(
+                        "stackchan speak_hook[%s]: prev POST did not complete "
+                        "within %.0fs vessel_id=%s prev_msg=%s — proceeding "
+                        "anyway (gateway lock may still be held)",
+                        message_id, _PREV_WAIT_TIMEOUT, vessel_id,
+                        prev_state.message_id,
+                    )
+                else:
+                    LOGGER.debug(
+                        "stackchan speak_hook[%s]: prev POST completed after "
+                        "%.2fs wait, starting our turn",
+                        message_id, _time.monotonic() - wait_start,
+                    )
 
         subscribe_pcm, _ = _load_voice_tts_subscribe()
         if subscribe_pcm is None:
