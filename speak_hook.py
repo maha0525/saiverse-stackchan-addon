@@ -14,16 +14,19 @@ voice-tts も同じ persona_speak hook を持つので両方が並行起動す�
   - 本 hook: 同じ audio_stream に subscribe (= 音源利用) → HTTP POST で gateway
 合成は voice-tts 側で 1 回しか走らない (二重合成にならない)。
 
-割り込み再生 (= 後発優先):
-    新しい persona_speak が来たら、 同じ vessel に向けて流れている既存 POST
-    を abort する。 abort signal を受けた iterator は yield を止めて
-    requests.post の body を終端させ、 gateway 側 ``send_pcm_stream`` は
-    ``tts_lock`` を解放する。 これで 2 個目の POST が server flow control
-    の閉塞 (= 1 個目が lock を握り続けるため send buffer 満タンで client が
-    7 秒で TimeoutError 食らう) を回避できる。 v0.4 の
-    ``archive/audio_stream_bridge.py`` の ``_active_workers`` パターンの移植。
+連続再生 (Phase 1: FIFO wait):
+    新しい persona_speak が来た時、 同じ vessel に向けて流れている既存 POST
+    があれば **その完了を待ってから** 新 POST を開始する (= preempt しない)。
+    これで 「同 pulse 内で連発した発話」 が全て途切れず順次再生される。
+    待ち合わせは ``_ActivePostState.completed`` を使い、 register は dict
+    末尾置換で chain する (= 3 連発も 1 → 2 → 3 の順に正しく流れる)。
 
-詳細設計: docs/intent/stackchan_vessel.md (SAIVerse 本体側) v0.5 §C-1
+    旧 「常時 preempt」 動作は ``abort_requested`` event の経路を残しつつ
+    無効化してある (Phase 1 では誰も .set() しない)。 Phase 2 で pulse_id
+    比較を入れて 「同 pulse → wait / 別 pulse → preempt」 で発動させる。
+
+詳細設計: docs/intent/voice_tts_playback_queue.md (= Phase 1)、
+docs/intent/stackchan_vessel.md (SAIVerse 本体側) v0.5 §C-1
 """
 import logging
 import sys
@@ -50,19 +53,28 @@ ADDON_NAME = "saiverse-stackchan-addon"
 _VOICE_TTS_SAMPLE_RATE = 32000
 
 
-# ----- 割り込み再生 (= 後発優先) 用の vessel 単位 in-flight POST tracking ---
+# ----- vessel 単位 in-flight POST tracking (Phase 1: FIFO wait chain) -----
 
 
 @dataclass
 class _ActivePostState:
     """1 vessel に対して進行中の POST の状態。
 
-    新しい persona_speak が来た時、 ``abort_requested`` を立てると iterator
-    が yield を止め、 requests.post が body を終端、 gateway がロックを
-    開放するので、 次の POST が即座に進める。 ``completed`` は thread が
-    実際に finally まで抜けた合図 (= 古い POST が完全に処理を終えた)。
+    Phase 1 (現状) では FIFO wait で順次再生される (= ``abort_requested``
+    は誰も .set() しない)。 Phase 2 で pulse_id を比較し、 別 pulse の
+    persona_speak が来た時のみ ``abort_requested`` を立てて旧 POST を
+    preempt する設計に拡張する予定。
+
+    Field の意味:
+      - ``message_id``: voice-tts の audio_stream key、 ログ識別用
+      - ``pulse_id``: 発話を生んだ pulse 識別子 (Phase 2 の preempt 判定軸)
+      - ``abort_requested``: 立てると iterator が yield を止めて
+        requests.post の body を終端させ、 gateway が ``tts_lock`` を解放
+      - ``completed``: thread が finally まで抜けた合図 (= POST が成功 /
+        失敗 / 早期 return のいずれでも立つ)、 後続 POST の wait 解除に使う
     """
     message_id: str
+    pulse_id: Optional[str] = None
     abort_requested: threading.Event = field(default_factory=threading.Event)
     completed: threading.Event = field(default_factory=threading.Event)
 
@@ -71,70 +83,43 @@ _active_posts: Dict[str, _ActivePostState] = {}
 _active_posts_lock = threading.Lock()
 
 
-def _preempt_and_register(
+def _register_at_tail(
     vessel_id: str, new_state: _ActivePostState
 ) -> Optional[_ActivePostState]:
-    """同一 vessel の既存 POST に abort を立てつつ、 新 state を register。
+    """新 state を vessel の queue 末尾として register、 直前 state を返す。
 
-    アトミックに次を行う:
-      1. ``_active_posts[vessel_id]`` の既存 state を取得 (= 我々が preempt
-         する対象)
-      2. それの ``abort_requested`` を立てる (= 立ってなかった場合)
-      3. ``_active_posts[vessel_id]`` を ``new_state`` に置換 (= 我々が
-         「現役」 になる)
+    Phase 1 の FIFO chaining: 連発 1 → 2 → 3 はそれぞれ:
+      - 1 が register: prev=None
+      - 2 が register: prev=1 → 2 は 1.completed を待ってから POST 開始
+      - 3 が register: prev=2 → 3 は 2.completed を待ってから POST 開始
 
-    返り値の旧 state は呼び出し側が ``completed.wait()`` で gateway 側
-    ロック解放を待つために使う。 旧 state が既に completed していたり
-    存在しない場合は ``None``。
+    結果として 2 は 1 の後ろ、 3 は 2 の後ろに並び、 順次再生される。
+    各 state の completed.set() が次の wait を解除する chain で、 GIL 下の
+    register-then-wait の race も無い (register をアトミックにやれば、
+    後続から見た 「直前 state」 が確実に 1 つ前になる)。
 
-    連発を正しく扱うため、 step (3) を wait より先に行うのが肝要。 これを
-    やらないと、 同時に発火した 2 つの persona_speak がそれぞれ「dict の
-    旧 state」 を見て同じ古い state を待つ → 両方とも wait 後に POST を
-    始めて gateway lock を奪い合う、 という race が起きる (= 観測例:
-    msg 153 と msg 154 が同時発火、 msg 154 が ConnectionAbortedError で
-    fail した 2026-05-15 00:29:32 のログ)。
+    旧 state が既に completed している (= POST が高速に終わった) 場合は
+    None を返し、 呼び出し側は wait をスキップして即 POST 開始する。
     """
     with _active_posts_lock:
-        old = _active_posts.get(vessel_id)
-        if old is not None and old.completed.is_set():
-            # 既に完了済みの残骸。 待つ必要なし。
-            old = None
-        if old is not None:
-            if not old.abort_requested.is_set():
-                old.abort_requested.set()
-                LOGGER.info(
-                    "stackchan speak_hook: preempting in-flight POST "
-                    "vessel_id=%s old_msg=%s new_msg=%s",
-                    vessel_id, old.message_id, new_state.message_id,
-                )
-            else:
-                # 既に他の preempt (= 連発のさらに連発の中間者) が abort
-                # を立てている。 我々はその完了を待ち、 自分が register
-                # で 「現役」 になる。
-                LOGGER.info(
-                    "stackchan speak_hook: chaining preempt vessel_id=%s "
-                    "old_msg=%s new_msg=%s (old already aborted)",
-                    vessel_id, old.message_id, new_state.message_id,
-                )
+        prev = _active_posts.get(vessel_id)
+        if prev is not None and prev.completed.is_set():
+            # 既に終わってる残骸。 待つ必要なし。
+            prev = None
         _active_posts[vessel_id] = new_state
-    return old
-
-
-def _is_still_current(
-    vessel_id: str, state: _ActivePostState
-) -> bool:
-    """この state が依然 vessel の現役 (= dict のトップ) かチェック。
-
-    wait から戻った時に False なら、 さらに後発の persona_speak が我々を
-    追い越して register 済み。 我々は POST を始めず素直に降りる。
-    """
-    with _active_posts_lock:
-        return _active_posts.get(vessel_id) is state
+        if prev is not None:
+            LOGGER.debug(
+                "stackchan speak_hook: queued behind in-flight POST "
+                "vessel_id=%s prev_msg=%s new_msg=%s",
+                vessel_id, prev.message_id, new_state.message_id,
+            )
+    return prev
 
 
 def _clear_active_post(vessel_id: str, state: _ActivePostState) -> None:
     """POST 完了時に state を切り離す。 既に別の新しい state に置き換わって
-    いれば dict には触らず、 ``state.completed`` だけ立てる。"""
+    いれば dict には触らず、 ``state.completed`` だけ立てる (= 後続 wait
+    が解放される)。"""
     with _active_posts_lock:
         if _active_posts.get(vessel_id) is state:
             _active_posts.pop(vessel_id, None)
@@ -312,8 +297,15 @@ def _post_pcm_in_background(
     sample_rate: int,
     vessel_id: str,
     state: _ActivePostState,
+    prev_state: Optional[_ActivePostState],
 ) -> None:
     """別スレッドで HTTP POST を実行 (= server_hook を block しない)。
+
+    Phase 1 (FIFO wait): ``prev_state`` が non-None なら、 まずその
+    completed を待つ (= 直前 POST が完全に終わるまで自分は POST しない)。
+    timeout は 1 発話の最大想定再生時間 (= 5 分) + マージン。 タイムアウト
+    したら警告だけ残して進む (= 何かが詰まっていても次の発話を永遠に
+    block しないための安全弁)。
 
     voice-tts の subscribe_pcm は subscribe-before-open 対応なので、まだ
     voice-tts 側で open_pcm_stream が呼ばれてなくても Queue が確保される。
@@ -327,8 +319,10 @@ def _post_pcm_in_background(
     listening に戻ってしまう (詳細は ``_wait_first_chunk`` の docstring
     参照)。
 
-    ``state.abort_requested`` が立った場合、 first chunk 待ち中なら
-    諦めて return、 既に POST 中なら iterator が止まって body 終端する。
+    ``state.abort_requested`` が立った場合 (= Phase 2 の別 pulse preempt)、
+    first chunk 待ち中なら諦めて return、 既に POST 中なら iterator が
+    止まって body 終端する。 Phase 1 では誰も .set() しないので発火しない。
+
     関数末尾の finally で必ず ``_clear_active_post`` を呼ぶので
     ``state.completed`` は確実に立つ (= 次の persona_speak が待ち合わせ
     から抜けられる)。
@@ -336,6 +330,25 @@ def _post_pcm_in_background(
     import time as _time
 
     try:
+        # Phase 1: FIFO wait — 直前 POST が完了するまで block する。
+        if prev_state is not None:
+            _PREV_WAIT_TIMEOUT = 600.0  # 10 分: 5 分発話 + 余裕
+            wait_start = _time.monotonic()
+            if not prev_state.completed.wait(timeout=_PREV_WAIT_TIMEOUT):
+                LOGGER.warning(
+                    "stackchan speak_hook[%s]: prev POST did not complete "
+                    "within %.0fs vessel_id=%s prev_msg=%s — proceeding "
+                    "anyway (gateway lock may still be held)",
+                    message_id, _PREV_WAIT_TIMEOUT, vessel_id,
+                    prev_state.message_id,
+                )
+            else:
+                LOGGER.debug(
+                    "stackchan speak_hook[%s]: prev POST completed after "
+                    "%.2fs wait, starting our turn",
+                    message_id, _time.monotonic() - wait_start,
+                )
+
         subscribe_pcm, _ = _load_voice_tts_subscribe()
         if subscribe_pcm is None:
             return
@@ -349,6 +362,7 @@ def _post_pcm_in_background(
             return
 
         # abort_requested が立っていれば first chunk すら待たず諦める。
+        # Phase 1 では発火しない (Phase 2 で別 pulse preempt 時に発火)。
         if state.abort_requested.is_set():
             LOGGER.info(
                 "stackchan speak_hook[%s]: aborted before first chunk wait",
@@ -482,43 +496,21 @@ def on_persona_speak(
     # の SAIVerse → gateway は loopback で十分。
     pcm_url = f"http://127.0.0.1:{capture_port}/pcm"
 
+    pulse_id = _kwargs.get("pulse_id")
     LOGGER.info(
-        "stackchan speak_hook: forwarding audio to vessel_id=%s persona=%s msg=%s",
-        vessel.vessel_id, persona_id, message_id,
+        "stackchan speak_hook: forwarding audio to vessel_id=%s persona=%s "
+        "msg=%s pulse=%s",
+        vessel.vessel_id, persona_id, message_id, pulse_id,
     )
 
-    # 割り込み再生: 同 vessel の既存 POST に abort signal を立て、 新 state
-    # を即座に register (= アトミック)、 旧 POST の完了を最大 5 秒待つ。
-    # アトミック register が race 対策 (= 同時発火 2 連発で 2 個目が 1 個目
-    # を preempt できる)。 旧 POST の iterator が abort flag を検出して
-    # return → requests.post が body 終端 → gateway が tts_lock 解放 → 新
-    # POST が即座に lock を取れる。 v0.4 の audio_stream_bridge.py
-    # (archive/) の _active_workers パターンの移植。
-    state = _ActivePostState(message_id=message_id)
-    old_state = _preempt_and_register(vessel.vessel_id, state)
-    if old_state is not None:
-        if not old_state.completed.wait(timeout=5.0):
-            LOGGER.warning(
-                "stackchan speak_hook: previous POST did not complete "
-                "within 5s vessel_id=%s old_msg=%s — proceeding anyway "
-                "(gateway lock may still be held)",
-                vessel.vessel_id, old_state.message_id,
-            )
+    # Phase 1 (FIFO wait): 自分を queue 末尾として register し、 直前 state
+    # を取得。 直前 wait + POST 本体は別スレッドで実行する (= server_hook
+    # の dispatch を妨げない)。 register をアトミックに行うことで、 同時
+    # 発火した 2 連発でも 「2 個目から見た直前 = 1 個目」 が確実に決まる
+    # (= chain が壊れない)。
+    state = _ActivePostState(message_id=message_id, pulse_id=pulse_id)
+    prev_state = _register_at_tail(vessel.vessel_id, state)
 
-    # wait 中に更に後発が preempt してきた場合、 dict 上では我々は
-    # 「過去の人」 になっている。 POST を始めずに降り、 我々を待ってる
-    # 後発に completed を立てる。
-    if not _is_still_current(vessel.vessel_id, state):
-        LOGGER.info(
-            "stackchan speak_hook: stepping aside vessel=%s msg=%s "
-            "(superseded by a newer persona_speak)",
-            vessel.vessel_id, message_id,
-        )
-        state.completed.set()
-        return
-
-    # HTTP POST は subscribe_pcm Queue の drain が完了するまでブロックするので
-    # 別スレッドで走らせる (= server_hook の dispatch を妨げない)。
     thread = threading.Thread(
         target=_post_pcm_in_background,
         args=(
@@ -528,6 +520,7 @@ def on_persona_speak(
             _VOICE_TTS_SAMPLE_RATE,
             vessel.vessel_id,
             state,
+            prev_state,
         ),
         daemon=True,
         name=f"stackchan-pcm-{message_id[:8]}",
