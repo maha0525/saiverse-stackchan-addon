@@ -47,7 +47,8 @@
                 {"name": "listen",             "visible": false},
                 {"name": "gpio_test",          "visible": false},
                 {"name": "uart_diag",          "visible": false},
-                {"name": "check_vm_en",        "visible": false}
+                {"name": "check_vm_en",        "visible": false},
+                {"name": "load_avatar_set",    "visible": false}
             ]
         }
     }

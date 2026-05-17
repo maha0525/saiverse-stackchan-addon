@@ -67,6 +67,23 @@ class AvatarSetLoader:
         self._lock = threading.Lock()
         # persona_id -> last loaded checksum string ("sha256:...")
         self._last_loaded: dict[str, str] = {}
+        # 現在 Vessel Building にいるペルソナ (= まはー検証 2026-05-17、
+        # ⑤ finalize 時に自動転送するか判定するため、 in-memory で記録)。
+        # 入室 / 退室 hook で更新、 SAIVerse 再起動でリセット。
+        self._currently_vessel_persona: Optional[str] = None
+
+    def mark_persona_entered(self, persona_id: str) -> None:
+        with self._lock:
+            self._currently_vessel_persona = persona_id
+
+    def mark_persona_exited(self, persona_id: str) -> None:
+        with self._lock:
+            if self._currently_vessel_persona == persona_id:
+                self._currently_vessel_persona = None
+
+    def is_persona_in_vessel(self, persona_id: str) -> bool:
+        with self._lock:
+            return self._currently_vessel_persona == persona_id
 
     # ----- Storage layout -----
 
@@ -147,6 +164,31 @@ def _vessel_building_id() -> Optional[str]:
     params = get_params(ADDON_NAME, persona_id=None) or {}
     vbid = params.get("vessel_building_id")
     return vbid if isinstance(vbid, str) and vbid else None
+
+
+def _get_active_set_name(persona_id: str) -> str:
+    """avatar_pipeline からアクティブセット名を取得 (Phase 4.5-d-5)。
+
+    `<storage>/avatar_sets/<persona_id>/_active.json` を読む。 ファイルが
+    無い / 読めない / pipeline モジュール未配置の場合は DEFAULT_SET_NAME
+    にフォールバック (= 既存挙動と一致、 後方互換)。
+
+    lazy import で書く理由: avatar_loader は server_hook (= addon ロード時に
+    register される) なので、 import 時点で avatar_pipeline まで強制 import
+    したくない (= module ロード順序の依存を作らない)。
+    """
+    try:
+        from avatar_pipeline import get_avatar_pipeline_manager
+        active = get_avatar_pipeline_manager().get_active(persona_id)
+        if active:
+            return active
+    except Exception as exc:
+        LOGGER.warning(
+            "avatar_loader: failed to resolve active set name "
+            "for persona=%s, falling back to %r: %s",
+            persona_id, DEFAULT_SET_NAME, exc,
+        )
+    return DEFAULT_SET_NAME
 
 
 async def _get_stackchan_conn():
@@ -233,14 +275,21 @@ def on_persona_entered_building(
     if building_id != vessel_bid:
         return
 
+    # in-vessel 記録 (= ⑤ finalize 時の自動転送判定用、 まはー検証 2026-05-17)。
+    get_avatar_loader().mark_persona_entered(persona_id)
+
     # 1. avatar セットを load (= 配置されてれば)。
+    # アクティブセット名を avatar_pipeline から引く (Phase 4.5-d-5)。
+    # 4.5-d-5 以前は DEFAULT_SET_NAME 固定だったが、 複数バリエーション
+    # 対応のために `<persona_id>/_active.json` を見るようにする。
     loader = get_avatar_loader()
-    found = loader.find_persona_set(persona_id)
+    active_set_name = _get_active_set_name(persona_id)
+    found = loader.find_persona_set(persona_id, active_set_name)
     if found is None:
         LOGGER.info(
             "avatar_loader: no avatar set on disk for persona=%s "
             "(expected at %s) — skip auto-load, will still reset face state",
-            persona_id, loader.set_dir(persona_id),
+            persona_id, loader.set_dir(persona_id, active_set_name),
         )
     else:
         bin_path, manifest = found
@@ -320,6 +369,8 @@ def on_persona_exited_building(
         "avatar_loader: vessel exit by persona=%s — hiding avatar layer",
         persona_id,
     )
+    # in-vessel 記録から削除 (= ⑤ finalize の auto-transfer 対象外に)。
+    get_avatar_loader().mark_persona_exited(persona_id)
     _run_async_on_mcp_loop(
         _call_set_avatar("off"), timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
     )
