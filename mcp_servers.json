@@ -29,7 +29,7 @@
             "_comment_building_ids": "building_ids は SAIVerse 本体 A-3-c の Building 単位 visibility 機構。Vessel Building 内に居るペルソナにのみ物理身体ツールを visible にする。AddonConfig.vessel_building_id (UI で設定) が placeholder で挿入される。**未設定なら placeholder は literal 文字列のまま残り、実際の building_id と一致しないため全 Building で hidden になる** = 設定し忘れたら物理身体ツールが見えないので分かりやすい failure mode を選んでいる。",
             "spell_tools": [
                 {"name": "move_head",          "display_name": "首を動かす",         "visible": true,  "building_ids": ["${addon.saiverse-stackchan-addon.vessel_building_id}"]},
-                {"name": "take_photo",         "display_name": "写真を撮る",         "visible": true,  "building_ids": ["${addon.saiverse-stackchan-addon.vessel_building_id}"]},
+                {"name": "take_photo",         "display_name": "写真を撮る",         "visible": false, "_comment_visible": "see (native tool) でラップして attachment 経路に乗せるので生 MCP は隠す。詳細: tools/see.py"},
                 {"name": "set_avatar",         "display_name": "表情を変える",       "visible": true,  "building_ids": ["${addon.saiverse-stackchan-addon.vessel_building_id}"]},
                 {"name": "set_mouth",          "display_name": "口形状を設定",       "visible": true,  "building_ids": ["${addon.saiverse-stackchan-addon.vessel_building_id}"]},
                 {"name": "set_mouth_sequence", "display_name": "口パクシーケンス",   "visible": true,  "building_ids": ["${addon.saiverse-stackchan-addon.vessel_building_id}"]},
