@@ -948,4 +948,14 @@ def clear_device_leds() -> dict:
 _bootstrap_executors()
 
 
+# --- Audio input relay (v0.7: device-driven listen capture) -----------------
+#
+# stackchan-mcp gateway が device 主導 listen (LCD タッチ / ウェイクワード)
+# の Opus 音声を Ogg コンテナにパックして POST してくる経路。詳細は
+# audio_input_relay.py の docstring 参照。
+from audio_input_relay import audio_router  # noqa: E402
+
+router.include_router(audio_router)
+
+
 __all__ = ["router"]

@@ -52,6 +52,20 @@
             "description": "Stack-chan に紐付ける Vessel Building の ID。物理身体ツール (move_head / take_photo 等) はこの Building 内に居るペルソナにのみ visible になる (SAIVerse 本体 A-3-c の Building 単位 visibility)。SAIVerse の Building 編集 UI で対象 Vessel Building の BUILDINGID を確認して入力。**未設定の場合、物理身体ツールはどの Building でも visible にならない** ので設定必須。",
             "type": "text",
             "placeholder": "b_vessel_stackchan"
+        },
+        {
+            "key": "saiverse_api_host",
+            "label": "SAIVerse API ホスト (audio hook 用)",
+            "description": "stackchan-mcp gateway が device 主導 listen 音声を POST する SAIVerse 側 endpoint のホスト。gateway と SAIVerse が同一マシンで動く通常運用では変更不要。Phase 3' (Gemini inline 音声認識経路) で device → gateway → SAIVerse の流れを成立させるために使う。",
+            "type": "text",
+            "default": "127.0.0.1"
+        },
+        {
+            "key": "saiverse_api_port",
+            "label": "SAIVerse API ポート (audio hook 用)",
+            "description": "SAIVerse 本体 API のポート。city_a なら 8000、city_b なら 9000 が標準。Vessel Building が所属する city の API ポートを入力。",
+            "type": "text",
+            "default": "8000"
         }
     ],
     "server_hooks": [

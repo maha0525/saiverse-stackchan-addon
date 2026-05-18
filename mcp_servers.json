@@ -18,6 +18,7 @@
             "env": {
                 "STACKCHAN_TOKEN": "${addon.saiverse-stackchan-addon.master_token}",
                 "STACKCHAN_PCM_TOKEN": "${addon.saiverse-stackchan-addon.pcm_token}",
+                "STACKCHAN_AUDIO_HOOK_URL": "http://${addon.saiverse-stackchan-addon.saiverse_api_host}:${addon.saiverse-stackchan-addon.saiverse_api_port}/api/addon/saiverse-stackchan-addon/audio-in",
                 "HOST": "${addon.saiverse-stackchan-addon.gateway_host}",
                 "WS_PORT": "${addon.saiverse-stackchan-addon.gateway_ws_port}",
                 "CAPTURE_PORT": "${addon.saiverse-stackchan-addon.gateway_capture_port}",
