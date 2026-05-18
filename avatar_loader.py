@@ -54,9 +54,13 @@ MCP_TOOL_LOAD_SET = "load_avatar_set"
 # で再 expose している。 ここで呼ぶのは gateway の expose 名 = 短い方。
 MCP_TOOL_SET_AVATAR = "set_avatar"
 # device の boot session id を含む device status を取る。 SAIVerse 側
-# avatar cache (_last_loaded) と device 実状態の不整合を解消するため、
-# 入室時に session_id を確認して reboot を検知する目的で使う。
-MCP_TOOL_GET_DEVICE_STATUS = "get_device_status"
+# avatar cache (_device_current_checksum) と device 実状態の不整合を解消
+# するため、 入室時に session_id を確認して reboot を検知する目的で使う。
+# gateway の bare 名は ``get_device_info``、 これが内部で ESP32 の
+# ``self.get_device_status`` に relay される (stdio_server.py:735 の
+# tool_map 参照、 set_avatar が ``self.display.set_avatar`` に 対応する
+# のと同じパターン)。
+MCP_TOOL_GET_DEVICE_STATUS = "get_device_info"
 
 # load_avatar_set 全体のタイムアウト (HTTP 転送 + ESP32 PSRAM 書き込みを
 # 含む)。 MCP tool 側のデフォルトは 60 s、 こちらは余裕を見て 90 s。
@@ -322,15 +326,29 @@ def _fetch_device_session_id() -> Optional[str]:
         _call_get_device_status(), timeout_sec=_GET_STATUS_TIMEOUT_SEC,
     )
     if not result:
+        LOGGER.debug("_fetch_device_session_id: result is empty/None")
         return None
     try:
         parsed = json.loads(result) if isinstance(result, str) else result
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as exc:
+        LOGGER.warning(
+            "_fetch_device_session_id: JSON parse failed: %s, raw=%r",
+            exc, str(result)[:300],
+        )
         return None
     if not isinstance(parsed, dict):
+        LOGGER.warning(
+            "_fetch_device_session_id: parsed not dict, type=%s raw=%r",
+            type(parsed).__name__, str(result)[:300],
+        )
         return None
     sid = parsed.get("boot_session_id")
     if not isinstance(sid, str) or not sid:
+        LOGGER.warning(
+            "_fetch_device_session_id: no boot_session_id field "
+            "(keys=%s, raw=%r)",
+            list(parsed.keys()), str(result)[:300],
+        )
         return None
     return sid
 
