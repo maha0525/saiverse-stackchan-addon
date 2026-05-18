@@ -29,8 +29,9 @@ import json
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # addon_loader の spec_from_file_location 経由ロードでは __package__ が
 # 設定されないため相対 import が動かない。 同梱モジュールを絶対 import
@@ -177,9 +178,16 @@ class AvatarSetLoader:
         with self._lock:
             self._device_current_checksum = None
 
-    def reconcile_session(self, current_session_id: Optional[str]) -> None:
+    def reconcile_session(
+        self,
+        current_session_id: Optional[str],
+        on_invalidate: Optional[Callable[[], None]] = None,
+    ) -> None:
         """device の boot_session_id を比較して、 reboot を検知した場合に
-        cache を invalidate する。
+        cache を invalidate する。 ``on_invalidate`` が指定されていれば、
+        実際に invalidate が発生した時に lock 解放後に呼び出す (= polling
+        loop が再 transfer を発火する用途、 callback 内で再帰的に lock
+        を取らないため)。
 
         ``current_session_id`` が ``None`` の場合 (= device 不在、 古い
         firmware で session_id を返さない、 通信エラー等) は保守的に何も
@@ -187,6 +195,7 @@ class AvatarSetLoader:
         """
         if current_session_id is None:
             return
+        invalidated = False
         with self._lock:
             previous = self._last_seen_session_id
             if previous is None:
@@ -195,8 +204,7 @@ class AvatarSetLoader:
                 # 不要だが、 念のため None にしておく。
                 self._last_seen_session_id = current_session_id
                 self._device_current_checksum = None
-                return
-            if previous != current_session_id:
+            elif previous != current_session_id:
                 LOGGER.info(
                     "avatar_loader: device boot session changed (%s -> %s),"
                     " clearing cached avatar checksum (was %s)",
@@ -205,6 +213,14 @@ class AvatarSetLoader:
                 )
                 self._device_current_checksum = None
                 self._last_seen_session_id = current_session_id
+                invalidated = True
+        if invalidated and on_invalidate is not None:
+            try:
+                on_invalidate()
+            except Exception:
+                LOGGER.exception(
+                    "avatar_loader: on_invalidate callback failed"
+                )
 
 
 _loader = AvatarSetLoader()
@@ -500,3 +516,155 @@ def on_persona_exited_building(
     _run_async_on_mcp_loop(
         _call_set_avatar("off"), timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
     )
+
+
+# ----- Background reconcile loop (state 同期) -----
+#
+# 入室時の lazy check (= on_persona_entered_building) だけだと、 以下 2 つの
+# シナリオで device 状態と SAIVerse cache が乖離する:
+#
+#   A. SAIVerse 起動中に device 単独で reboot した場合 — 退室 / 再入室
+#      が無ければ気付かない
+#   B. device が blank の状態で、 既に vessel に居る persona が登録された
+#      まま SAIVerse を起動した場合 — そもそも入室 event が発火しないので
+#      avatar transfer が走らない
+#
+# これらに対応するため、 module ロード時に daemon thread を起動して:
+#   tick 0 (起動後 _INITIAL_DELAY 秒):   起動時 reconcile (= シナリオ B 対応)
+#   tick 1+ (以降 _POLL_INTERVAL ごと): session_id 監視で reboot 検知
+#                                        (= シナリオ A 対応)
+# を実行する。 thread は daemon なので SAIVerse プロセス停止時に自動終了。
+
+# MCP loop が初期化されるまでの猶予 (= addon ロード完了 → main app の MCP
+# subprocess connect → SAIVerse 側 _mcp._loop が ready になるまでの間)。
+_INITIAL_DELAY_SEC = 8.0
+# session_id 変化の polling 間隔。 device reboot 検知の応答性 vs MCP
+# round trip コストのバランス。 30 秒なら最悪 30 秒で reboot を反映、
+# get_device_status は軽い (JSON 返すだけ) ので負荷は無視できる範囲。
+_POLL_INTERVAL_SEC = 30.0
+
+
+def _query_current_vessel_persona(vessel_bid: str) -> Optional[str]:
+    """DB から「現在 vessel building に入室中のペルソナ ID」を 1 つ取得する。
+
+    Vessel Building は capacity=1 設計なので最大 1 件。 ``BuildingOccupancyLog``
+    で ``EXIT_TIMESTAMP IS NULL`` (= 退室記録なし = まだ入室中) を探す。
+
+    DB アクセス失敗時 (起動直後で DB 未初期化等) は WARNING を残して
+    ``None`` を返す。 呼び出し元は何もしない (= 次回 tick まで wait)。
+    """
+    try:
+        from database.session import SessionLocal  # noqa: E402
+        from database.models import BuildingOccupancyLog  # noqa: E402
+    except Exception as exc:
+        LOGGER.warning(
+            "avatar_loader: cannot import database session: %s", exc
+        )
+        return None
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(BuildingOccupancyLog)
+            .filter(BuildingOccupancyLog.BUILDINGID == vessel_bid)
+            .filter(BuildingOccupancyLog.EXIT_TIMESTAMP.is_(None))
+            .order_by(BuildingOccupancyLog.ID.desc())
+            .first()
+        )
+        return row.AIID if row is not None else None
+    except Exception as exc:
+        LOGGER.warning(
+            "avatar_loader: DB query for current vessel persona failed: %s",
+            exc,
+        )
+        return None
+    finally:
+        db.close()
+
+
+def _reconcile_vessel_state(reason: str) -> None:
+    """vessel に現在居るペルソナを取得して、 ``on_persona_entered_building``
+    相当の avatar transfer 経路に乗せる。 既存 hook を直接呼ぶことでロジック
+    重複を避ける (cache check / load / face reset すべて再利用)。
+    """
+    vessel_bid = _vessel_building_id()
+    if not vessel_bid:
+        return
+    persona_id = _query_current_vessel_persona(vessel_bid)
+    if persona_id is None:
+        LOGGER.debug(
+            "avatar_loader: %s — no persona currently in vessel, nothing to sync",
+            reason,
+        )
+        return
+    LOGGER.info(
+        "avatar_loader: %s — re-syncing avatar for persona=%s in vessel %s",
+        reason, persona_id, vessel_bid,
+    )
+    try:
+        on_persona_entered_building(
+            persona_id=persona_id, building_id=vessel_bid,
+        )
+    except Exception:
+        LOGGER.exception(
+            "avatar_loader: re-sync via on_persona_entered_building failed "
+            "for persona=%s", persona_id,
+        )
+
+
+def _periodic_reconcile_loop() -> None:
+    """daemon thread main — 起動時 reconcile + 定期 session_id 監視。"""
+    try:
+        time.sleep(_INITIAL_DELAY_SEC)
+        # シナリオ B: 起動時に既に vessel に居る persona の avatar を sync。
+        # この時点で MCP loop が ready でない場合は get_device_status が
+        # None を返すので reconcile_session は skip され、 _reconcile_vessel_state
+        # 内の on_persona_entered_building も load 経路で MCP コールが
+        # None になって安全に skip される。 次の tick で再試行されるので
+        # 大きな問題はない。
+        _reconcile_vessel_state("initial reconcile (startup)")
+
+        while True:
+            time.sleep(_POLL_INTERVAL_SEC)
+            current_sid = _fetch_device_session_id()
+            if current_sid is None:
+                # device 不在 / 古い firmware / 通信エラー — skip
+                continue
+            # session_id 変化があれば cache invalidate + vessel state を
+            # 再 sync する callback を渡す。 変化が無ければ callback は
+            # 呼ばれない (= 不要な transfer を発生させない)。
+            get_avatar_loader().reconcile_session(
+                current_sid,
+                on_invalidate=lambda: _reconcile_vessel_state(
+                    "device reboot detected via polling"
+                ),
+            )
+    except Exception:
+        LOGGER.exception(
+            "avatar_loader: periodic reconcile loop crashed, "
+            "device reboot detection disabled"
+        )
+
+
+def _start_reconcile_thread() -> None:
+    """module ロード時に 1 回だけ daemon thread を起動する。 多重起動防止用
+    に thread reference を module level に保持。
+    """
+    global _reconcile_thread
+    if _reconcile_thread is not None and _reconcile_thread.is_alive():
+        return
+    _reconcile_thread = threading.Thread(
+        target=_periodic_reconcile_loop,
+        name="avatar-loader-reconcile",
+        daemon=True,
+    )
+    _reconcile_thread.start()
+    LOGGER.info(
+        "avatar_loader: reconcile thread started "
+        "(initial_delay=%.0fs, poll_interval=%.0fs)",
+        _INITIAL_DELAY_SEC, _POLL_INTERVAL_SEC,
+    )
+
+
+_reconcile_thread: Optional[threading.Thread] = None
+_start_reconcile_thread()
