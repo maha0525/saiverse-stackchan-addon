@@ -199,11 +199,11 @@ class AvatarSetLoader:
         with self._lock:
             previous = self._last_seen_session_id
             if previous is None:
-                # 初回観測 — session_id を記録するのみ。 cache は既に
-                # 空のはず (= SAIVerse 起動直後の状態) なので invalidate
-                # 不要だが、 念のため None にしておく。
+                # 初回観測 — session_id を記録するのみ。 cache は触らない:
+                # 起動時 reconcile が既に成功してれば正しい checksum が
+                # 入っているのでそれを尊重、 失敗してれば空のままで次回
+                # 入室時に lazy load される (= 既存挙動と一致)。
                 self._last_seen_session_id = current_session_id
-                self._device_current_checksum = None
             elif previous != current_session_id:
                 LOGGER.info(
                     "avatar_loader: device boot session changed (%s -> %s),"
@@ -613,32 +613,48 @@ def _reconcile_vessel_state(reason: str) -> None:
 
 
 def _periodic_reconcile_loop() -> None:
-    """daemon thread main — 起動時 reconcile + 定期 session_id 監視。"""
+    """daemon thread main。 device が ready (= session_id 取れる状態) に
+    なるのを待ってから initial reconcile (= シナリオ B 対応)、 以降は同じ
+    ループで session_id 監視 (= シナリオ A 対応)。
+
+    initial reconcile を独立した 1 ステップにせず、 「session_id が初めて
+    取れたタイミング = device ready のタイミング」を起点にしているのは、
+    SAIVerse 起動直後は device がまだ boot 中 / gateway 未接続のことが
+    多く、 8 秒固定 delay の初期 reconcile では ``no_device`` で失敗する
+    ため。 session_id が取れるまで polling 経路で待つ。
+    """
     try:
         time.sleep(_INITIAL_DELAY_SEC)
-        # シナリオ B: 起動時に既に vessel に居る persona の avatar を sync。
-        # この時点で MCP loop が ready でない場合は get_device_status が
-        # None を返すので reconcile_session は skip され、 _reconcile_vessel_state
-        # 内の on_persona_entered_building も load 経路で MCP コールが
-        # None になって安全に skip される。 次の tick で再試行されるので
-        # 大きな問題はない。
-        _reconcile_vessel_state("initial reconcile (startup)")
-
+        initial_done = False
         while True:
-            time.sleep(_POLL_INTERVAL_SEC)
             current_sid = _fetch_device_session_id()
             if current_sid is None:
-                # device 不在 / 古い firmware / 通信エラー — skip
+                # device 未 ready / 古い firmware / 通信エラー — wait & retry
+                time.sleep(_POLL_INTERVAL_SEC)
                 continue
-            # session_id 変化があれば cache invalidate + vessel state を
-            # 再 sync する callback を渡す。 変化が無ければ callback は
-            # 呼ばれない (= 不要な transfer を発生させない)。
-            get_avatar_loader().reconcile_session(
-                current_sid,
-                on_invalidate=lambda: _reconcile_vessel_state(
-                    "device reboot detected via polling"
-                ),
-            )
+
+            if not initial_done:
+                # device が初めて ready になった瞬間 — シナリオ B 対応の
+                # initial reconcile を実行。 session_id を記録した後で
+                # vessel state を sync する。
+                LOGGER.info(
+                    "avatar_loader: device ready (session=%s), "
+                    "performing initial reconcile",
+                    current_sid,
+                )
+                get_avatar_loader().reconcile_session(current_sid)
+                _reconcile_vessel_state("initial reconcile (startup)")
+                initial_done = True
+            else:
+                # 以降は session_id 変化検知のみ。 変化があれば cache
+                # invalidate + vessel state 再 sync。
+                get_avatar_loader().reconcile_session(
+                    current_sid,
+                    on_invalidate=lambda: _reconcile_vessel_state(
+                        "device reboot detected via polling"
+                    ),
+                )
+            time.sleep(_POLL_INTERVAL_SEC)
     except Exception:
         LOGGER.exception(
             "avatar_loader: periodic reconcile loop crashed, "
@@ -646,19 +662,29 @@ def _periodic_reconcile_loop() -> None:
         )
 
 
+# プロセス全体で 1 つだけ thread を動かすために、 thread 名で enumerate
+# する。 avatar_loader.py は addon_loader 経由 / addon 内 lazy import 経由
+# など複数の module 名で同時 import されうるが、 OS process は同一なので
+# ``threading.enumerate()`` で見える thread は共通。
+_RECONCILE_THREAD_NAME = "saiverse-avatar-loader-reconcile"
+
+
 def _start_reconcile_thread() -> None:
-    """module ロード時に 1 回だけ daemon thread を起動する。 多重起動防止用
-    に thread reference を module level に保持。
+    """module ロード時に 1 回だけ daemon thread を起動する。 プロセス内で
+    同名 thread が既に走っていれば skip (= 多重 import 対策)。
     """
-    global _reconcile_thread
-    if _reconcile_thread is not None and _reconcile_thread.is_alive():
-        return
-    _reconcile_thread = threading.Thread(
+    for t in threading.enumerate():
+        if t.name == _RECONCILE_THREAD_NAME and t.is_alive():
+            LOGGER.debug(
+                "avatar_loader: reconcile thread already running, skip"
+            )
+            return
+    thread = threading.Thread(
         target=_periodic_reconcile_loop,
-        name="avatar-loader-reconcile",
+        name=_RECONCILE_THREAD_NAME,
         daemon=True,
     )
-    _reconcile_thread.start()
+    thread.start()
     LOGGER.info(
         "avatar_loader: reconcile thread started "
         "(initial_delay=%.0fs, poll_interval=%.0fs)",
@@ -666,5 +692,4 @@ def _start_reconcile_thread() -> None:
     )
 
 
-_reconcile_thread: Optional[threading.Thread] = None
 _start_reconcile_thread()
