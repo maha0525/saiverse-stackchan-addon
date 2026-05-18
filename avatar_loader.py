@@ -52,12 +52,19 @@ MCP_TOOL_LOAD_SET = "load_avatar_set"
 # いるが、 gateway は SAIVerse の MCP client に対しては bare 名 ``set_avatar``
 # で再 expose している。 ここで呼ぶのは gateway の expose 名 = 短い方。
 MCP_TOOL_SET_AVATAR = "set_avatar"
+# device の boot session id を含む device status を取る。 SAIVerse 側
+# avatar cache (_last_loaded) と device 実状態の不整合を解消するため、
+# 入室時に session_id を確認して reboot を検知する目的で使う。
+MCP_TOOL_GET_DEVICE_STATUS = "get_device_status"
 
 # load_avatar_set 全体のタイムアウト (HTTP 転送 + ESP32 PSRAM 書き込みを
 # 含む)。 MCP tool 側のデフォルトは 60 s、 こちらは余裕を見て 90 s。
 _LOAD_TIMEOUT_SEC = 90.0
 # set_avatar(idle/off) は 1 回の WS frame 往復だけなので短めで OK。
 _SET_AVATAR_TIMEOUT_SEC = 10.0
+# get_device_status は 1 回の WS frame 往復だけ、 入室経路に乗せるので
+# レイテンシを抑えたい。
+_GET_STATUS_TIMEOUT_SEC = 5.0
 
 
 class AvatarSetLoader:
@@ -65,12 +72,25 @@ class AvatarSetLoader:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # persona_id -> last loaded checksum string ("sha256:...")
-        self._last_loaded: dict[str, str] = {}
+        # device の PSRAM に現在 adopt されてる avatar set の checksum 1 つ。
+        # device は avatar set を同時に 1 つしか保持できず、 新規 load で
+        # 旧 set は上書きされて消える (= adopt 経路、 firmware
+        # AvatarSetFetcher::AdoptOwnedBuffer 参照)。 SAIVerse 側で
+        # ペルソナ別に「load 済み」を覚える設計は実機モデルと合わないため、
+        # ここでは device 状態を 1:1 で trace する。
+        # ``None`` = device の現状態不明 (起動直後、 session reset 後)。
+        self._device_current_checksum: Optional[str] = None
         # 現在 Vessel Building にいるペルソナ (= まはー検証 2026-05-17、
         # ⑤ finalize 時に自動転送するか判定するため、 in-memory で記録)。
         # 入室 / 退室 hook で更新、 SAIVerse 再起動でリセット。
         self._currently_vessel_persona: Optional[str] = None
+        # device の最後に観測した boot_session_id。 device 側で boot ごとに
+        # esp_random で生成される UUID。 入室時に都度 get_device_status で
+        # 取得し、 前回と違ったら device が reboot した = PSRAM クリア =
+        # cache を invalidate する必要がある、と判定する。
+        # 古い firmware (boot_session_id を返さない) には対応せず保守的に
+        # cache 維持する (= None のまま動作、 invalidate しない)。
+        self._last_seen_session_id: Optional[str] = None
 
     def mark_persona_entered(self, persona_id: str) -> None:
         with self._lock:
@@ -124,29 +144,67 @@ class AvatarSetLoader:
     # ----- Cache (連続ロードのスキップ判定) -----
 
     def is_load_required(self, persona_id: str, checksum: str) -> bool:
-        """前回ロード済みの checksum と比較し、 再ロードが必要なら True。
+        """device に現在 adopt されてる avatar checksum と比較し、 再ロード
+        が必要なら True。 ``persona_id`` は API 互換用 (= 内部判定は
+        checksum のみで完結、 device は 1 set しか持たないため)。
 
         ``checksum`` が空文字列なら常に再ロード扱い (= manifest に
         checksum がない / 古いフォーマット)。
         """
+        del persona_id  # device は 1 avatar set のみ保持、 persona 別比較不要
         if not checksum:
             return True
         with self._lock:
-            return self._last_loaded.get(persona_id) != checksum
+            return self._device_current_checksum != checksum
 
     def mark_loaded(self, persona_id: str, checksum: str) -> None:
+        """device に avatar が adopt されたことを記録する。 device は
+        1 set しか保持しないので、 ``persona_id`` は使わず checksum を
+        上書きする (= 新 set adopt で旧は捨てられる挙動と一致)。
+        """
+        del persona_id
         if not checksum:
             return
         with self._lock:
-            self._last_loaded[persona_id] = checksum
+            self._device_current_checksum = checksum
 
     def clear_cache(self, persona_id: Optional[str] = None) -> None:
-        """テスト / 手動再ロード用。 ``persona_id=None`` で全消去。"""
+        """テスト / 手動再ロード用。 ``persona_id`` 引数は API 互換のみで
+        実際の挙動には影響しない (device は 1 set 保持なので全消去のみ
+        意味がある)。
+        """
+        del persona_id
         with self._lock:
-            if persona_id is None:
-                self._last_loaded.clear()
-            else:
-                self._last_loaded.pop(persona_id, None)
+            self._device_current_checksum = None
+
+    def reconcile_session(self, current_session_id: Optional[str]) -> None:
+        """device の boot_session_id を比較して、 reboot を検知した場合に
+        cache を invalidate する。
+
+        ``current_session_id`` が ``None`` の場合 (= device 不在、 古い
+        firmware で session_id を返さない、 通信エラー等) は保守的に何も
+        しない (= cache 維持)。 これにより古い firmware との互換も保つ。
+        """
+        if current_session_id is None:
+            return
+        with self._lock:
+            previous = self._last_seen_session_id
+            if previous is None:
+                # 初回観測 — session_id を記録するのみ。 cache は既に
+                # 空のはず (= SAIVerse 起動直後の状態) なので invalidate
+                # 不要だが、 念のため None にしておく。
+                self._last_seen_session_id = current_session_id
+                self._device_current_checksum = None
+                return
+            if previous != current_session_id:
+                LOGGER.info(
+                    "avatar_loader: device boot session changed (%s -> %s),"
+                    " clearing cached avatar checksum (was %s)",
+                    previous, current_session_id,
+                    self._device_current_checksum,
+                )
+                self._device_current_checksum = None
+                self._last_seen_session_id = current_session_id
 
 
 _loader = AvatarSetLoader()
@@ -226,6 +284,41 @@ async def _call_set_avatar(face: str) -> str:
     return await conn.call_tool(MCP_TOOL_SET_AVATAR, {"face": face})
 
 
+async def _call_get_device_status() -> str:
+    """gateway の ``get_device_status`` MCP tool を呼ぶ。
+
+    新 firmware は JSON に ``boot_session_id`` フィールドを含める。 これを
+    SAIVerse 側で記録 / 比較して device reboot を検知する。
+    """
+    conn = await _get_stackchan_conn()
+    return await conn.call_tool(MCP_TOOL_GET_DEVICE_STATUS, {})
+
+
+def _fetch_device_session_id() -> Optional[str]:
+    """device の現在の ``boot_session_id`` を取得する。 取れなかったら ``None``。
+
+    保守的な失敗扱い: タイムアウト / MCP エラー / 古い firmware (= フィールド
+    なし) / JSON parse 失敗 のいずれも ``None`` 扱い。 呼び出し元は ``None``
+    を受け取った場合は cache を invalidate しない (= 古い firmware との
+    互換維持)。
+    """
+    result = _run_async_on_mcp_loop(
+        _call_get_device_status(), timeout_sec=_GET_STATUS_TIMEOUT_SEC,
+    )
+    if not result:
+        return None
+    try:
+        parsed = json.loads(result) if isinstance(result, str) else result
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    sid = parsed.get("boot_session_id")
+    if not isinstance(sid, str) or not sid:
+        return None
+    return sid
+
+
 def _run_async_on_mcp_loop(coro, timeout_sec: float) -> Optional[str]:
     """sync 文脈から MCP loop の coro を呼んで結果を取る共通ヘルパ。
 
@@ -276,13 +369,22 @@ def on_persona_entered_building(
         return
 
     # in-vessel 記録 (= ⑤ finalize 時の自動転送判定用、 まはー検証 2026-05-17)。
-    get_avatar_loader().mark_persona_entered(persona_id)
+    loader = get_avatar_loader()
+    loader.mark_persona_entered(persona_id)
+
+    # device の boot_session_id を取得して、 前回観測と比較する。 異なれば
+    # device が reboot した = PSRAM がクリアされた = `_last_loaded` cache
+    # は無効 (= "load 済み" と思ってる avatar は実際には device に存在
+    # しない) なので、 cache を全クリアして強制再 transfer に倒す。
+    # `None` (= 古い firmware で boot_session_id を返さない / 通信エラー)
+    # は保守的に無視 (= 既存挙動を維持)。
+    current_session_id = _fetch_device_session_id()
+    loader.reconcile_session(current_session_id)
 
     # 1. avatar セットを load (= 配置されてれば)。
     # アクティブセット名を avatar_pipeline から引く (Phase 4.5-d-5)。
     # 4.5-d-5 以前は DEFAULT_SET_NAME 固定だったが、 複数バリエーション
     # 対応のために `<persona_id>/_active.json` を見るようにする。
-    loader = get_avatar_loader()
     active_set_name = _get_active_set_name(persona_id)
     found = loader.find_persona_set(persona_id, active_set_name)
     if found is None:
@@ -323,7 +425,31 @@ def on_persona_entered_building(
                     "result=%s",
                     persona_id, mode, result,
                 )
-                loader.mark_loaded(persona_id, checksum)
+                # gateway は load_avatar_set の結果を JSON 文字列で返す
+                # ({"ok": bool, "checksum": str, "error": str|null,
+                # "bytes_transferred": int})。 device 不在等で転送失敗
+                # ("ok": false) なのに mark_loaded すると、 次回入室で
+                # 「load 済み」と誤認して skip 経路に入り、 そのペルソナ
+                # の avatar が永久に device に届かなくなる。 ok=true の
+                # 時だけマークし、 失敗時は WARNING を残して次回再試行
+                # を許容する。
+                try:
+                    parsed = (
+                        json.loads(result)
+                        if isinstance(result, str)
+                        else result
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict) and parsed.get("ok") is True:
+                    loader.mark_loaded(persona_id, checksum)
+                else:
+                    LOGGER.warning(
+                        "avatar_loader: load FAILED for persona=%s "
+                        "mode=%s result=%s — not marking as loaded, "
+                        "will retry on next vessel entry",
+                        persona_id, mode, result,
+                    )
 
     # 2. 状態リセット: 前ペルソナの face/mouth/blink 状態が device 側に
     # 残ってる可能性があるので、 idle を明示的に打って初期化する。
