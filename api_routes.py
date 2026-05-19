@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, status,
+    APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 # 同梱モジュールを絶対 import するためにパック自身のディレクトリを
@@ -946,6 +946,736 @@ def clear_device_leds() -> dict:
 
 
 _bootstrap_executors()
+
+
+# ============================================================================
+# Vessel Pairing endpoints (Phase 2')
+# ============================================================================
+# Stack-chan device の登録・解除を AddonManager UI から実行するための HTTP API。
+# archive/api_routes.py から移植 (v0.5 Bearer Token モデル合わせ + AddonConfig
+# 自動更新を追加)。
+#
+# 設計判断:
+#   - Phase 1' の single vessel 前提に従い、既にペアリング済み vessel があれば
+#     POST /pair は 409 を返す。ユーザーは DELETE で先に解除する
+#   - AddonConfig.master_token / vessel_building_id はペアリング時に自動更新
+#     (intent doc §Phase 2' 引き継ぎ事項、二重管理の自動同期)
+#   - 解除時に AddonConfig はクリアしない (= 再ペアリング時に上書きされる、
+#     UX で入力欄が空になると不便)
+#   - WebSocket /vessel と firmware 配信は廃止 (gateway は stackchan-mcp、
+#     flash は Step 4 で UI 経由 esptool subprocess に置き換え)
+
+from saiverse.addon_deps import get_manager  # noqa: E402
+from vessel_manager import get_vessel_manager  # noqa: E402
+
+_ADDON_NAME_FOR_CONFIG = "saiverse-stackchan-addon"
+
+
+class PairRequest(BaseModel):
+    """新規ペアリング発行リクエスト。"""
+    building_id: str
+    persona_id: Optional[str] = None
+    hardware_model: str = "stackchan_kickstarter_2025"
+
+
+class PairResponse(BaseModel):
+    """ペアリング発行レスポンス。device_token は平文で 1 回だけ返す。"""
+    vessel_id: str
+    device_token: str  # device の AP モード設定 UI に入力する値
+    building_id: str
+    gateway_ws_url: str  # ws://<vision_host>:<gateway_ws_port>/ (= AddonConfig 経由)
+
+
+def _build_gateway_ws_url() -> str:
+    """device の AP モード設定 UI で入力する Gateway URL を組み立てる。
+
+    AddonConfig から ``vision_host`` (= LAN IP) と ``gateway_ws_port``
+    (= WS 待受 port) を読んで合成する。 未設定なら placeholder 文字列を
+    返して UI に「ここを埋めてね」 と気づかせる。
+    """
+    from saiverse.addon_config import get_params
+
+    params = get_params(_ADDON_NAME_FOR_CONFIG)
+    host = (params.get("vision_host") or "").strip() or "<vision_host 未設定>"
+    port = (params.get("gateway_ws_port") or "").strip() or "8765"
+    return f"ws://{host}:{port}/"
+
+
+class VesselSummary(BaseModel):
+    """vessel 一覧 entry。"""
+    vessel_id: str
+    bound_building_id: str
+    bound_persona_id: Optional[str]
+    hardware_model: str
+    firmware_version: Optional[str]
+    paired_at: str
+    last_seen_at: Optional[str]
+    connected: bool
+
+
+def _update_addon_config_after_pair(
+    db,
+    *,
+    master_token: str,
+    vessel_building_id: str,
+) -> None:
+    """AddonConfig.params_json の master_token / vessel_building_id を更新。
+
+    intent doc §Phase 2' 引き継ぎ事項に従い、ペアリング操作時に AddonConfig
+    の値も自動で同期する (= mcp_servers.json placeholder の解決経路と
+    vessel_manager の vessels.db の二重管理を解消)。
+
+    既存パターン (api/routes/addon.py:440-445) と同じく AddonConfig 行を
+    直接 update する。本体側に汎用 set_param() は追加しない (= addon 個別
+    の都合で本体機構を生やすのを避ける、必要が出てきたら汎用化)。
+    """
+    from database.models import AddonConfig
+
+    row = db.query(AddonConfig).filter_by(
+        addon_name=_ADDON_NAME_FOR_CONFIG,
+    ).first()
+    if row is None:
+        row = AddonConfig(
+            addon_name=_ADDON_NAME_FOR_CONFIG,
+            is_enabled=True,
+            params_json=None,
+        )
+        db.add(row)
+
+    existing: dict = {}
+    if row.params_json:
+        try:
+            existing = json.loads(row.params_json)
+        except (json.JSONDecodeError, TypeError):
+            LOGGER.warning(
+                "api_routes: invalid params_json for %s, treating as empty",
+                _ADDON_NAME_FOR_CONFIG,
+            )
+            existing = {}
+
+    existing["master_token"] = master_token
+    existing["vessel_building_id"] = vessel_building_id
+    row.params_json = json.dumps(existing, ensure_ascii=False)
+
+
+@router.post("/pair", response_model=PairResponse)
+def pair_vessel(
+    req: PairRequest, manager=Depends(get_manager),
+) -> PairResponse:
+    """新規ペアリング発行 (Phase 2')。
+
+    1. Phase 1' single vessel 前提: 既に vessel が登録されていれば 409 を返す
+    2. Building 存在確認 + PHYSICAL_VESSEL_ID 未割り当て確認
+    3. vessel_manager.create_pairing で vessel_id + device_token 発行
+    4. Building.PHYSICAL_VESSEL_ID + CAPACITY=1 (不変条件 2) 強制
+    5. AddonConfig.master_token / vessel_building_id 自動更新
+
+    device_token は平文で 1 回だけレスポンスに含まれる。DB には sha256 ハッシュ
+    のみが保存されるため、紛失時は再ペアリングが必要。
+    """
+    from database.models import Building
+
+    vm = get_vessel_manager()
+
+    # Phase 1' single vessel 前提
+    existing = vm.list_vessels()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Already paired with vessel '{existing[0].vessel_id}'. "
+                "Phase 1' は single vessel 前提、 先に DELETE /vessels/<id> で "
+                "既存ペアリングを解除してから再実行してください。"
+            ),
+        )
+
+    db = manager.SessionLocal()
+    try:
+        building = db.query(Building).filter_by(
+            BUILDINGID=req.building_id,
+        ).first()
+        if not building:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Building '{req.building_id}' not found",
+            )
+        if building.PHYSICAL_VESSEL_ID:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Building '{req.building_id}' is already paired with "
+                    f"vessel '{building.PHYSICAL_VESSEL_ID}'."
+                ),
+            )
+
+        vessel_id, device_token = vm.create_pairing(
+            building_id=req.building_id,
+            persona_id=req.persona_id,
+            hardware_model=req.hardware_model,
+        )
+
+        # 不変条件 2: Vessel Building は capacity=1 強制
+        building.PHYSICAL_VESSEL_ID = vessel_id
+        building.CAPACITY = 1
+
+        _update_addon_config_after_pair(
+            db,
+            master_token=device_token,
+            vessel_building_id=req.building_id,
+        )
+
+        db.commit()
+        LOGGER.info(
+            "pair_vessel: vessel_id=%s building_id=%s persona_id=%s "
+            "(AddonConfig master_token / vessel_building_id auto-updated)",
+            vessel_id, req.building_id, req.persona_id,
+        )
+    finally:
+        db.close()
+
+    # AddonConfig 更新が DB に commit された後、 stackchan-mcp gateway
+    # subprocess を新 env で再起動する。 OS プロセスの env は起動時に固定
+    # されるため、 master_token 変更を実 gateway に反映するには subprocess
+    # 再起動が必須 (= さもなければ device は新 token で接続するが gateway
+    # は古い token で 401 reject の連発になる)。
+    #
+    # tools.mcp_client.reconnect_mcp_server は内部で _server_meta の
+    # raw_config を re-resolve してから disconnect → connect する (= 改修
+    # 済み、 docs/intent/stackchan_vessel.md Phase 2' 改修参照)。
+    _reconnect_stackchan_mcp_or_log()
+
+    return PairResponse(
+        vessel_id=vessel_id,
+        device_token=device_token,
+        building_id=req.building_id,
+        gateway_ws_url=_build_gateway_ws_url(),
+    )
+
+
+_STACKCHAN_MCP_QUALIFIED_NAME = "saiverse-stackchan-addon__stackchan"
+
+
+def _reconnect_stackchan_mcp_or_log() -> None:
+    """ペアリング後に stackchan-mcp gateway を新 env で再起動する。
+
+    失敗してもペアリング API は成功扱い (= vessels.db / Building /
+    AddonConfig は既に commit 済み)。 reconnect 失敗時は WARNING ログを
+    出して、 ユーザーには「SAIVerse 再起動で復旧する」 旨を UI で案内
+    する余地を残す (= Step 5 で UI 側にも反映予定)。
+    """
+    from tools.mcp_client import (  # noqa: E402
+        get_mcp_manager,
+        reconnect_mcp_server,
+    )
+    import tools.mcp_client as _mcp  # noqa: E402
+
+    manager = get_mcp_manager()
+    if manager is None:
+        LOGGER.warning(
+            "pair_vessel: MCP manager not initialized, skipping gateway "
+            "reconnect (= SAIVerse 再起動で復旧)",
+        )
+        return
+    loop = _mcp._loop
+    if loop is None:
+        LOGGER.warning(
+            "pair_vessel: MCP event loop not initialized, skipping gateway "
+            "reconnect (= SAIVerse 再起動で復旧)",
+        )
+        return
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            reconnect_mcp_server(_STACKCHAN_MCP_QUALIFIED_NAME),
+            loop,
+        )
+        success = future.result(timeout=15.0)
+        if success:
+            LOGGER.info(
+                "pair_vessel: stackchan-mcp gateway reconnected with new env",
+            )
+        else:
+            LOGGER.warning(
+                "pair_vessel: reconnect_mcp_server returned False "
+                "(server '%s' may not be running, or env unchanged) "
+                "— SAIVerse 再起動で確実に反映",
+                _STACKCHAN_MCP_QUALIFIED_NAME,
+            )
+    except asyncio.TimeoutError:
+        LOGGER.warning(
+            "pair_vessel: gateway reconnect timed out after 15s "
+            "(= subprocess respawn 中? SAIVerse 再起動で復旧)",
+        )
+    except Exception:
+        LOGGER.exception(
+            "pair_vessel: unexpected error during gateway reconnect "
+            "(= ペアリング自体は成功、 SAIVerse 再起動で復旧)",
+        )
+
+
+@router.get("/vessels")
+def list_vessels() -> dict:
+    """登録済み vessel 一覧と接続状態を返す。
+
+    `connected` は addon 内部の VesselSession state holder ベース。Phase 2'
+    では Phase 3' / 5' の event 経路がまだ薄いので、 register_session を
+    呼ぶ箇所が少なく、 実態としては「pairing 直後の接続成立」 を反映する
+    というよりは「addon 側で session が register された vessel」 を返す。
+    実機検証で UX が薄ければ Phase 4' 以降で gateway 経由の死活確認に
+    切り替える。
+    """
+    vm = get_vessel_manager()
+    records = vm.list_vessels()
+    connected_ids = {s.vessel_id for s in vm.list_sessions()}
+    return {
+        "vessels": [
+            VesselSummary(
+                vessel_id=r.vessel_id,
+                bound_building_id=r.bound_building_id,
+                bound_persona_id=r.bound_persona_id,
+                hardware_model=r.hardware_model,
+                firmware_version=r.firmware_version,
+                paired_at=r.paired_at,
+                last_seen_at=r.last_seen_at,
+                connected=r.vessel_id in connected_ids,
+            ).model_dump()
+            for r in records
+        ]
+    }
+
+
+@router.delete("/vessels/{vessel_id}")
+def delete_vessel(
+    vessel_id: str, manager=Depends(get_manager),
+) -> dict:
+    """ペアリング解除。Building.PHYSICAL_VESSEL_ID を NULL に戻す。
+
+    AddonConfig.master_token / vessel_building_id はクリアしない (= 再ペア
+    リング時に上書きされる、 UX で入力欄が空になると不便)。
+    """
+    from database.models import Building
+
+    vm = get_vessel_manager()
+    target = vm.get_vessel(vessel_id)
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Vessel '{vessel_id}' not found",
+        )
+
+    db = manager.SessionLocal()
+    try:
+        building = db.query(Building).filter_by(
+            BUILDINGID=target.bound_building_id,
+            PHYSICAL_VESSEL_ID=vessel_id,
+        ).first()
+        if building:
+            building.PHYSICAL_VESSEL_ID = None
+            db.commit()
+    finally:
+        db.close()
+
+    deleted = vm.delete_vessel(vessel_id)
+    LOGGER.info(
+        "delete_vessel: vessel_id=%s building_id=%s deleted=%s",
+        vessel_id, target.bound_building_id, deleted,
+    )
+    return {"deleted": deleted}
+
+
+# ============================================================================
+# Firmware flash endpoints (Phase 2' Step 4)
+# ============================================================================
+# Stack-chan device の NVS erase / firmware flash を UI から実行する。
+# esptool subprocess を backend で起動して、 stdout を SSE で realtime に
+# frontend へ stream する。
+#
+# 2 系統:
+#   - POST /flash/erase-nvs → NVS partition のみ消去 (0x9000 / 0x4000、
+#     16m.csv 準拠)。 ペアリング解除後の AP モード復帰用、 詰み防止に必須
+#   - POST /flash/firmware  → merged-binary.bin を 0x0 に書き込み (初回 /
+#     クリーンインストール)
+#
+# 設計判断:
+#   - esptool バイナリは shutil.which で resolve、 見つからなければ uvx
+#     fallback (= 環境固有の障壁を最小化)
+#   - 進捗は SSE (text/event-stream)。 EventSource API で frontend は
+#     simple に購読可
+#   - cancel は SSE 切断 = subprocess kill (= asyncio.shield しない)
+#   - firmware path は `~/.saiverse/addons/saiverse-stackchan-addon/firmware/
+#     merged-binary.bin` を default。 自動 DL は Phase 後半で
+
+import os
+import shutil
+import subprocess
+
+# NVS partition: stackchan-mcp の partitions/v2/16m.csv 準拠
+_NVS_OFFSET = "0x9000"
+_NVS_SIZE = "0x4000"
+
+
+def _resolve_esptool_command() -> list[str]:
+    """esptool の起動コマンドを返す。
+
+    優先順位:
+      1. ``shutil.which("esptool")`` (= PATH 上の esptool バイナリ、
+         例: ``~/.local/bin/esptool.exe`` を ~/.bashrc PATH で公開)
+      2. fallback: ``uvx esptool`` (= uv 経由で一時 install + 実行、
+         初回は数秒の install 待ち。 stackchan-mcp gateway 自体が uv
+         前提なので、 uv が使える前提は確実)
+
+    どちらも見つからなければ HTTPException 503 (= UI 側で「esptool が
+    使えない、 uv 入れて」 と案内する経路に乗せる)。
+    """
+    direct = shutil.which("esptool")
+    if direct:
+        return [direct]
+    uvx = shutil.which("uvx")
+    if uvx:
+        return [uvx, "esptool"]
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "esptool が見つかりません。 uv (= uvx) を install するか、 "
+            "pip install esptool で PATH に通してください。"
+        ),
+    )
+
+
+def _firmware_resolve_path() -> Optional[Path]:
+    """書き込みに使う merged-binary.bin の path を決定する。
+
+    優先順位:
+      1. AddonConfig.firmware_path (UI で path 指定) — 設定済みで存在
+         するならそれを返す
+      2. ``<SAIVerse repo>/temp/stackchan-mcp/firmware/build/
+         merged-binary.bin`` (= ローカル開発者の ESP-IDF build 成果物、
+         まはー の手元 fork repo の build dir そのまま参照する。 GPL-3.0
+         firmware を addon に複製しないため、 intent doc §8 と整合)
+      3. ``~/.saiverse/addons/saiverse-stackchan-addon/firmware/
+         merged-binary.bin`` (= 一般ユーザー向け、 GitHub Releases から
+         DL して配置する想定の path)
+
+    どれも見つからなければ None を返す (= 呼び出し側で 404 を返す)。
+    """
+    from saiverse.addon_config import get_params
+    from saiverse.addon_paths import get_addon_storage_path
+
+    # (1) AddonConfig.firmware_path
+    params = get_params(_ADDON_NAME_FOR_CONFIG)
+    user_path_str = (params.get("firmware_path") or "").strip()
+    if user_path_str:
+        user_path = Path(user_path_str)
+        if user_path.exists():
+            return user_path
+
+    # (2) repo 配下のローカル build dir
+    # __file__ は ~/.saiverse/... ではなく expansion_data/saiverse-stackchan
+    # -addon/api_routes.py を指す (= addon_loader が spec_from_file_location
+    # で読むため). そこから親 5 階層上 (api_routes.py → addon → expansion
+    # _data → SAIVerse repo root) で repo root を取る。
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    repo_build = (
+        repo_root / "temp" / "stackchan-mcp" / "firmware" / "build"
+        / "merged-binary.bin"
+    )
+    if repo_build.exists():
+        return repo_build
+
+    # (3) 一般ユーザー向け配置場所
+    user_default = (
+        get_addon_storage_path(_ADDON_NAME_FOR_CONFIG)
+        / "firmware" / "merged-binary.bin"
+    )
+    if user_default.exists():
+        return user_default
+
+    return None
+
+
+class FlashPort(BaseModel):
+    port: str  # "COM3" 等
+    description: str  # "USB Serial Device (COM3)" 等
+    vid: Optional[str] = None  # "303A" 等
+    pid: Optional[str] = None  # "1001" 等
+
+
+class FirmwareInfo(BaseModel):
+    path: Optional[str] = None
+    exists: bool = False
+    size: Optional[int] = None
+    mtime_iso: Optional[str] = None
+    source: str  # "addon_config" / "local_build" / "user_default" / "not_found"
+
+
+@router.get("/flash/firmware-info", response_model=FirmwareInfo)
+def flash_firmware_info() -> FirmwareInfo:
+    """書き込みに使われる firmware の情報を返す (UI 表示用)。
+
+    `_firmware_resolve_path()` の解決結果 + どの経路で見つかったかを返す。
+    UI 側で「ローカル build dir を使ってる」 「user_default を使ってる」
+    「未検出」 等を表示できるようにする。
+    """
+    from datetime import datetime, timezone
+    from saiverse.addon_config import get_params
+
+    fw_path = _firmware_resolve_path()
+    if fw_path is None:
+        return FirmwareInfo(source="not_found")
+
+    # どの経路で見つかったかを fw_path から逆引きで判定
+    params = get_params(_ADDON_NAME_FOR_CONFIG)
+    user_path_str = (params.get("firmware_path") or "").strip()
+    if user_path_str and str(fw_path) == user_path_str:
+        source = "addon_config"
+    elif "temp" in fw_path.parts and "stackchan-mcp" in fw_path.parts:
+        source = "local_build"
+    else:
+        source = "user_default"
+
+    try:
+        stat = fw_path.stat()
+        size = stat.st_size
+        mtime_iso = datetime.fromtimestamp(
+            stat.st_mtime, tz=timezone.utc,
+        ).isoformat()
+    except OSError:
+        size = None
+        mtime_iso = None
+
+    return FirmwareInfo(
+        path=str(fw_path),
+        exists=True,
+        size=size,
+        mtime_iso=mtime_iso,
+        source=source,
+    )
+
+
+@router.get("/flash/ports", response_model=list[FlashPort])
+def list_flash_ports() -> list[FlashPort]:
+    """利用可能な COM port を返す。 Windows のみで実装、 ESP32-S3
+    (VID 303A) を filter してリストアップする。
+
+    Linux/Mac は将来対応 (= まはー の環境は Windows のみ)。
+    """
+    if sys.platform != "win32":
+        return []
+
+    # PowerShell の Get-PnpDevice で USB Serial Device を列挙、
+    # VID 303A / 10C4 (CP210x) / 1A86 (CH340) 等 ESP32 系を filter
+    ps_cmd = (
+        "Get-PnpDevice -Class Ports -PresentOnly "
+        "| Where-Object { $_.Status -eq 'OK' } "
+        "| Select-Object Name, DeviceID "
+        "| ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        LOGGER.warning("list_flash_ports: powershell failed: %s", exc)
+        return []
+
+    if result.returncode != 0:
+        LOGGER.warning(
+            "list_flash_ports: powershell rc=%d stderr=%s",
+            result.returncode, result.stderr,
+        )
+        return []
+
+    raw = result.stdout.strip()
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        LOGGER.warning("list_flash_ports: invalid JSON from powershell: %r", raw[:200])
+        return []
+
+    # 0 件で null、 1 件で dict、 複数で list が返るので正規化
+    if data is None:
+        entries: list[dict] = []
+    elif isinstance(data, dict):
+        entries = [data]
+    elif isinstance(data, list):
+        entries = data
+    else:
+        entries = []
+
+    ports: list[FlashPort] = []
+    for ent in entries:
+        name = ent.get("Name", "") or ""
+        device_id = ent.get("DeviceID", "") or ""
+        # COM port 抽出: "USB Serial Device (COM3)" → "COM3"
+        # name に (COMx) が含まれていれば抽出、 なければ skip
+        import re
+        m = re.search(r"\((COM\d+)\)", name)
+        if not m:
+            continue
+        port = m.group(1)
+        # VID/PID 抽出: "USB\VID_303A&PID_1001\..." 形式
+        vid_m = re.search(r"VID_([0-9A-Fa-f]{4})", device_id)
+        pid_m = re.search(r"PID_([0-9A-Fa-f]{4})", device_id)
+        ports.append(FlashPort(
+            port=port,
+            description=name,
+            vid=vid_m.group(1).upper() if vid_m else None,
+            pid=pid_m.group(1).upper() if pid_m else None,
+        ))
+    return ports
+
+
+def _stream_esptool(args: list[str], op_label: str):
+    """esptool subprocess を起動して stdout を SSE event として yield する。
+
+    SSE 形式: ``data: <json>\\n\\n`` の繰り返し。 各 event の JSON は:
+      - {"type": "line", "text": "..."}        # stdout 1 行
+      - {"type": "done", "returncode": N}      # 終了
+      - {"type": "error", "text": "..."}       # 致命的エラー
+
+    HTTPException は raise しない (= 起動後のエラーは SSE 内で報告、
+    起動前のエラー = esptool 不在等は呼び出し側で先に弾く)。
+    """
+    cmd = _resolve_esptool_command() + args
+    LOGGER.info("flash: starting esptool: %s (%s)", cmd, op_label)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,  # line buffered
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, FileNotFoundError) as exc:
+        LOGGER.exception("flash: failed to start esptool")
+        err_event = {"type": "error", "text": f"esptool 起動失敗: {exc}"}
+        yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
+        return
+
+    try:
+        assert proc.stdout is not None
+        for line in iter(proc.stdout.readline, ""):
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            event = {"type": "line", "text": line}
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        proc.stdout.close()
+        rc = proc.wait(timeout=10)
+    except Exception as exc:
+        LOGGER.exception("flash: error while streaming esptool output")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        err_event = {"type": "error", "text": str(exc)}
+        yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
+        return
+
+    done_event = {"type": "done", "returncode": rc}
+    yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+    LOGGER.info("flash: esptool finished rc=%d (%s)", rc, op_label)
+
+
+def _validate_com_port(port: str) -> str:
+    """COM port 文字列を validate + sanitize する。
+
+    subprocess に渡す前に「COM<数字>」 形式しか許可しない (= shell injection
+    回避、 ただし Popen で shell=False なので injection は元々ないが安全策)。
+    """
+    import re
+    if not re.fullmatch(r"COM\d+", port):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid COM port: {port!r}",
+        )
+    return port
+
+
+@router.post("/flash/erase-nvs")
+def flash_erase_nvs(port: str = Query(...)) -> StreamingResponse:
+    """NVS partition のみを erase (= AP モード復帰)。
+
+    ペアリング解除後に device が古い token のままで詰む状況を解消する。
+    firmware と OTA は無傷。 数秒で完了。
+    """
+    port = _validate_com_port(port)
+    args = [
+        "--chip", "esp32s3", "--port", port,
+        "erase-region", _NVS_OFFSET, _NVS_SIZE,
+    ]
+    return StreamingResponse(
+        _stream_esptool(args, f"erase-nvs port={port}"),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # nginx buffering 無効化
+        },
+    )
+
+
+@router.post("/flash/firmware")
+def flash_firmware(
+    port: str = Query(...),
+    firmware_path: Optional[str] = Query(None),
+) -> StreamingResponse:
+    """merged-binary.bin を 0x0 に書き込み (= 初回 / クリーンインストール)。
+
+    NVS も含めて全消去 + 書き込みなので、 既存ペアリング情報はリセット
+    される。 完了後 device は AP モードで起動するので、 captive portal
+    で新規 Wi-Fi + Token 設定が必要。
+
+    firmware_path 指定なしなら ``_firmware_resolve_path()`` で 3 段階の
+    fallback (AddonConfig → ローカル build dir → 一般ユーザー DL 配置)
+    を走らせて使う path を決定する。
+    """
+    port = _validate_com_port(port)
+    if firmware_path:
+        fw_path: Optional[Path] = Path(firmware_path)
+    else:
+        fw_path = _firmware_resolve_path()
+    if fw_path is None or not fw_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "merged-binary.bin が見つかりません。\n\n"
+                "(1) ローカルでビルドするなら "
+                "<SAIVerse repo>/temp/stackchan-mcp/firmware/build/ に "
+                "merged-binary.bin を生成 (`esptool merge-bin` 等)、 "
+                "(2) GitHub Releases から DL する場合は "
+                "~/.saiverse/addons/saiverse-stackchan-addon/firmware/ に "
+                "配置してください。 もしくは AddonConfig.firmware_path で "
+                "絶対 path を指定してください。"
+            ),
+        )
+    # path traversal 簡易チェック (= 任意の path を許す代わりに最低限の
+    # validation、 query で渡された場合のみ)
+    if not fw_path.is_file():
+        raise HTTPException(
+            status_code=400, detail=f"Not a file: {fw_path}",
+        )
+
+    args = [
+        "--chip", "esp32s3", "--port", port,
+        "--baud", "921600",
+        "--before", "default-reset",
+        "--after", "hard-reset",
+        "write-flash", "0x0", str(fw_path),
+    ]
+    return StreamingResponse(
+        _stream_esptool(args, f"flash-firmware port={port} fw={fw_path.name}"),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # --- Audio input relay (v0.7: device-driven listen capture) -----------------

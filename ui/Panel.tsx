@@ -27,6 +27,12 @@ interface AddonPanelProps {
     };
     personas: { id: string; name: string }[];
     addonApiBase: string;
+    /**
+     * Panel 内部で AddonConfig を書き換えた場合に呼ぶ callback。
+     * 呼ぶと親 AddonManagerModal が再 fetch して ParamsSection を最新値で
+     * 再描画する。 ペアリング操作 (master_token rotate) で必須。
+     */
+    onConfigChanged?: () => void | Promise<void>;
 }
 
 // ----- Avatar set types (= avatar_pipeline.py の SetInfo と対応) -----
@@ -55,7 +61,7 @@ interface ListSetsResponse {
 const DEBUG_FLAG_KEY = "stackchan-addon-debug-flag";
 
 export default function StackchanVesselPanel({
-    personas, addonApiBase,
+    personas, addonApiBase, onConfigChanged,
 }: AddonPanelProps) {
     const [debugMode, setDebugMode] = useState(false);
 
@@ -92,12 +98,622 @@ export default function StackchanVesselPanel({
                     Debug
                 </label>
             </div>
+            <VesselPairingSection
+                addonApiBase={addonApiBase}
+                onConfigChanged={onConfigChanged}
+            />
+            <FirmwareFlashSection addonApiBase={addonApiBase} />
             <AvatarSection
                 personas={personas}
                 addonApiBase={addonApiBase}
                 debugMode={debugMode}
             />
             <DeviceSection addonApiBase={addonApiBase} />
+        </div>
+    );
+}
+
+// ----- Vessel Pairing section (Phase 2') -----
+//
+// Stack-chan device の登録・解除を addon UI から実行する。
+// - POST /pair → device_token + vessel_id を発行、AddonConfig も自動更新
+// - GET /vessels → 登録済み vessel 一覧
+// - DELETE /vessels/{id} → 解除
+// Phase 1' single vessel 前提に従い、1 機体が登録済みなら追加 UI は非表示。
+
+interface VesselSummary {
+    vessel_id: string;
+    bound_building_id: string;
+    bound_persona_id: string | null;
+    hardware_model: string;
+    firmware_version: string | null;
+    paired_at: string;
+    last_seen_at: string | null;
+    connected: boolean;
+}
+
+interface PairResponse {
+    vessel_id: string;
+    device_token: string;
+    building_id: string;
+    gateway_ws_url: string;
+}
+
+interface BuildingSummary {
+    id: string;
+    name: string;
+}
+
+function VesselPairingSection({
+    addonApiBase, onConfigChanged,
+}: {
+    addonApiBase: string;
+    onConfigChanged?: () => void | Promise<void>;
+}) {
+    const [vessels, setVessels] = useState<VesselSummary[] | null>(null);
+    const [buildings, setBuildings] = useState<BuildingSummary[]>([]);
+    const [selectedBuildingId, setSelectedBuildingId] = useState<string>("");
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [newPairing, setNewPairing] = useState<PairResponse | null>(null);
+    const [copied, setCopied] = useState(false);
+
+    const fetchVessels = useCallback(async () => {
+        try {
+            const res = await fetch(`${addonApiBase}/vessels`);
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            setVessels(data.vessels ?? []);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setVessels([]);
+        }
+    }, [addonApiBase]);
+
+    // Building 一覧は addon の外 (= 本体 API /api/user/buildings) から取る。
+    // 失敗時は手入力フォールバック (= input 欄が表示される)。
+    const fetchBuildings = useCallback(async () => {
+        try {
+            const res = await fetch("/api/user/buildings");
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            setBuildings(data.buildings ?? []);
+        } catch {
+            // 取得失敗時は input fallback、 error 表示は出さない (= 本来の
+            // operation エラーと混同しないため)
+            setBuildings([]);
+        }
+    }, []);
+
+    useEffect(() => {
+        fetchVessels();
+        fetchBuildings();
+    }, [fetchVessels, fetchBuildings]);
+
+    const createPairing = async () => {
+        if (!selectedBuildingId.trim()) return;
+        setBusy(true);
+        setError(null);
+        setNewPairing(null);
+        try {
+            const res = await fetch(`${addonApiBase}/pair`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    building_id: selectedBuildingId.trim(),
+                }),
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            const data: PairResponse = await res.json();
+            setNewPairing(data);
+            setSelectedBuildingId("");
+            await fetchVessels();
+            // AddonConfig.master_token / vessel_building_id を内部更新したので、
+            // 親 (AddonManagerModal) に通知して ParamsSection を最新値で再描画。
+            try {
+                await onConfigChanged?.();
+            } catch {
+                // 親側 fetch 失敗は致命的じゃない、 ペアリング自体は成功扱い
+            }
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const deletePairing = async (vesselId: string, buildingId: string) => {
+        const ok = window.confirm(
+            `Building '${buildingId}' のペアリングを解除しますか?\n` +
+            "device は再接続できなくなります。 再度ペアリングするには新規発行が必要です。",
+        );
+        if (!ok) return;
+        setBusy(true);
+        setError(null);
+        try {
+            const res = await fetch(
+                `${addonApiBase}/vessels/${encodeURIComponent(vesselId)}`,
+                { method: "DELETE" },
+            );
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            setNewPairing(null);
+            await fetchVessels();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const copyToken = async () => {
+        if (!newPairing) return;
+        try {
+            await navigator.clipboard.writeText(newPairing.device_token);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 2000);
+        } catch {
+            // clipboard 不可な環境 (= 非 secure context 等) は何もしない、
+            // ユーザーは textarea から手動で選択コピーできる
+        }
+    };
+
+    const canCreate = vessels !== null && vessels.length === 0;
+
+    return (
+        <div style={panelStyles.section}>
+            <div style={panelStyles.sectionLabel}>Vessel ペアリング</div>
+
+            {vessels === null ? (
+                <div style={panelStyles.muted}>読み込み中…</div>
+            ) : vessels.length === 0 ? (
+                <div style={panelStyles.muted}>
+                    ペアリング済みの Stack-chan はありません。
+                </div>
+            ) : (
+                <div>
+                    {vessels.map((v) => (
+                        <div key={v.vessel_id} style={panelStyles.vesselCard}>
+                            <div style={panelStyles.vesselCardRow}>
+                                <div style={panelStyles.vesselDetails}>
+                                    <div>
+                                        <span style={panelStyles.vesselStatus}>
+                                            {v.connected ? "🟢" : "⚪"}
+                                        </span>
+                                        <span style={panelStyles.vesselBuilding}>
+                                            Building: {v.bound_building_id}
+                                        </span>
+                                    </div>
+                                    <div style={panelStyles.subtle}>
+                                        vessel_id: {v.vessel_id.slice(0, 8)}…
+                                    </div>
+                                    {v.bound_persona_id && (
+                                        <div style={panelStyles.subtle}>
+                                            persona: {v.bound_persona_id}
+                                        </div>
+                                    )}
+                                    {v.firmware_version && (
+                                        <div style={panelStyles.subtle}>
+                                            fw: {v.firmware_version}
+                                        </div>
+                                    )}
+                                    <div style={panelStyles.subtle}>
+                                        paired: {formatPairedAt(v.paired_at)}
+                                    </div>
+                                </div>
+                                <button
+                                    onClick={() => deletePairing(
+                                        v.vessel_id, v.bound_building_id,
+                                    )}
+                                    disabled={busy}
+                                    style={
+                                        busy
+                                            ? panelStyles.buttonDisabled
+                                            : panelStyles.deleteBtn
+                                    }
+                                >
+                                    解除
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {canCreate && (
+                <div style={panelStyles.formRow}>
+                    {buildings.length > 0 ? (
+                        <select
+                            value={selectedBuildingId}
+                            onChange={(e) =>
+                                setSelectedBuildingId(e.target.value)}
+                            disabled={busy}
+                            style={panelStyles.select}
+                        >
+                            <option value="">Building を選択…</option>
+                            {buildings.map((b) => (
+                                <option key={b.id} value={b.id}>
+                                    {b.name} ({b.id})
+                                </option>
+                            ))}
+                        </select>
+                    ) : (
+                        <input
+                            type="text"
+                            value={selectedBuildingId}
+                            onChange={(e) =>
+                                setSelectedBuildingId(e.target.value)}
+                            placeholder="b_vessel_stackchan"
+                            disabled={busy}
+                            style={panelStyles.input}
+                        />
+                    )}
+                    <button
+                        onClick={createPairing}
+                        disabled={busy || !selectedBuildingId.trim()}
+                        style={
+                            busy || !selectedBuildingId.trim()
+                                ? panelStyles.buttonDisabled
+                                : panelStyles.buttonPrimary
+                        }
+                    >
+                        スタックチャンを追加
+                    </button>
+                </div>
+            )}
+
+            {newPairing && (
+                <div style={panelStyles.pairingResult}>
+                    <div style={panelStyles.pairingResultLabel}>
+                        ペアリング発行しました。 device の captive portal で
+                        以下を入力してください:
+                    </div>
+                    <div style={panelStyles.pairingKv}>
+                        <span style={panelStyles.pairingKey}>
+                            Gateway URL:
+                        </span>
+                        <code style={panelStyles.pairingValue}>
+                            {newPairing.gateway_ws_url}
+                        </code>
+                    </div>
+                    <div style={panelStyles.pairingKv}>
+                        <span style={panelStyles.pairingKey}>Token:</span>
+                        <code style={panelStyles.pairingValue}>
+                            {newPairing.device_token}
+                        </code>
+                        <button
+                            onClick={copyToken}
+                            style={panelStyles.copyButton}
+                        >
+                            {copied ? "コピー済み" : "コピー"}
+                        </button>
+                    </div>
+                    <div style={panelStyles.subtle}>
+                        token は一度しか表示されません。 紛失したら DELETE で
+                        解除して再ペアリングが必要です。
+                    </div>
+                </div>
+            )}
+
+            {error && (
+                <div style={panelStyles.errorBox}>
+                    エラー: {error}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function formatPairedAt(iso: string): string {
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString();
+    } catch {
+        return iso;
+    }
+}
+
+function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function fwInfoSourceLabel(source: FirmwareInfo["source"]): string {
+    switch (source) {
+        case "addon_config": return "AddonConfig 設定値";
+        case "local_build": return "ローカルビルド (temp/stackchan-mcp/firmware/build)";
+        case "user_default": return "ユーザー配置 (~/.saiverse/addons/...)";
+        case "not_found": return "未検出";
+    }
+}
+
+// ----- Firmware flash section (Phase 2' Step 4) -----
+//
+// Stack-chan device の NVS erase / firmware flash を UI から実行する。
+// backend が esptool subprocess を起動して stdout を SSE で stream して
+// くる、 EventSource で購読して append 表示。
+//
+// 2 ボタン:
+//   - NVS リセット: 数秒、 ペアリング解除後の AP モード復帰用
+//   - ファームウェア書き込み: 初回 / クリーンインストール、 数分
+
+interface FlashPort {
+    port: string;
+    description: string;
+    vid: string | null;
+    pid: string | null;
+}
+
+interface FirmwareInfo {
+    path: string | null;
+    exists: boolean;
+    size: number | null;
+    mtime_iso: string | null;
+    source: "addon_config" | "local_build" | "user_default" | "not_found";
+}
+
+function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
+    const [ports, setPorts] = useState<FlashPort[]>([]);
+    const [selectedPort, setSelectedPort] = useState<string>("");
+    const [busy, setBusy] = useState(false);
+    const [output, setOutput] = useState<string[]>([]);
+    const [error, setError] = useState<string | null>(null);
+    const [exitCode, setExitCode] = useState<number | null>(null);
+    const [fwInfo, setFwInfo] = useState<FirmwareInfo | null>(null);
+
+    const fetchFwInfo = useCallback(async () => {
+        try {
+            const res = await fetch(`${addonApiBase}/flash/firmware-info`);
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+            const data: FirmwareInfo = await res.json();
+            setFwInfo(data);
+        } catch {
+            // 取得失敗時は info 表示なし (= 致命的じゃない、 焼く時に
+            // 別途エラーが出る)
+            setFwInfo(null);
+        }
+    }, [addonApiBase]);
+
+    const fetchPorts = useCallback(async () => {
+        try {
+            const res = await fetch(`${addonApiBase}/flash/ports`);
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+            const data: FlashPort[] = await res.json();
+            setPorts(data);
+            // ESP32-S3 (VID 303A) を優先選択。 見つからなければ先頭。
+            const esp = data.find((p) => p.vid === "303A");
+            if (esp) {
+                setSelectedPort(esp.port);
+            } else if (data.length > 0 && !selectedPort) {
+                setSelectedPort(data[0].port);
+            }
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        }
+    }, [addonApiBase, selectedPort]);
+
+    useEffect(() => {
+        fetchPorts();
+        fetchFwInfo();
+    }, [fetchPorts, fetchFwInfo]);
+
+    // SSE 経路で esptool stdout を購読する。 完走 / エラーで Promise が
+    // 解決される。 EventSource は GET しか送れないので fetch + stream
+    // reader を使って POST + SSE-style response を扱う。
+    const runFlash = async (endpoint: string, label: string) => {
+        if (!selectedPort) {
+            setError("COM port が選択されてません");
+            return;
+        }
+        setBusy(true);
+        setError(null);
+        setExitCode(null);
+        setOutput([`▶ ${label} (port=${selectedPort}) 開始…`]);
+        try {
+            const url = `${addonApiBase}${endpoint}?port=${encodeURIComponent(selectedPort)}`;
+            const res = await fetch(url, { method: "POST" });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            if (!res.body) {
+                throw new Error("Response body が空 (SSE stream なし)");
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let buffer = "";
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                // SSE event 区切り: 空行
+                const parts = buffer.split("\n\n");
+                buffer = parts.pop() ?? "";
+                for (const part of parts) {
+                    // `data: <json>` 形式
+                    const line = part.trim();
+                    if (!line.startsWith("data:")) continue;
+                    const payload = line.slice(5).trim();
+                    let event: { type: string; text?: string; returncode?: number };
+                    try {
+                        event = JSON.parse(payload);
+                    } catch {
+                        continue;
+                    }
+                    if (event.type === "line" && event.text) {
+                        setOutput((prev) => [...prev, event.text!]);
+                    } else if (event.type === "done") {
+                        setExitCode(event.returncode ?? null);
+                        setOutput((prev) => [
+                            ...prev,
+                            `\n✓ 完了 (returncode=${event.returncode})`,
+                        ]);
+                    } else if (event.type === "error" && event.text) {
+                        setError(event.text);
+                        setOutput((prev) => [
+                            ...prev,
+                            `\n✗ エラー: ${event.text}`,
+                        ]);
+                    }
+                }
+            }
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const eraseNvs = async () => {
+        const ok = window.confirm(
+            "device の NVS partition (= Wi-Fi 設定 + Token) を消去します。\n" +
+            "完了後、 device は AP モードで起動するので captive portal で " +
+            "再設定が必要です。 続けますか?",
+        );
+        if (!ok) return;
+        await runFlash("/flash/erase-nvs", "NVS リセット");
+    };
+
+    const flashFirmware = async () => {
+        const ok = window.confirm(
+            "merged-binary.bin を device に書き込みます (= 初回 / 完全リセット)。\n" +
+            "既存のペアリング情報 / Wi-Fi 設定はすべて消えます。\n" +
+            "数分かかります。 続けますか?",
+        );
+        if (!ok) return;
+        await runFlash("/flash/firmware", "ファームウェア書き込み");
+    };
+
+    return (
+        <div style={panelStyles.section}>
+            <div style={panelStyles.sectionLabel}>ファームウェア</div>
+
+            <div style={panelStyles.row}>
+                <label style={panelStyles.label}>COM port:</label>
+                <select
+                    value={selectedPort}
+                    onChange={(e) => setSelectedPort(e.target.value)}
+                    disabled={busy || ports.length === 0}
+                    style={panelStyles.select}
+                >
+                    {ports.length === 0 && (
+                        <option value="">(検出されません)</option>
+                    )}
+                    {ports.map((p) => (
+                        <option key={p.port} value={p.port}>
+                            {p.description}
+                            {p.vid === "303A" ? " ⚡ESP32" : ""}
+                        </option>
+                    ))}
+                </select>
+                <button
+                    onClick={fetchPorts}
+                    disabled={busy}
+                    style={busy ? panelStyles.buttonDisabled : panelStyles.buttonSubtle}
+                >
+                    再検出
+                </button>
+            </div>
+
+            {fwInfo && (
+                <div style={panelStyles.fwInfo}>
+                    {fwInfo.source === "not_found" ? (
+                        <div style={panelStyles.fwInfoMissing}>
+                            ⚠ merged-binary.bin が見つかりません。
+                            「ファームウェア書き込み」 は利用不可。<br />
+                            <span style={panelStyles.subtle}>
+                                配置 path 候補: (1) AddonConfig.firmware_path で
+                                絶対 path 指定、 (2) &lt;SAIVerse repo&gt;
+                                /temp/stackchan-mcp/firmware/build/、 (3)
+                                ~/.saiverse/addons/saiverse-stackchan-addon/firmware/
+                            </span>
+                        </div>
+                    ) : (
+                        <>
+                            <div>
+                                <span style={panelStyles.fwInfoLabel}>
+                                    使用する firmware:
+                                </span>{" "}
+                                <code style={panelStyles.fwInfoPath}>
+                                    {fwInfo.path}
+                                </code>
+                            </div>
+                            <div style={panelStyles.subtle}>
+                                source: {fwInfoSourceLabel(fwInfo.source)}
+                                {fwInfo.size !== null && (
+                                    ` / size: ${formatBytes(fwInfo.size)}`
+                                )}
+                                {fwInfo.mtime_iso && (
+                                    ` / mtime: ${formatPairedAt(fwInfo.mtime_iso)}`
+                                )}
+                            </div>
+                        </>
+                    )}
+                </div>
+            )}
+
+            <div style={panelStyles.row}>
+                <button
+                    onClick={eraseNvs}
+                    disabled={busy || !selectedPort}
+                    style={
+                        busy || !selectedPort
+                            ? panelStyles.buttonDisabled
+                            : panelStyles.buttonAccent
+                    }
+                >
+                    NVS リセット (AP モード復帰)
+                </button>
+                <button
+                    onClick={flashFirmware}
+                    disabled={
+                        busy || !selectedPort || fwInfo?.source === "not_found"
+                    }
+                    style={
+                        busy || !selectedPort || fwInfo?.source === "not_found"
+                            ? panelStyles.buttonDisabled
+                            : panelStyles.deleteBtn
+                    }
+                >
+                    ファームウェア書き込み
+                </button>
+            </div>
+
+            {(output.length > 0 || busy) && (
+                <pre style={panelStyles.flashOutput}>
+                    {output.join("\n")}
+                    {busy && <span style={panelStyles.flashBusyMarker}> ▌</span>}
+                </pre>
+            )}
+
+            {exitCode !== null && exitCode !== 0 && !error && (
+                <div style={panelStyles.errorBox}>
+                    esptool が異常終了 (returncode={exitCode})
+                </div>
+            )}
+
+            {error && (
+                <div style={panelStyles.errorBox}>
+                    エラー: {error}
+                </div>
+            )}
         </div>
     );
 }
@@ -692,5 +1308,124 @@ const panelStyles: Record<string, React.CSSProperties> = {
         color: "#ccc",
         fontSize: "11px",
         fontVariantNumeric: "tabular-nums",
+    },
+    // ----- Vessel Pairing -----
+    muted: {
+        color: "#888",
+        fontSize: "11px",
+        padding: "4px 0",
+    },
+    vesselCard: {
+        padding: "8px",
+        marginBottom: "6px",
+        background: "#1a1a1a",
+        borderRadius: "4px",
+        border: "1px solid #333",
+    },
+    vesselCardRow: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "flex-start",
+        gap: "8px",
+    },
+    vesselDetails: {
+        flex: 1,
+        fontSize: "11px",
+        lineHeight: 1.5,
+    },
+    vesselStatus: {
+        marginRight: "4px",
+    },
+    vesselBuilding: {
+        fontWeight: 600,
+        color: "#fff",
+        fontSize: "12px",
+    },
+    pairingResult: {
+        marginTop: "8px",
+        padding: "8px",
+        background: "#243",
+        border: "1px solid #4a8",
+        borderRadius: "4px",
+        fontSize: "11px",
+    },
+    pairingResultLabel: {
+        marginBottom: "6px",
+        color: "#dfd",
+        fontWeight: 600,
+    },
+    pairingKv: {
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        marginBottom: "4px",
+        flexWrap: "wrap",
+    },
+    pairingKey: {
+        color: "#aaa",
+        minWidth: "78px",
+    },
+    pairingValue: {
+        flex: 1,
+        padding: "2px 6px",
+        background: "#000",
+        color: "#ffa",
+        fontFamily: "monospace",
+        fontSize: "11px",
+        borderRadius: "3px",
+        wordBreak: "break-all",
+    },
+    copyButton: {
+        padding: "2px 8px",
+        fontSize: "10px",
+        background: "#246",
+        color: "#cdf",
+        border: "1px solid #48a",
+        borderRadius: "3px",
+        cursor: "pointer",
+    },
+    // ----- Firmware flash -----
+    flashOutput: {
+        marginTop: "6px",
+        padding: "6px 8px",
+        background: "#000",
+        color: "#cfc",
+        fontFamily: "monospace",
+        fontSize: "10px",
+        lineHeight: 1.4,
+        borderRadius: "3px",
+        border: "1px solid #333",
+        maxHeight: "240px",
+        overflowY: "auto",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-all",
+    },
+    flashBusyMarker: {
+        color: "#fc8",
+        fontWeight: 700,
+    },
+    fwInfo: {
+        marginBottom: "6px",
+        padding: "6px 8px",
+        background: "#1a1a1a",
+        borderRadius: "3px",
+        border: "1px solid #333",
+        fontSize: "11px",
+        lineHeight: 1.5,
+    },
+    fwInfoLabel: {
+        color: "#aaa",
+    },
+    fwInfoPath: {
+        padding: "1px 4px",
+        background: "#000",
+        color: "#cfc",
+        fontFamily: "monospace",
+        fontSize: "10px",
+        borderRadius: "2px",
+        wordBreak: "break-all",
+    },
+    fwInfoMissing: {
+        color: "#fc8",
     },
 };

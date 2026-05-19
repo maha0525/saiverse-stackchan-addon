@@ -66,6 +66,13 @@
             "description": "SAIVerse 本体 API のポート。city_a なら 8000、city_b なら 9000 が標準。Vessel Building が所属する city の API ポートを入力。",
             "type": "text",
             "default": "8000"
+        },
+        {
+            "key": "firmware_path",
+            "label": "Firmware merged-binary.bin の path (UI 書き込み用)",
+            "description": "AddonManager UI の「ファームウェア書き込み」ボタンが使う merged-binary.bin の絶対 path。 空欄なら自動検出: (1) <SAIVerse repo>/temp/stackchan-mcp/firmware/build/merged-binary.bin (= ローカル開発者の ESP-IDF build 成果物) → (2) ~/.saiverse/addons/saiverse-stackchan-addon/firmware/merged-binary.bin (= GitHub Releases から DL した一般ユーザー向け配置場所) の順で fallback。 GPL-3.0 firmware を addon に含めない方針 (intent doc §8)、 一般ユーザーは stackchan-mcp の Releases から DL してください。",
+            "type": "text",
+            "placeholder": "(空欄 = 自動検出)"
         }
     ],
     "server_hooks": [
