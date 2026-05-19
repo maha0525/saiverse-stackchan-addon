@@ -73,6 +73,13 @@
             "description": "AddonManager UI の「ファームウェア書き込み」ボタンが使う merged-binary.bin の絶対 path。 空欄なら自動検出: (1) <SAIVerse repo>/temp/stackchan-mcp/firmware/build/merged-binary.bin (= ローカル開発者の ESP-IDF build 成果物) → (2) ~/.saiverse/addons/saiverse-stackchan-addon/firmware/merged-binary.bin (= GitHub Releases から DL した一般ユーザー向け配置場所) の順で fallback。 GPL-3.0 firmware を addon に含めない方針 (intent doc §8)、 一般ユーザーは stackchan-mcp の Releases から DL してください。",
             "type": "text",
             "placeholder": "(空欄 = 自動検出)"
+        },
+        {
+            "key": "unit_env3_enabled",
+            "label": "ENV III (温湿度・気圧) を有効化",
+            "description": "Stack-chan の Port A に接続した M5Stack ENV III Unit (SHT30 温湿度 0x44 + QMP6988 気圧 0x70) を spell として公開する。 有効化するとペルソナが「温度を取得」「気圧を取得」 系の spell を呼べるようになる。 物理 Unit を接続していない場合は無効のままにしておく (= spell が出ない)。 ファーム書き換え不要で Port A I2C bus 経由で動作 (PR ② Port A I2C generic tools 必須)。",
+            "type": "toggle",
+            "default": false
         }
     ],
     "server_hooks": [
