@@ -536,7 +536,7 @@ def on_persona_exited_building(
     )
 
 
-# ----- Background reconcile loop (state 同期) -----
+# ----- Background reconcile (state 同期) -----
 #
 # 入室時の lazy check (= on_persona_entered_building) だけだと、 以下 2 つの
 # シナリオで device 状態と SAIVerse cache が乖離する:
@@ -547,19 +547,39 @@ def on_persona_exited_building(
 #      まま SAIVerse を起動した場合 — そもそも入室 event が発火しないので
 #      avatar transfer が走らない
 #
-# これらに対応するため、 module ロード時に daemon thread を起動して:
-#   tick 0 (起動後 _INITIAL_DELAY 秒):   起動時 reconcile (= シナリオ B 対応)
-#   tick 1+ (以降 _POLL_INTERVAL ごと): session_id 監視で reboot 検知
-#                                        (= シナリオ A 対応)
-# を実行する。 thread は daemon なので SAIVerse プロセス停止時に自動終了。
+# 設計:
+#   - シナリオ B (起動時の同期) は本体 MCP client の ``on_server_ready``
+#     hook で event driven に発火。 gateway subprocess の接続完了を待って
+#     から initial reconcile を 1 回実行する。 timed polling (旧設計の
+#     8 秒固定 + 30 秒 tick) より大幅に応答性が良い。
+#   - シナリオ A (起動後の device 単独 reboot) は session_id の polling で
+#     検知。 gateway は device WS 切断/再接続を SAIVerse に通知しない
+#     構造的制約があるため、 device 状態を観測する経路は polling が残る。
+#
+# どちらも daemon thread で動かす (= SAIVerse プロセス停止で自動終了)。
 
-# MCP loop が初期化されるまでの猶予 (= addon ロード完了 → main app の MCP
-# subprocess connect → SAIVerse 側 _mcp._loop が ready になるまでの間)。
-_INITIAL_DELAY_SEC = 8.0
-# session_id 変化の polling 間隔。 device reboot 検知の応答性 vs MCP
-# round trip コストのバランス。 30 秒なら最悪 30 秒で reboot を反映、
-# get_device_status は軽い (JSON 返すだけ) ので負荷は無視できる範囲。
+# 通常の session_id polling 間隔 (= initial reconcile 完了後の device 単独
+# reboot 検知用)。 reboot 検知の応答性 vs MCP round trip コストのバランス。
 _POLL_INTERVAL_SEC = 30.0
+# MCP server ready 後の **ESP32 接続待ち burst window**。 重要な分離:
+# - MCP server ready = gateway subprocess (= host 側 WS server) が起動完了
+# - device available  = ESP32 が WS server に接続して hello 完了
+# この 2 つは別 timing で、 ESP32 boot + WiFi assoc + WS handshake で
+# 通常数秒〜十数秒のラグがある。 server ready で起こされた後、 この window
+# 内は短間隔 retry で ESP32 の接続を即時検出 (= 起動応答性)、 window を
+# 過ぎたら ESP32 が居ない / 永久未接続な状況 (= 電源 off / WiFi 不通 /
+# 認証失敗) と判断して通常 polling 間隔に落とし負荷を下げる。
+_INITIAL_BURST_SEC = 60.0
+_INITIAL_BURST_INTERVAL_SEC = 2.0
+# event 経由の device ready 通知が永久に来なかった場合の fallback。
+# manager の on_server_ready hook 機構自体が壊れた / 古い本体 (= hook 未対応)
+# 等の安全網として、 この時間を過ぎたら polling だけで初期同期も試みる。
+_READY_EVENT_FALLBACK_SEC = 120.0
+
+# device ready 通知 (gateway 接続完了) を thread 間で受け渡すための event。
+# MCP client の on_server_ready callback が ``set()``、 reconcile loop の
+# initial 同期パスが ``wait()`` で受ける。
+_device_ready_event = threading.Event()
 
 
 def _query_current_vessel_persona(vessel_bid: str) -> Optional[str]:
@@ -630,25 +650,98 @@ def _reconcile_vessel_state(reason: str) -> None:
         )
 
 
-def _periodic_reconcile_loop() -> None:
-    """daemon thread main。 device が ready (= session_id 取れる状態) に
-    なるのを待ってから initial reconcile (= シナリオ B 対応)、 以降は同じ
-    ループで session_id 監視 (= シナリオ A 対応)。
+def _on_stackchan_mcp_ready() -> None:
+    """本体 MCP client の ``on_server_ready`` 経由で呼ばれる。 gateway
+    subprocess が起動 + 接続完了したタイミングで fire。
 
-    initial reconcile を独立した 1 ステップにせず、 「session_id が初めて
-    取れたタイミング = device ready のタイミング」を起点にしているのは、
-    SAIVerse 起動直後は device がまだ boot 中 / gateway 未接続のことが
-    多く、 8 秒固定 delay の初期 reconcile では ``no_device`` で失敗する
-    ため。 session_id が取れるまで polling 経路で待つ。
+    callback は MCP event loop thread から呼ばれるので、 ここでは event を
+    起こすだけで重い処理 (session_id 取得 / DB 検索 / avatar transfer) は
+    reconcile thread に委譲する。
+    """
+    LOGGER.info(
+        "avatar_loader: stackchan MCP server ready, signaling reconcile thread"
+    )
+    _device_ready_event.set()
+
+
+def _register_mcp_ready_hook() -> None:
+    """本体 MCP client に on_server_ready hook を register する。
+
+    addon load 時点では ``get_mcp_manager()`` が ``None`` のことが多い
+    (= MCP 初期化は main.py の startup シーケンスで avatar_loader の load
+    後に走る)。 manager が利用可能になるまで短間隔で polling して、 取れた
+    時点で hook を register する。 一定時間経っても manager が来なければ
+    諦め、 reconcile_loop の fallback (= タイムアウト後の polling) に
+    任せる。
+    """
+    import tools.mcp_client as _mcp
+
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        manager = _mcp.get_mcp_manager()
+        if manager is not None and hasattr(manager, "on_server_ready"):
+            manager.on_server_ready(
+                MCP_QUALIFIED_SERVER, _on_stackchan_mcp_ready,
+            )
+            LOGGER.info(
+                "avatar_loader: registered on_server_ready hook for %s",
+                MCP_QUALIFIED_SERVER,
+            )
+            return
+        time.sleep(0.5)
+    LOGGER.warning(
+        "avatar_loader: MCP manager did not initialize within 60s "
+        "(or lacks on_server_ready support), event-driven device ready "
+        "skipped — reconcile loop will fall back to polling after %.0fs",
+        _READY_EVENT_FALLBACK_SEC,
+    )
+
+
+def _periodic_reconcile_loop() -> None:
+    """daemon thread main。 設計:
+
+    1. ``_device_ready_event`` を ``_READY_EVENT_FALLBACK_SEC`` 上限で wait
+       (= MCP gateway subprocess の起動完了通知)。
+    2. event 起きたら burst window 開始: ``_INITIAL_BURST_SEC`` 秒間、
+       ``_INITIAL_BURST_INTERVAL_SEC`` 間隔で ``_fetch_device_session_id``
+       を retry (= ESP32 の WS 接続完了を素早く検知)。
+    3. session_id が取れたら initial reconcile を 1 回実行。
+    4. 以降は ``_POLL_INTERVAL_SEC`` 間隔で session_id 監視 (= シナリオ A
+       対応の device reboot 検知)。 burst window 経過後に session_id が
+       取れない場合も同じ長間隔に落とす (= ESP32 未接続時の負荷削減)。
+
+    event が timeout までに来なかった場合は burst をスキップして直接長間隔
+    polling に入る (= hook 機構が壊れた / 古い本体で hook 非対応 / gateway
+    起動失敗 等の最終保険)。
     """
     try:
-        time.sleep(_INITIAL_DELAY_SEC)
+        got_event = _device_ready_event.wait(timeout=_READY_EVENT_FALLBACK_SEC)
+        if not got_event:
+            LOGGER.warning(
+                "avatar_loader: device ready event not received within %.0fs, "
+                "proceeding with polling-only mode",
+                _READY_EVENT_FALLBACK_SEC,
+            )
+            burst_deadline = 0.0  # burst 無効、 即長間隔
+        else:
+            burst_deadline = time.monotonic() + _INITIAL_BURST_SEC
+            LOGGER.info(
+                "avatar_loader: MCP ready, entering ESP32 connection burst "
+                "window for %.0fs (interval=%.1fs)",
+                _INITIAL_BURST_SEC, _INITIAL_BURST_INTERVAL_SEC,
+            )
+
         initial_done = False
         while True:
             current_sid = _fetch_device_session_id()
             if current_sid is None:
-                # device 未 ready / 古い firmware / 通信エラー — wait & retry
-                time.sleep(_POLL_INTERVAL_SEC)
+                # device 未接続 / 古い firmware / 通信エラー。 burst window
+                # 内なら短間隔で連続 retry、 外なら長間隔に落とす。
+                in_burst = time.monotonic() < burst_deadline
+                time.sleep(
+                    _INITIAL_BURST_INTERVAL_SEC if in_burst
+                    else _POLL_INTERVAL_SEC
+                )
                 continue
 
             if not initial_done:
@@ -685,28 +778,41 @@ def _periodic_reconcile_loop() -> None:
 # など複数の module 名で同時 import されうるが、 OS process は同一なので
 # ``threading.enumerate()`` で見える thread は共通。
 _RECONCILE_THREAD_NAME = "saiverse-avatar-loader-reconcile"
+_HOOK_REGISTRAR_THREAD_NAME = "saiverse-avatar-loader-hook-registrar"
 
 
 def _start_reconcile_thread() -> None:
-    """module ロード時に 1 回だけ daemon thread を起動する。 プロセス内で
-    同名 thread が既に走っていれば skip (= 多重 import 対策)。
+    """module ロード時に daemon thread を 2 つ起動する。 プロセス内で同名
+    thread が既に走っていれば skip (= 多重 import 対策)。
+
+    - reconcile thread: device ready event を待って initial reconcile を
+      実行、 以降は session_id polling で reboot 検知。
+    - registrar thread: MCP manager 利用可能になるのを待って
+      on_server_ready hook を register する (1 回限り)。
     """
-    for t in threading.enumerate():
-        if t.name == _RECONCILE_THREAD_NAME and t.is_alive():
-            LOGGER.debug(
-                "avatar_loader: reconcile thread already running, skip"
-            )
-            return
-    thread = threading.Thread(
+    existing_names = {t.name for t in threading.enumerate() if t.is_alive()}
+    if _RECONCILE_THREAD_NAME in existing_names:
+        LOGGER.debug(
+            "avatar_loader: reconcile thread already running, skip"
+        )
+        return
+
+    threading.Thread(
+        target=_register_mcp_ready_hook,
+        name=_HOOK_REGISTRAR_THREAD_NAME,
+        daemon=True,
+    ).start()
+
+    threading.Thread(
         target=_periodic_reconcile_loop,
         name=_RECONCILE_THREAD_NAME,
         daemon=True,
-    )
-    thread.start()
+    ).start()
+
     LOGGER.info(
         "avatar_loader: reconcile thread started "
-        "(initial_delay=%.0fs, poll_interval=%.0fs)",
-        _INITIAL_DELAY_SEC, _POLL_INTERVAL_SEC,
+        "(event_fallback=%.0fs, poll_interval=%.0fs)",
+        _READY_EVENT_FALLBACK_SEC, _POLL_INTERVAL_SEC,
     )
 
 
