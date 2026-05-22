@@ -1,7 +1,7 @@
 """Vessel 紐付け管理 (v0.5: stackchan-mcp 採用版)。
 
 Stack-chan device と SAIVerse Building / Persona の紐付けを管理する。アドオン
-専用 SQLite (~/.saiverse/addons/saiverse-stackchan-addon/vessels.db) で永続化。
+専用 SQLite (~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/vessels.db) で永続化。
 
 v0.5 の認証モデル:
   - stackchan-mcp は `Authorization: Bearer <token>` のみで device を認証
@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from saiverse.addon_paths import get_addon_storage_path
+from saiverse.addon_paths import get_addon_data_dir
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ class VesselManager:
     """
 
     def __init__(self) -> None:
-        storage = get_addon_storage_path(ADDON_NAME)
+        storage = get_addon_data_dir(ADDON_NAME)
         self._db_path: Path = storage / "vessels.db"
         self._lock = threading.RLock()
         self._sessions: Dict[str, VesselSession] = {}

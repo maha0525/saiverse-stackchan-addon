@@ -5,7 +5,7 @@ Generates a color-coded raw RGB565 placeholder set (= same idea as
 ``generate_test_avatar_set.py``) and writes it into the location the
 ``avatar_loader`` server_hook expects:
 
-    ~/.saiverse/addons/saiverse-stackchan-addon/avatar_sets/<persona_id>/<set_name>/
+    ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/avatar_sets/<persona_id>/<set_name>/
         avatar.bin       # raw RGB565 payload (537,600 or 3,456,000 bytes)
         manifest.json    # {"mode": "...", "checksum": "sha256:..."}
 
@@ -97,18 +97,20 @@ def _generate_tinted(mode: str, tint_hue_deg: float) -> bytes:
 
 
 def _addon_storage_dir() -> Path:
-    """Resolve ``~/.saiverse/addons/saiverse-stackchan-addon/`` without
-    importing SAIVerse internals (the script may be run outside the
+    """Resolve ``~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/``
+    without importing SAIVerse internals (the script may be run outside the
     SAIVerse Python environment).
     """
-    home = Path.home() / ".saiverse"
-    # Honour SAIVERSE_HOME like data_paths.py does.
     import os
 
-    override = os.environ.get("SAIVERSE_HOME")
-    if override:
-        home = Path(override)
-    return home / "addons" / "saiverse-stackchan-addon"
+    user_data_override = os.environ.get("SAIVERSE_USER_DATA_DIR")
+    if user_data_override:
+        user_data = Path(user_data_override)
+    else:
+        home_override = os.environ.get("SAIVERSE_HOME")
+        home = Path(home_override) if home_override else Path.home() / ".saiverse"
+        user_data = home / "user_data"
+    return user_data / "addon_data" / "saiverse-stackchan-addon"
 
 
 def main() -> None:

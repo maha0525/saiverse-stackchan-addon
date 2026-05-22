@@ -7,7 +7,7 @@ storage に保持し、 ペルソナが Vessel Building に入室したタイミ
 
 ストレージレイアウト:
 
-    ~/.saiverse/addons/saiverse-stackchan-addon/
+    ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/
         avatar_sets/
             <persona_id>/
                 default/             # 最初のリリースでは set 名は固定 "default"
@@ -41,7 +41,7 @@ if _PACK_DIR not in sys.path:
     sys.path.insert(0, _PACK_DIR)
 
 from saiverse.addon_config import get_params  # noqa: E402
-from saiverse.addon_paths import get_addon_storage_path  # noqa: E402
+from saiverse.addon_paths import get_addon_data_dir  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class AvatarSetLoader:
     # ----- Storage layout -----
 
     def storage_root(self) -> Path:
-        return get_addon_storage_path(ADDON_NAME) / "avatar_sets"
+        return get_addon_data_dir(ADDON_NAME) / "avatar_sets"
 
     def set_dir(
         self, persona_id: str, set_name: str = DEFAULT_SET_NAME

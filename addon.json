@@ -2,7 +2,14 @@
     "name": "saiverse-stackchan-addon",
     "display_name": "Stack-chan Vessel",
     "description": "ペルソナを Stack-chan (M5Stack 製 AI Desktop Robot) の物理身体に降ろす Vessel 統合アドオン。Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作します。詳細設計: docs/intent/stackchan_vessel.md",
-    "version": "0.3.0",
+    "version": "0.4.0",
+    "manifest_version": 2,
+    "setup_version": 1,
+    "data_subdirs": {
+        "avatar_sets": "ペルソナごとの Stack-chan 顔素材セット (憑依時に device に転送)",
+        "vessels.db": "Vessel 紐付け管理用 SQLite (ペアリング状態、 building 紐付け等)",
+        "firmware": "ESP32-S3 merged-binary.bin の配置場所 (UI 書き込みボタン用、 GPL-3.0 のため手動 DL)"
+    },
     "params_schema": [
         {
             "key": "master_token",
@@ -70,7 +77,7 @@
         {
             "key": "firmware_path",
             "label": "Firmware merged-binary.bin の path (UI 書き込み用)",
-            "description": "AddonManager UI の「ファームウェア書き込み」ボタンが使う merged-binary.bin の絶対 path。 空欄なら自動検出: (1) <SAIVerse repo>/temp/stackchan-mcp/firmware/build/merged-binary.bin (= ローカル開発者の ESP-IDF build 成果物) → (2) ~/.saiverse/addons/saiverse-stackchan-addon/firmware/merged-binary.bin (= GitHub Releases から DL した一般ユーザー向け配置場所) の順で fallback。 GPL-3.0 firmware を addon に含めない方針 (intent doc §8)、 一般ユーザーは stackchan-mcp の Releases から DL してください。",
+            "description": "AddonManager UI の「ファームウェア書き込み」ボタンが使う merged-binary.bin の絶対 path。 空欄なら自動検出: (1) <SAIVerse repo>/temp/stackchan-mcp/firmware/build/merged-binary.bin (= ローカル開発者の ESP-IDF build 成果物) → (2) ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/merged-binary.bin (= GitHub Releases から DL した一般ユーザー向け配置場所) の順で fallback。 GPL-3.0 firmware を addon に含めない方針 (intent doc §8)、 一般ユーザーは stackchan-mcp の Releases から DL してください。",
             "type": "text",
             "placeholder": "(空欄 = 自動検出)"
         },

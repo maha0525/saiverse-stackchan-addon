@@ -40,7 +40,7 @@ Vessel Building にペルソナが居る間、物理マイク・スピーカー�
 ### SAIVerse 本体側
 
 - `Building` テーブルに `PHYSICAL_VESSEL_ID` カラム (本アドオンを使う SAIVerse バージョンで自動マイグレーション)
-- 既存のアドオン拡張点 (`server_hooks`, `api_routes.py` 自動マウント, `addon_paths.get_addon_storage_path`, `addon_deps.get_manager`)
+- 既存のアドオン拡張点 (`server_hooks`, `api_routes.py` 自動マウント, `addon_paths.get_addon_data_dir`, `addon_deps.get_manager`)
 
 ### 並列に必要なアドオン
 

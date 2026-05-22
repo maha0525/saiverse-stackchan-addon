@@ -8,7 +8,7 @@
 
 ストレージレイアウト:
 
-    ~/.saiverse/addons/saiverse-stackchan-addon/avatar_sets/
+    ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/avatar_sets/
         <persona_id>/
             _active.json         # アクティブセット名 (D-8)
             <set_name>/
@@ -44,7 +44,7 @@ _PACK_DIR = str(Path(__file__).parent)
 if _PACK_DIR not in sys.path:
     sys.path.insert(0, _PACK_DIR)
 
-from saiverse.addon_paths import get_addon_storage_path  # noqa: E402
+from saiverse.addon_paths import get_addon_data_dir  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -240,7 +240,7 @@ class AvatarPipelineManager:
     # ----- Storage layout -----
 
     def storage_root(self) -> Path:
-        return get_addon_storage_path(ADDON_NAME) / "avatar_sets"
+        return get_addon_data_dir(ADDON_NAME) / "avatar_sets"
 
     def persona_dir(self, persona_id: str) -> Path:
         _validate_id_component(persona_id, "persona_id")

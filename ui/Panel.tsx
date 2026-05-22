@@ -642,7 +642,7 @@ function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
                                 配置 path 候補: (1) AddonConfig.firmware_path で
                                 絶対 path 指定、 (2) &lt;SAIVerse repo&gt;
                                 /temp/stackchan-mcp/firmware/build/、 (3)
-                                ~/.saiverse/addons/saiverse-stackchan-addon/firmware/
+                                ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/
                             </span>
                         </div>
                     ) : (

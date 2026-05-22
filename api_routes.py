@@ -1302,8 +1302,8 @@ def delete_vessel(
 #   - 進捗は SSE (text/event-stream)。 EventSource API で frontend は
 #     simple に購読可
 #   - cancel は SSE 切断 = subprocess kill (= asyncio.shield しない)
-#   - firmware path は `~/.saiverse/addons/saiverse-stackchan-addon/firmware/
-#     merged-binary.bin` を default。 自動 DL は Phase 後半で
+#   - firmware path は `~/.saiverse/user_data/addon_data/saiverse-stackchan-
+#     addon/firmware/merged-binary.bin` を default。 自動 DL は Phase 後半で
 
 import os
 import shutil
@@ -1352,14 +1352,14 @@ def _firmware_resolve_path() -> Optional[Path]:
          merged-binary.bin`` (= ローカル開発者の ESP-IDF build 成果物、
          まはー の手元 fork repo の build dir そのまま参照する。 GPL-3.0
          firmware を addon に複製しないため、 intent doc §8 と整合)
-      3. ``~/.saiverse/addons/saiverse-stackchan-addon/firmware/
-         merged-binary.bin`` (= 一般ユーザー向け、 GitHub Releases から
-         DL して配置する想定の path)
+      3. ``~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/
+         firmware/merged-binary.bin`` (= 一般ユーザー向け、 GitHub
+         Releases から DL して配置する想定の path、 v2 規約に統一)
 
     どれも見つからなければ None を返す (= 呼び出し側で 404 を返す)。
     """
     from saiverse.addon_config import get_params
-    from saiverse.addon_paths import get_addon_storage_path
+    from saiverse.addon_paths import get_addon_data_dir
 
     # (1) AddonConfig.firmware_path
     params = get_params(_ADDON_NAME_FOR_CONFIG)
@@ -1384,7 +1384,7 @@ def _firmware_resolve_path() -> Optional[Path]:
 
     # (3) 一般ユーザー向け配置場所
     user_default = (
-        get_addon_storage_path(_ADDON_NAME_FOR_CONFIG)
+        get_addon_data_dir(_ADDON_NAME_FOR_CONFIG)
         / "firmware" / "merged-binary.bin"
     )
     if user_default.exists():
@@ -1649,7 +1649,7 @@ def flash_firmware(
                 "<SAIVerse repo>/temp/stackchan-mcp/firmware/build/ に "
                 "merged-binary.bin を生成 (`esptool merge-bin` 等)、 "
                 "(2) GitHub Releases から DL する場合は "
-                "~/.saiverse/addons/saiverse-stackchan-addon/firmware/ に "
+                "~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/ に "
                 "配置してください。 もしくは AddonConfig.firmware_path で "
                 "絶対 path を指定してください。"
             ),
