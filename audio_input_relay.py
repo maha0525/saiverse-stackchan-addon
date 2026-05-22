@@ -202,9 +202,22 @@ async def receive_device_audio(request: Request) -> dict:
         ],
     }
 
+    # 本文は metadata.media[] の Ogg/Opus が主で、 ペルソナ (Gemini) は
+    # inline_data で「音」を直接理解する。 ただし SAIVerse 本体
+    # (manager/runtime.py の handle_user_input_stream) は空 text を
+    # 「入力が空でした」 として弾くガードを持つので、 音声受信を示す
+    # 短い system 文をユーザーメッセージとして同送する (memory
+    # feedback_system_tag_design.md: role='user' + <system>...</system>
+    # 形式)。 これで本体ガードを通過しつつ、 ペルソナには「ｽﾀｯｸﾁｬﾝ経由で
+    # 音声が届いた」 という来歴も伝わる。
+    audio_intro_text = (
+        "<system>ｽﾀｯｸﾁｬﾝから音声入力を受信しました。"
+        "添付の音声を聴いて応答してください。</system>"
+    )
+
     try:
         stream = manager.handle_user_input_stream(
-            "",                                  # text 本体は空、media が主
+            audio_intro_text,
             metadata=metadata,
             building_id=vessel.bound_building_id,
         )
