@@ -13,7 +13,7 @@
  *
  * 詳細設計: docs/intent/stackchan_avatar_pipeline.md §D-3〜D-7
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // side-effect import: アドオン固有の CSS 変数 (--stackchan-X) を
 // :global で document に登録する。 styles の var(...) 参照で使う。
@@ -86,6 +86,19 @@ const STAGE_LABELS: Record<string, string> = {
     "03_matrix": "③ 目・口差分",
     "03_layered": "③ 目・口差分",
     "04_trimmed": "④ トリミング",
+};
+
+const STAGE_DESCRIPTIONS: Record<string, string> = {
+    "01_face":
+        "ベースになる「目を開けて口を閉じた」 1 枚を作る。生成 or 既存画像のアップロード。",
+    "02_expressions":
+        "idle 以外の 5 表情 (happy / thinking / sad / surprised / embarrassed) のベース画像を作る。",
+    "03_matrix":
+        "6 表情 × 3 目状態 × 5 口形状 = 84 枚をまとめて作る。眼開・口閉の 6 枚は ①② から自動コピー。",
+    "03_layered":
+        "目 3 枚 + 口 5 枚 = 8 枚のレイヤーを作る。実機で face レイヤーに重ねて表示。",
+    "04_trimmed":
+        "全画像を 160×120 にトリム。avatar.bin に出力して Vessel 内なら自動転送。",
 };
 
 const FACE_NAMES = [
@@ -183,6 +196,11 @@ export default function AvatarPipelineModal({
     const [info, setInfo] = useState<SetInfo | null>(null);
     const [templates, setTemplates] = useState<TemplatesResponse>({});
     const [currentStageIdx, setCurrentStageIdx] = useState(0);
+    // 初回 info 取得後に「ファイル無し最初の stage」 で開く。
+    // 既存セットが ④ まで進んでいたら ① から「次へ」 連打する手間を省く。
+    // useRef で「初期化済みフラグ」 を持ち、 fetchInfo の再取得 (= 操作後の
+    // 再 fetch) では currentStageIdx を上書きしない。
+    const stageIdxInitialized = useRef(false);
     const [busy, setBusy] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [lightbox, setLightbox] = useState<{
@@ -280,6 +298,17 @@ export default function AvatarPipelineModal({
     useEffect(() => { fetchInfo(); }, [fetchInfo]);
 
     const stages = useMemo(() => info?.wip_stages ?? [], [info]);
+
+    // 起動時の stage 復元。 初回 info 取得後 1 回だけ「ファイル無し最初の
+    // stage」 を選ぶ。 全 stage 完了済みなら最後の stage (④) を開く。
+    useEffect(() => {
+        if (stageIdxInitialized.current) return;
+        if (stages.length === 0) return;
+        let nextIdx = stages.findIndex((s) => s.files.length === 0);
+        if (nextIdx < 0) nextIdx = stages.length - 1;
+        setCurrentStageIdx(nextIdx);
+        stageIdxInitialized.current = true;
+    }, [stages]);
     const currentStage = stages[currentStageIdx];
 
     const callJson = async (
@@ -468,7 +497,9 @@ export default function AvatarPipelineModal({
         if (idx < 0 || idx >= stages.length) return;
         if (idx === 0) { setCurrentStageIdx(0); return; }
         const prev = stages[idx - 1];
-        if (prev && (prev.completed || prev.files.length > 0)) {
+        // 前 stage にファイルがあれば次へ進める。
+        // 「完了マーク」 概念は廃止し、 ファイル有無を遷移ゲートにする。
+        if (prev && prev.files.length > 0) {
             setCurrentStageIdx(idx);
         }
     };
@@ -550,18 +581,33 @@ export default function AvatarPipelineModal({
                     onUpdate={updateMetadata}
                 />
 
-                {/* アニメーションプレビュー (= 目パチ口パクのレビュー用) */}
-                <AnimationPreviewSection
-                    metadata={info.wip_metadata!}
-                    stages={stages}
-                    imageUrl={imageUrl}
-                />
+                {/* アニメーションプレビュー (= 目パチ口パクのレビュー用)。
+                    ③ で目・口差分が生成されないと意味のあるプレビューに
+                    ならない (= 空の枠だけが表示されて初見ユーザーを混乱
+                    させる) ため、 ③ 以降に進んだとき + 実際に差分ファイル
+                    がある時のみ展開する。 */}
+                {currentStageIdx >= 2 && (() => {
+                    const stage3 = stages.find(
+                        (s) => s.stage_id === "03_matrix"
+                            || s.stage_id === "03_layered",
+                    );
+                    if (!stage3 || stage3.files.length === 0) return null;
+                    return (
+                        <AnimationPreviewSection
+                            metadata={info.wip_metadata!}
+                            stages={stages}
+                            imageUrl={imageUrl}
+                        />
+                    );
+                })()}
 
-                {/* 段階バー */}
+                {/* 段階バー: 「完了済み」 はファイル有無で判定。
+                    backend の completed_stages フラグは ④ runFinalChain で
+                    自動更新されるが、 ユーザー視点では「ファイルが生成され
+                    たら完了」 が直感的なのでファイル数を真値とする。 */}
                 <div style={styles.stageBar}>
                     {stages.map((s, i) => {
                         const isActive = i === currentStageIdx;
-                        const isComplete = s.completed;
                         const hasFiles = s.files.length > 0;
                         return (
                             <button
@@ -570,7 +616,7 @@ export default function AvatarPipelineModal({
                                 style={{
                                     ...styles.stageBtn,
                                     ...(isActive ? styles.stageBtnActive : {}),
-                                    ...(isComplete ? styles.stageBtnComplete : {}),
+                                    ...(hasFiles ? styles.stageBtnComplete : {}),
                                 }}
                             >
                                 {STAGE_LABELS[s.stage_id]}
@@ -613,6 +659,7 @@ export default function AvatarPipelineModal({
                         ) : (
                             <StagePanel
                                 stage={currentStage}
+                                allStages={stages}
                                 metadata={info.wip_metadata!}
                                 imageUrl={imageUrl}
                                 onZoom={openLightbox}
@@ -1210,12 +1257,18 @@ function CommonPromptSection({
     return (
         <details style={styles.section} open>
             <summary style={styles.sectionTitle}>
-                共通プロンプト + モデル / 並列度
+                画像生成の共通設定 (プロンプト / モデル / 並列度)
                 {debugMode && (
                     <span style={styles.debugTag}>+ Debug 設定</span>
                 )}
                 <span style={styles.autosaveTag}>自動保存</span>
             </summary>
+            <div style={styles.subtle}>
+                プロンプトは ① 元顔生成 / ② 表情差分生成で base として使われ
+                ます (= 各 target 個別プロンプトの前段)。 ① をアップロードで
+                済ませて ② も生成しないなら未入力で OK。 モデル / 並列度の
+                設定は ①②③ すべての画像生成 API に効きます。
+            </div>
             <textarea
                 value={common}
                 onChange={(e) => setCommon(e.target.value)}
@@ -1307,12 +1360,15 @@ function CommonPromptSection({
 // ----- 段階パネル -----
 
 function StagePanel({
-    stage, metadata, imageUrl, onZoom, debugMode, getTemplate,
+    stage, allStages, metadata, imageUrl, onZoom, debugMode, getTemplate,
     onExecute, onRegenerate, onMarkCompleted, onUpdateMetadata,
     onImportZip,
     chainStatus, setChainStatus, fetchInfo,
 }: {
     stage: StageState;
+    /** ③ matrix の grid 描画で「①② から base copy 予定」 を判定するため、
+     *  全 stage の files を参照する必要がある。 */
+    allStages: StageState[];
     metadata: SetMetadata;
     imageUrl: (stageId: string, filename: string) => string;
     onZoom: (url: string, alt: string) => void;
@@ -1492,10 +1548,19 @@ function StagePanel({
     return (
         <div>
             <div style={styles.stageHeader}>
-                <div style={styles.stageHeaderTitle}>
-                    {STAGE_LABELS[stageId]}
-                    {stage.completed && (
-                        <span style={styles.completedBadge}>✓ 完了済み</span>
+                <div>
+                    <div style={styles.stageHeaderTitle}>
+                        {STAGE_LABELS[stageId]}
+                        {stage.files.length > 0 && (
+                            <span style={styles.completedBadge}>
+                                ✓ {stage.files.length} 枚生成済み
+                            </span>
+                        )}
+                    </div>
+                    {STAGE_DESCRIPTIONS[stageId] && (
+                        <div style={styles.stageDescription}>
+                            {STAGE_DESCRIPTIONS[stageId]}
+                        </div>
                     )}
                 </div>
                 <div style={styles.stageHeaderActions}>
@@ -1516,8 +1581,8 @@ function StagePanel({
                         style={styles.btnPrimary}
                     >
                         {stage.files.length > 0
-                            ? "全件実行 (resume safe)"
-                            : "全件実行"}
+                            ? "未生成のものだけ生成"
+                            : "全件生成"}
                     </button>
                     {/* 強制再生成: matrix は face checkbox で対象選択。
                         layered / ② は即実行 (= 全件上書き)。 */}
@@ -1638,14 +1703,6 @@ function StagePanel({
                             </button>
                         </>
                     )}
-                    {stage.files.length > 0 && !stage.completed && (
-                        <button
-                            onClick={onMarkCompleted}
-                            style={styles.btnAccent}
-                        >
-                            完了マーク → 次へ
-                        </button>
-                    )}
                 </div>
             </div>
 
@@ -1710,59 +1767,121 @@ function StagePanel({
                 </>
             )}
 
-            <div style={styles.targetGrid}>
-                {targets.map((target) => {
-                    const file = stage.files.find((f) => f.target === target);
-                    const extra = stageExtras[target] || "";
-                    return (
-                        <div key={target} style={styles.targetCell}>
-                            {file ? (
+            {(() => {
+            // ③ matrix は face ごとに 15 セル (3 目 × 5 口) でまとめて
+            // 表示すると、 表情ごとの並びが追いやすい。 ① / ② / ③ layered
+            // / ④ は flat grid のまま (= target 数が少ないか、 自然な並び
+            // が既に存在する)。
+            const renderCell = (target: string) => {
+                const file = stage.files.find((f) => f.target === target);
+                const extra = stageExtras[target] || "";
+                // ③ matrix では eyes=open && mouth=closed の 6 セルは
+                // ①② から自動 copy される (avatar_generator.py:737-754)。
+                // ③ 実行前でも ①② に base 画像があれば「再利用予定」 と
+                // 分かるよう、 そちらの画像をプレビュー表示する。
+                const baseReuse = (() => {
+                    if (file) return null;
+                    if (stageId !== "03_matrix") return null;
+                    const parts = target.split("_");
+                    if (parts.length !== 3) return null;
+                    const [face, eyes, mouth] = parts;
+                    if (eyes !== "open" || mouth !== "closed") return null;
+                    const baseStageId = face === "idle"
+                        ? "01_face" : "02_expressions";
+                    const baseTarget = face === "idle" ? "face" : face;
+                    const baseStage = allStages.find(
+                        (s) => s.stage_id === baseStageId,
+                    );
+                    if (!baseStage) return null;
+                    const hasBase = baseStage.files.some(
+                        (f) => f.target === baseTarget,
+                    );
+                    if (!hasBase) return null;
+                    return {
+                        url: imageUrl(baseStageId, `${baseTarget}.png`),
+                        label: face === "idle" ? "① 元顔" : "② 表情差分",
+                    };
+                })();
+                return (
+                    <div key={target} style={styles.targetCell}>
+                        {file ? (
+                            <ClickableImage
+                                src={imageUrl(stageId, `${target}.png`)}
+                                alt={target}
+                                onZoom={onZoom}
+                            />
+                        ) : baseReuse ? (
+                            <>
                                 <ClickableImage
-                                    src={imageUrl(stageId, `${target}.png`)}
+                                    src={baseReuse.url}
                                     alt={target}
                                     onZoom={onZoom}
                                 />
-                            ) : (
-                                <div style={styles.previewEmpty}>未生成</div>
-                            )}
-                            <div style={styles.targetLabel}>{target}</div>
-                            {stageId !== "04_trimmed" && (
-                                <>
-                                    <ExtraPromptInput
-                                        value={extra}
-                                        defaultTemplate={
-                                            getTemplate(stageId, target)
-                                        }
-                                        onSave={(val) =>
-                                            updateExtra(target, val)}
-                                    />
-                                    {file && (
-                                        <AsyncButton
-                                            onClick={() =>
-                                                onRegenerate(
-                                                    target,
-                                                    extra || undefined,
-                                                )}
-                                            busyLabel="生成中..."
-                                            style={styles.regenBtn}
-                                            busyStyle={styles.regenBtnBusy}
-                                        >
-                                            再生成
-                                        </AsyncButton>
-                                    )}
-                                </>
-                            )}
-                            {/* ④ の per-cell rect 上書きは変更可能な単位 (=
-                                matrix なら face、 layered なら target) ベースに
-                                統合 (= まはー検証 2026-05-17、 同 face 内
-                                15 セルは同 rect で十分なので per-cell は冗長)。
-                                ここでは「per-cell の上書き UI」 は撤去、
-                                ④ section の下に「Variant overrides」 セクション
-                                を別途配置する。 */}
-                        </div>
-                    );
-                })}
-            </div>
+                                <div style={styles.baseReuseBadge}>
+                                    {baseReuse.label} から自動コピー予定
+                                </div>
+                            </>
+                        ) : (
+                            <div style={styles.previewEmpty}>未生成</div>
+                        )}
+                        <div style={styles.targetLabel}>{target}</div>
+                        {stageId !== "04_trimmed" && (
+                            <>
+                                <ExtraPromptInput
+                                    value={extra}
+                                    defaultTemplate={
+                                        getTemplate(stageId, target)
+                                    }
+                                    onSave={(val) =>
+                                        updateExtra(target, val)}
+                                />
+                                {file && (
+                                    <AsyncButton
+                                        onClick={() =>
+                                            onRegenerate(
+                                                target,
+                                                extra || undefined,
+                                            )}
+                                        busyLabel="生成中..."
+                                        style={styles.regenBtn}
+                                        busyStyle={styles.regenBtnBusy}
+                                    >
+                                        再生成
+                                    </AsyncButton>
+                                )}
+                            </>
+                        )}
+                    </div>
+                );
+            };
+
+            if (stageId === "03_matrix") {
+                return (
+                    <div style={styles.matrixGroupContainer}>
+                        {FACE_NAMES.map((face) => {
+                            const faceTargets = targets.filter(
+                                (t) => t.startsWith(`${face}_`),
+                            );
+                            return (
+                                <div key={face} style={styles.matrixFaceGroup}>
+                                    <div style={styles.matrixFaceHeader}>
+                                        {face}
+                                    </div>
+                                    <div style={styles.targetGrid}>
+                                        {faceTargets.map(renderCell)}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                );
+            }
+            return (
+                <div style={styles.targetGrid}>
+                    {targets.map(renderCell)}
+                </div>
+            );
+            })()}
         </div>
     );
 }
@@ -1953,20 +2072,21 @@ function FaceStagePanel({
     return (
         <div>
             <div style={styles.stageHeader}>
-                <div style={styles.stageHeaderTitle}>
-                    {STAGE_LABELS[stageId]}
-                    {stage.completed && (
-                        <span style={styles.completedBadge}>✓ 完了済み</span>
+                <div>
+                    <div style={styles.stageHeaderTitle}>
+                        {STAGE_LABELS[stageId]}
+                        {stage.files.length > 0 && (
+                            <span style={styles.completedBadge}>
+                                ✓ 生成済み
+                            </span>
+                        )}
+                    </div>
+                    {STAGE_DESCRIPTIONS[stageId] && (
+                        <div style={styles.stageDescription}>
+                            {STAGE_DESCRIPTIONS[stageId]}
+                        </div>
                     )}
                 </div>
-                {stage.files.length > 0 && !stage.completed && (
-                    <button
-                        onClick={onMarkCompleted}
-                        style={styles.btnAccent}
-                    >
-                        完了マーク → 次へ
-                    </button>
-                )}
             </div>
 
             {/* 経路切替 (= 生成 / アップロード) */}
@@ -3464,6 +3584,12 @@ const styles: Record<string, React.CSSProperties> = {
         fontSize: "13px",
         fontWeight: 600,
     },
+    stageDescription: {
+        fontSize: "11px",
+        color: "var(--text-secondary)",
+        marginTop: "2px",
+        lineHeight: 1.4,
+    },
     stageHeaderActions: { display: "flex", gap: "6px" },
     completedBadge: {
         marginLeft: "8px",
@@ -3478,6 +3604,24 @@ const styles: Record<string, React.CSSProperties> = {
         gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
         gap: "8px",
         marginTop: "8px",
+    },
+    matrixGroupContainer: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "12px",
+        marginTop: "8px",
+    },
+    matrixFaceGroup: {
+        padding: "8px",
+        background: "var(--bg-tertiary)",
+        borderRadius: "4px",
+        border: "1px solid var(--border-color)",
+    },
+    matrixFaceHeader: {
+        fontSize: "12px",
+        fontWeight: 600,
+        color: "var(--text-primary)",
+        marginBottom: "4px",
     },
     targetCell: {
         padding: "6px",
@@ -3550,6 +3694,12 @@ const styles: Record<string, React.CSSProperties> = {
         color: "var(--text-secondary)",
         textAlign: "center",
         fontFamily: "monospace",
+    },
+    baseReuseBadge: {
+        fontSize: "9px",
+        color: "var(--stackchan-info-soft-fg)",
+        textAlign: "center",
+        padding: "2px 0",
     },
     targetExtraInput: {
         width: "100%",
