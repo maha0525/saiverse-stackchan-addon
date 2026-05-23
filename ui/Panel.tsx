@@ -449,8 +449,10 @@ function fwInfoSourceLabel(source: FirmwareInfo["source"]): string {
 // くる、 EventSource で購読して append 表示。
 //
 // 2 ボタン:
-//   - NVS リセット: 数秒、 ペアリング解除後の AP モード復帰用
-//   - ファームウェア書き込み: 初回 / クリーンインストール、 数分
+//   - 「Wi-Fi 設定をリセット」 (内部的には NVS partition erase): 数秒、
+//     ペアリング解除後の AP モード復帰用 (= device 単独で AP を立てて
+//     captive portal を提供する状態に戻す)
+//   - 「ファームウェア書き込み」: 初回 / クリーンインストール、 数分
 
 interface FlashPort {
     port: string;
@@ -587,19 +589,21 @@ function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
 
     const eraseNvs = async () => {
         const ok = window.confirm(
-            "device の NVS partition (= Wi-Fi 設定 + Token) を消去します。\n" +
-            "完了後、 device は AP モードで起動するので captive portal で " +
-            "再設定が必要です。 続けますか?",
+            "Stack-chan に保存された Wi-Fi 接続情報と認証情報を消去します。\n" +
+            "完了後、 Stack-chan は自分で Wi-Fi スポットを立てて\n" +
+            "セットアップ画面を出す状態 (初回起動と同じ) に戻ります。\n\n" +
+            "続けますか?",
         );
         if (!ok) return;
-        await runFlash("/flash/erase-nvs", "NVS リセット");
+        await runFlash("/flash/erase-nvs", "Wi-Fi 設定をリセット");
     };
 
     const flashFirmware = async () => {
         const ok = window.confirm(
-            "merged-binary.bin を device に書き込みます (= 初回 / 完全リセット)。\n" +
-            "既存のペアリング情報 / Wi-Fi 設定はすべて消えます。\n" +
-            "数分かかります。 続けますか?",
+            "Stack-chan のソフトウェア (ファームウェア) を書き込みます。\n" +
+            "初回セットアップや、 動作がおかしくなった時の完全リセット用です。\n" +
+            "保存された Wi-Fi 設定・認証情報はすべて消えます。 数分かかります。\n\n" +
+            "続けますか?",
         );
         if (!ok) return;
         await runFlash("/flash/firmware", "ファームウェア書き込み");
@@ -677,13 +681,14 @@ function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
                 <button
                     onClick={eraseNvs}
                     disabled={busy || !selectedPort}
+                    title="Stack-chan の Wi-Fi 接続情報と認証情報を消して、 初回セットアップ画面 (Stack-chan 自身が Wi-Fi スポットを立てる状態) に戻します"
                     style={
                         busy || !selectedPort
                             ? panelStyles.buttonDisabled
                             : panelStyles.buttonAccent
                     }
                 >
-                    NVS リセット (AP モード復帰)
+                    Wi-Fi 設定をリセット
                 </button>
                 <button
                     onClick={flashFirmware}
