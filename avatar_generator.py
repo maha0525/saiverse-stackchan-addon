@@ -44,8 +44,7 @@ _IMAGE_GEN_PATH = _REPO_ROOT / "builtin_data" / "tools" / "image_generator.py"
 
 DEFAULT_TEMPLATES: dict[str, Any] = {
     "common_prompt_hint": (
-        "Describe the persona's overall look: facial features, hair color/style, "
-        "clothing, atmosphere. This text is prepended to every per-image prompt."
+        "ペルソナの外見を書く: 顔立ち、 髪色・髪型、 服装、 雰囲気など"
     ),
     # ③ で常に prepend される「ポーズ・構図維持」 制約 (= まはー検証 2026-05-17)。
     # 「指定がない側 (目または口) は参照画像から完全にそのまま」 を明示

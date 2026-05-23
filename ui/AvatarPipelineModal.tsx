@@ -109,9 +109,11 @@ const EXPRESSION_NAMES = [
 ];
 const EYES_STATES = ["open", "half", "closed"];
 const MOUTH_SHAPES = ["closed", "half", "open", "e", "u"];
+// 並び順 = dropdown 表示順 + 新規セット作成時の初期値 (= 配列先頭)。
+// backend default も "gpt_image_2" (avatar_pipeline.py:127)。
 const IMAGE_MODELS = [
-    "nano_banana_2", "nano_banana_pro",
-    "gpt_image_1_5", "gpt_image_2", "grok_imagine",
+    "gpt_image_2", "gpt_image_1_5",
+    "nano_banana_2", "nano_banana_pro", "grok_imagine",
 ];
 const IMAGE_QUALITIES = ["low", "medium", "high", "auto"];
 const SUPPORTED_ASPECTS = [
@@ -201,6 +203,9 @@ export default function AvatarPipelineModal({
     // useRef で「初期化済みフラグ」 を持ち、 fetchInfo の再取得 (= 操作後の
     // 再 fetch) では currentStageIdx を上書きしない。
     const stageIdxInitialized = useRef(false);
+    // ① の経路 (生成 / アップロード) を親で持つ。 CommonPromptSection の
+    // 表示判定 (= アップロード派ならプロンプト欄 hide) に使う。
+    const [faceMode, setFaceMode] = useState<"generate" | "upload">("generate");
     const [busy, setBusy] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [lightbox, setLightbox] = useState<{
@@ -569,17 +574,22 @@ export default function AvatarPipelineModal({
                 )}
                 {error && <div style={styles.errorBox}>エラー: {error}</div>}
 
-                {/* 共通プロンプト + Debug 設定 */}
-                <CommonPromptSection
-                    metadata={info.wip_metadata!}
-                    debugMode={debugMode}
-                    commonPromptHint={
-                        typeof templates.common_prompt_hint === "string"
-                            ? templates.common_prompt_hint
-                            : ""
-                    }
-                    onUpdate={updateMetadata}
-                />
+                {/* 画像生成オプション: ① でアップロードを選んだ時はプロンプ
+                    トやモデル設定が不要なので hide。 ②③④ に進んだ時 or
+                    ① で生成を選んだ時のみ表示する (まはー指摘の「先に
+                    生成/アップロード選んでから表示される流れ」)。 */}
+                {(currentStageIdx > 0 || faceMode === "generate") && (
+                    <CommonPromptSection
+                        metadata={info.wip_metadata!}
+                        debugMode={debugMode}
+                        commonPromptHint={
+                            typeof templates.common_prompt_hint === "string"
+                                ? templates.common_prompt_hint
+                                : ""
+                        }
+                        onUpdate={updateMetadata}
+                    />
+                )}
 
                 {/* アニメーションプレビューは ③ stage に限定 + 制約プロンプト
                     の下に配置 (= StagePanel 内、 Stage3ConstraintEditor の
@@ -620,6 +630,8 @@ export default function AvatarPipelineModal({
                         currentStage.stage_id === "01_face" ? (
                             <FaceStagePanel
                                 stage={currentStage}
+                                mode={faceMode}
+                                onSetMode={setFaceMode}
                                 metadata={info.wip_metadata!}
                                 imageUrl={imageUrl}
                                 onZoom={openLightbox}
@@ -1241,25 +1253,20 @@ function CommonPromptSection({
     return (
         <details style={styles.section} open>
             <summary style={styles.sectionTitle}>
-                画像生成の共通設定 (プロンプト / モデル / 並列度)
+                画像生成オプション
                 {debugMode && (
                     <span style={styles.debugTag}>+ Debug 設定</span>
                 )}
                 <span style={styles.autosaveTag}>自動保存</span>
             </summary>
-            <div style={styles.subtle}>
-                プロンプトは ① 元顔生成 / ② 表情差分生成で base として使われ
-                ます (= 各 target 個別プロンプトの前段)。 ① をアップロードで
-                済ませて ② も生成しないなら未入力で OK。 モデル / 並列度の
-                設定は ①②③ すべての画像生成 API に効きます。
-            </div>
+            <div style={styles.label}>プロンプト</div>
             <textarea
                 value={common}
                 onChange={(e) => setCommon(e.target.value)}
                 onBlur={saveCommon}
                 placeholder={
                     commonPromptHint
-                    || "ペルソナの外見・服装・雰囲気。 全画像で共通に適用。"
+                    || "ペルソナの外見を書く: 顔立ち、 髪色・髪型、 服装、 雰囲気など"
                 }
                 rows={3}
                 style={styles.textarea}
@@ -2028,9 +2035,13 @@ function FaceStagePanel({
     stage, metadata, imageUrl, onZoom, debugMode, faceTemplate,
     onExecute, onUploadFace, onAnalyzeImage,
     onUploadRefImage, onListRefImages, onDeleteRefImage,
-    onMarkCompleted, onUpdateMetadata,
+    onMarkCompleted, onUpdateMetadata, mode, onSetMode,
 }: {
     stage: StageState;
+    /** ① の経路 (生成 / アップロード) は親で state を持つ。
+     *  CommonPromptSection の表示判定にも使うため。 */
+    mode: "generate" | "upload";
+    onSetMode: (mode: "generate" | "upload") => void;
     metadata: SetMetadata;
     imageUrl: (stageId: string, filename: string) => string;
     onZoom: (url: string, alt: string) => void;
@@ -2053,7 +2064,7 @@ function FaceStagePanel({
     onMarkCompleted: () => Promise<unknown>;
     onUpdateMetadata: (updates: Partial<SetMetadata>) => Promise<unknown>;
 }) {
-    const [mode, setMode] = useState<"generate" | "upload">("generate");
+    const setMode = onSetMode;
     const stageId = stage.stage_id;
     const stageExtras = metadata.extra_prompts[stageId] || {};
     const extra = stageExtras["face"] || "";
@@ -2574,7 +2585,7 @@ function Stage3ConstraintEditor({
     return (
         <details style={styles.section}>
             <summary style={styles.sectionTitle}>
-                ③ 制約プロンプト (= 必ず prepend、 自動保存)
+                ③ 制約プロンプト (各画像生成の前に必ず付加)
                 <span style={styles.autosaveTag}>自動保存</span>
                 {isOverridden && (
                     <span style={styles.debugTag}>カスタム文使用中</span>
