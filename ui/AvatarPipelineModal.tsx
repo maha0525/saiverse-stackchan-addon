@@ -120,6 +120,36 @@ const SUPPORTED_ASPECTS = [
     "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "4:5", "5:4",
 ];
 
+/** 画像サイズの中に収まる最大の中央矩形を、 指定アス比で計算する。 「4:3
+ *  固定」 が ON のまま 4:3 じゃない画像をアップロードした時、 初期 trim
+ *  矩形が元画像比率になってしまう問題を避けるための共通計算。 */
+function fitRectToAspect(
+    imgW: number, imgH: number, aspect: string,
+): { x: number; y: number; width: number; height: number } {
+    const [aw, ah] = aspect.split(":").map(Number);
+    if (!aw || !ah) return { x: 0, y: 0, width: imgW, height: imgH };
+    const targetRatio = aw / ah;
+    const imgRatio = imgW / imgH;
+    if (imgRatio > targetRatio) {
+        // 画像が target より横長 → 高さ最大、 幅を縮めて中央配置
+        const rectW = Math.round(imgH * targetRatio);
+        return {
+            x: Math.round((imgW - rectW) / 2),
+            y: 0,
+            width: rectW,
+            height: imgH,
+        };
+    }
+    // 画像が target より縦長 (or 同じ) → 幅最大、 高さを縮めて中央配置
+    const rectH = Math.round(imgW / targetRatio);
+    return {
+        x: 0,
+        y: Math.round((imgH - rectH) / 2),
+        width: imgW,
+        height: rectH,
+    };
+}
+
 function buildMatrixTargets(): string[] {
     const out: string[] = [];
     for (const f of FACE_NAMES) {
@@ -2307,6 +2337,7 @@ function FaceUploadSubpanel({
     }>;
 }) {
     const [file, setFile] = useState<File | null>(null);
+    const [imgPreviewUrl, setImgPreviewUrl] = useState<string | null>(null);
     const [analysis, setAnalysis] = useState<{
         width: number; height: number;
         suggested_aspect: string; supported_aspects: string[];
@@ -2314,9 +2345,30 @@ function FaceUploadSubpanel({
     const [targetAspect, setTargetAspect] = useState<string>(
         metadata.aspect_ratio,
     );
-    const [useCustomCrop, setUseCustomCrop] = useState(false);
     const [crop, setCrop] = useState({ x: 0, y: 0, width: 0, height: 0 });
+    const [lockAspect, setLockAspect] = useState<boolean>(true);
     const [analyzing, setAnalyzing] = useState(false);
+
+    // file 選択中はプレビュー URL を生成、 解除時に revoke。
+    useEffect(() => {
+        if (!file) {
+            setImgPreviewUrl(null);
+            return;
+        }
+        const url = URL.createObjectURL(file);
+        setImgPreviewUrl(url);
+        return () => URL.revokeObjectURL(url);
+    }, [file]);
+
+    // targetAspect 変更時に crop 初期値を「中央 target アス比」 で再計算
+    // (= まはー要望「4:3 固定 ON のまま 4:3 じゃない画像で初期 rect が
+    // 元画像比率」 問題の解消)。
+    useEffect(() => {
+        if (!analysis) return;
+        setCrop(fitRectToAspect(
+            analysis.width, analysis.height, targetAspect,
+        ));
+    }, [analysis, targetAspect]);
 
     const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const f = e.target.files?.[0];
@@ -2331,9 +2383,7 @@ function FaceUploadSubpanel({
             const result = await onAnalyzeImage(f);
             setAnalysis(result);
             setTargetAspect(result.suggested_aspect);
-            // crop 初期値は画像全体 (= 中央 default を backend に任せる)。
-            setCrop({ x: 0, y: 0, width: result.width, height: result.height });
-        } catch (err) {
+        } catch {
             setAnalysis(null);
         } finally {
             setAnalyzing(false);
@@ -2342,16 +2392,17 @@ function FaceUploadSubpanel({
 
     const submit = async () => {
         if (!file) return;
-        const cropRect = useCustomCrop ? crop : null;
-        await onUploadFace(file, targetAspect, cropRect);
+        await onUploadFace(file, targetAspect, crop);
     };
+
+    const saveIfDirty = () => {/* state 単体なので何もしない (auto sync) */};
 
     return (
         <div style={styles.subpanel}>
             <div style={styles.label}>
-                既存の標準顔画像を ① の出力としてそのまま配置 (= 生成スキップ)。
-                target_aspect に合わせてクロップされて
-                wip/01_face/face.png に保存される。
+                既存の標準顔画像をそのまま配置 (生成スキップ)。 ②③ も同じ
+                アス比で生成されるので、 ここで決めるトリミング範囲が以降
+                全画像のキャンバスサイズを決める。
             </div>
             <div style={styles.row}>
                 <input
@@ -2362,14 +2413,14 @@ function FaceUploadSubpanel({
                 />
             </div>
             {analyzing && <div style={styles.subtle}>解析中...</div>}
-            {analysis && (
+            {analysis && imgPreviewUrl && (
                 <>
                     <div style={styles.subtle}>
                         サイズ: {analysis.width}×{analysis.height}、
                         推奨アス比: {analysis.suggested_aspect}
                     </div>
                     <div style={styles.row}>
-                        <label style={styles.label}>target_aspect:</label>
+                        <label style={styles.label}>アス比:</label>
                         <select
                             value={targetAspect}
                             onChange={(e) =>
@@ -2380,68 +2431,68 @@ function FaceUploadSubpanel({
                                 <option key={a} value={a}>{a}</option>
                             ))}
                         </select>
-                        <span style={styles.subtle}>
-                            ※ ②③ も同じアス比で生成される (目パチ口パクの
-                            座標ズレ防止)
-                        </span>
                     </div>
-                    <label style={styles.checkboxLabel}>
+                    <div style={styles.label}>
+                        クロップ範囲 (ドラッグで調整可能、 初期値は中央の
+                        {" "}{targetAspect} 矩形):
+                    </div>
+                    <TrimRectVisualEditor
+                        imageSrc={imgPreviewUrl}
+                        rect={crop}
+                        onChange={(next) => setCrop(next)}
+                        lockAspect={lockAspect}
+                        onLockAspectChange={setLockAspect}
+                    />
+                    <div style={styles.row}>
+                        <label style={styles.label}>x:</label>
                         <input
-                            type="checkbox"
-                            checked={useCustomCrop}
+                            type="number"
+                            value={crop.x}
+                            style={styles.numberInputSmall}
                             onChange={(e) =>
-                                setUseCustomCrop(e.target.checked)}
+                                setCrop({
+                                    ...crop,
+                                    x: parseInt(e.target.value) || 0,
+                                })}
+                            onBlur={saveIfDirty}
                         />
-                        手動でクロップ矩形を指定 (= 中央クロップが嫌な場合)
-                    </label>
-                    {useCustomCrop && (
-                        <div style={styles.row}>
-                            <label>x:</label>
-                            <input
-                                type="number"
-                                value={crop.x}
-                                style={styles.numberInput}
-                                onChange={(e) =>
-                                    setCrop({
-                                        ...crop,
-                                        x: parseInt(e.target.value) || 0,
-                                    })}
-                            />
-                            <label>y:</label>
-                            <input
-                                type="number"
-                                value={crop.y}
-                                style={styles.numberInput}
-                                onChange={(e) =>
-                                    setCrop({
-                                        ...crop,
-                                        y: parseInt(e.target.value) || 0,
-                                    })}
-                            />
-                            <label>w:</label>
-                            <input
-                                type="number"
-                                value={crop.width}
-                                style={styles.numberInput}
-                                onChange={(e) =>
-                                    setCrop({
-                                        ...crop,
-                                        width: parseInt(e.target.value) || 0,
-                                    })}
-                            />
-                            <label>h:</label>
-                            <input
-                                type="number"
-                                value={crop.height}
-                                style={styles.numberInput}
-                                onChange={(e) =>
-                                    setCrop({
-                                        ...crop,
-                                        height: parseInt(e.target.value) || 0,
-                                    })}
-                            />
-                        </div>
-                    )}
+                        <label style={styles.label}>y:</label>
+                        <input
+                            type="number"
+                            value={crop.y}
+                            style={styles.numberInputSmall}
+                            onChange={(e) =>
+                                setCrop({
+                                    ...crop,
+                                    y: parseInt(e.target.value) || 0,
+                                })}
+                            onBlur={saveIfDirty}
+                        />
+                        <label style={styles.label}>w:</label>
+                        <input
+                            type="number"
+                            value={crop.width}
+                            style={styles.numberInputSmall}
+                            onChange={(e) =>
+                                setCrop({
+                                    ...crop,
+                                    width: parseInt(e.target.value) || 0,
+                                })}
+                            onBlur={saveIfDirty}
+                        />
+                        <label style={styles.label}>h:</label>
+                        <input
+                            type="number"
+                            value={crop.height}
+                            style={styles.numberInputSmall}
+                            onChange={(e) =>
+                                setCrop({
+                                    ...crop,
+                                    height: parseInt(e.target.value) || 0,
+                                })}
+                            onBlur={saveIfDirty}
+                        />
+                    </div>
                     <div style={styles.row}>
                         <button
                             onClick={submit}
@@ -2899,13 +2950,33 @@ function TrimRectVisualEditor({
     const displayRect = pendingRect ?? rect;
 
     // 画像の natural size を取って、 「初回 rect 未設定なら画像全体」 を提案。
+    // さらに lockAspect ON で rect が画像全体と等しい (= 未補正の初期値)
+    // 場合、 中央 4:3 矩形に自動補正する。 まはー指摘「最初の画像が 4:3
+    // じゃない時、 lockAspect ON でも初期 rect が元画像比率」 の解消。
     const handleImgLoad = () => {
         if (imgRef.current) {
             const w = imgRef.current.naturalWidth;
             const h = imgRef.current.naturalHeight;
             setImgNatural({ w, h });
             if (!rect || rect.width === 0 || rect.height === 0) {
-                onChange({ x: 0, y: 0, width: w, height: h });
+                if (lockAspect) {
+                    onChange(fitRectToAspect(w, h, "4:3"));
+                } else {
+                    onChange({ x: 0, y: 0, width: w, height: h });
+                }
+                return;
+            }
+            // rect が画像全体と等しい (= backend default) のに lockAspect が
+            // ON なら、 ユーザー意図 (= 4:3 に揃えたい) に合わせて補正。
+            if (
+                lockAspect
+                && rect.x === 0 && rect.y === 0
+                && rect.width === w && rect.height === h
+            ) {
+                const imgRatio = w / h;
+                if (Math.abs(imgRatio - 4 / 3) > 0.01) {
+                    onChange(fitRectToAspect(w, h, "4:3"));
+                }
             }
         }
     };
