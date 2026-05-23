@@ -1,0 +1,73 @@
+/*
+ * stackchan-addon Panel テーマ変数。
+ *
+ * 本体 globals.css の --bg-X / --text-X / --border-color に乗らない
+ * アドオン固有のアクセント色 (success / info / danger / warning / code)
+ * を light / dark 両モードで定義する。
+ *
+ * Panel.tsx が side-effect import (`import "./theme.module.css";`) して
+ * 取り込む。CSS Modules の :global を使ってグローバルスコープに変数を
+ * ぶら下げているので、Panel.tsx の inline style (= var(--stackchan-X))
+ * からそのまま参照できる。
+ *
+ * 命名規約: --stackchan-<role>-<variant>-<surface>
+ *   role:    success / info / danger / warning / code
+ *   variant: strong (= 飽和) / soft (= 控えめ)、 単一の場合は省略
+ *   surface: bg / fg / border、 fg-on-bg は strong-bg の上に乗る文字色
+ */
+
+:global(:root) {
+    /* light mode defaults */
+    --stackchan-success-strong-bg: #16a34a;
+    --stackchan-success-strong-fg: #ffffff;
+    --stackchan-success-soft-bg: #dcfce7;
+    --stackchan-success-soft-fg: #166534;
+    --stackchan-success-border: #16a34a;
+
+    --stackchan-info-soft-bg: #dbeafe;
+    --stackchan-info-soft-fg: #1e40af;
+    --stackchan-info-border: #3b82f6;
+
+    --stackchan-danger-soft-bg: #fee2e2;
+    --stackchan-danger-soft-fg: #991b1b;
+    --stackchan-danger-strong-bg: #fecaca;
+    --stackchan-danger-border: #ef4444;
+
+    --stackchan-warning-fg: #d97706;
+    --stackchan-warning-soft-bg: #fef3c7;
+    --stackchan-warning-soft-fg: #92400e;
+    --stackchan-warning-border: #d97706;
+
+    /* Code blocks (firmware flash output, pairing token 等) は light でも
+       ターミナル風に暗背景で保つ。 周辺の panel と視覚的に明確に区別する
+       ため、 light の bg-tertiary には溶け込ませない。 */
+    --stackchan-code-bg: #0f172a;
+    --stackchan-code-token-fg: #fbbf24;
+    --stackchan-code-success-fg: #86efac;
+}
+
+:global([data-theme="dark"]) {
+    --stackchan-success-strong-bg: #264;
+    --stackchan-success-strong-fg: #ffffff;
+    --stackchan-success-soft-bg: #264;
+    --stackchan-success-soft-fg: #dfd;
+    --stackchan-success-border: #4a8;
+
+    --stackchan-info-soft-bg: #246;
+    --stackchan-info-soft-fg: #cdf;
+    --stackchan-info-border: #48a;
+
+    --stackchan-danger-soft-bg: #622;
+    --stackchan-danger-soft-fg: #fcc;
+    --stackchan-danger-strong-bg: #522;
+    --stackchan-danger-border: #844;
+
+    --stackchan-warning-fg: #fc8;
+    --stackchan-warning-soft-bg: #642;
+    --stackchan-warning-soft-fg: #fdc;
+    --stackchan-warning-border: #a84;
+
+    --stackchan-code-bg: #000;
+    --stackchan-code-token-fg: #ffa;
+    --stackchan-code-success-fg: #cfc;
+}
