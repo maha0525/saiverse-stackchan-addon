@@ -1431,8 +1431,8 @@ const panelStyles: Record<string, React.CSSProperties> = {
     },
     fwInfoPath: {
         padding: "1px 4px",
-        background: "var(--stackchan-code-bg)",
-        color: "var(--stackchan-code-success-fg)",
+        background: "var(--bg-tertiary)",
+        color: "var(--text-primary)",
         fontFamily: "monospace",
         fontSize: "10px",
         borderRadius: "2px",
