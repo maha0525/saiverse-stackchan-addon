@@ -741,11 +741,15 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                 }
                 const data = await res.json();
                 if (cancelled) return;
-                if (typeof data?.volume === "number") {
-                    setVolume(data.volume);
+                // stackchan-mcp firmware (wifi_board.cc) は volume を
+                // `audio_speaker.volume` の **ネスト構造** で返す。
+                // トップレベル `volume` は旧形式 / raw fallback 想定で互換維持。
+                const vol = (typeof data?.audio_speaker?.volume === "number")
+                    ? data.audio_speaker.volume
+                    : (typeof data?.volume === "number" ? data.volume : null);
+                if (vol !== null) {
+                    setVolume(vol);
                 } else {
-                    // volume key 不在 (raw fallback / firmware 仕様変更) は
-                    // 50 を仮置きしてスライダだけ動かせるようにする。
                     setVolume(50);
                 }
             } catch (e) {

@@ -888,7 +888,15 @@ def _parse_mcp_text_as_dict(raw: Any) -> dict:
     """MCP tool の text 結果を dict に parse (失敗時は raw を載せて返す)。
 
     gateway 側は ESP32 からの JSON text をそのまま透過するので、
-    通常は `{"volume": 50, "battery_level": 80, ...}` 形式の dict。
+    stackchan-mcp firmware (wifi_board.cc:GetDeviceStatusJson) が返す
+    ネスト構造の dict:
+        {
+          "audio_speaker": {"volume": 70},
+          "screen": {"brightness": 80, "theme": "light"},
+          "battery": {"level": 50, "charging": false},
+          "network": {"type": "wifi", "ssid": "...", "signal": "strong"},
+          "chip": {"temperature": 32.5}
+        }
     firmware の予期せぬ仕様変更で非 JSON になっても 500 を返さず、
     UI 側で取得失敗を表示できるよう raw を返却する。
     """
