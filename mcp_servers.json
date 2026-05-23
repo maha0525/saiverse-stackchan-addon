@@ -2,7 +2,7 @@
     "_comment": "stackchan-mcp gateway を SAIVerse 本体の MCP client が subprocess として起動する設定。詳細は docs/intent/stackchan_vessel.md (SAIVerse 本体) §B / §D 参照。",
     "_comment_command": "Elyth と同じく実行時取得方式 (= ユーザーは事前 install 不要)。Elyth は npx -y で npm registry から、こちらは uvx --from で git URL から取得。Phase 1'-4' 検証中は手元 fork (PR1/PR2/PR3 含む) の feature ブランチを指定。Phase 5' で上流 PR が merge されたら、command: 'uvx' / args: ['stackchan-mcp'] (= PyPI 公開版) に切り替える。",
     "_comment_with": "POST /pcm endpoint は内部で stackchan_mcp.tts.send_pcm_stream を呼び、その中で opuslib による Opus encoding を行う。opuslib は gateway の [tts] extra に入っているが、`uvx --from <git>` だけだとデフォルト依存しか install されないので、--with で個別に追加 install する。Phase 1' 検証完了後、上流 PR で gateway デフォルト依存に格上げできれば --with は不要になる。",
-    "_comment_env": "master_token は device の WS 接続認証 (Authorization: Bearer)、pcm_token は voice-tts → gateway の HTTP PCM POST 認証 (VISION_TOKEN の前例に倣う)。両方 addon の AddonConfig から addon.<addon_name>.<key> 形式の placeholder で解決。Phase 2' のペアリング UX でランダム生成 + 永続化を実装、Phase 1' は手動設定で動かす。",
+    "_comment_env": "master_token は device の WS 接続認証 (Authorization: Bearer)、pcm_token は voice-tts → gateway の HTTP PCM POST 認証 (VISION_TOKEN の前例に倣う)。両方 addon の AddonConfig から addon.<addon_name>.<key> 形式の placeholder で解決。Phase 2' のペアリング UX でランダム生成 + 永続化を実装、Phase 1' は手動設定で動かす。VISION_HOST は ${runtime.lan_ip} で SAIVerse 本体が起動時 / reconnect 時に socket probe で自動検出 (Wi-Fi 切り替え時もユーザー操作不要、 詳細: saiverse/lan_ip.py)。",
     "_comment_scope": "Vessel Building は capacity=1 で単一 persona、stackchan-mcp gateway も単一 device 想定なので global で 1 つの subprocess を共有。",
     "_comment_spell_tools": "visible=true 15 個 (ペルソナが Vessel Building で使う物理身体ツール)、visible=false 6 個 (say は voice-tts に置換、listen は Phase 3' で別経路、get_status と診断系は管理者向け)。Phase 4' で各エントリに building_ids: ['<vessel_building_id>'] を追加して Vessel Building 内のみ visible に絞る (本体 MCP client への汎用拡張 A-3-c)。",
     "mcpServers": {
@@ -22,7 +22,7 @@
                 "HOST": "${addon.saiverse-stackchan-addon.gateway_host}",
                 "WS_PORT": "${addon.saiverse-stackchan-addon.gateway_ws_port}",
                 "CAPTURE_PORT": "${addon.saiverse-stackchan-addon.gateway_capture_port}",
-                "VISION_HOST": "${addon.saiverse-stackchan-addon.vision_host}"
+                "VISION_HOST": "${runtime.lan_ip}"
             },
             "scope": "global",
             "timeout": 30,

@@ -16,42 +16,40 @@
             "label": "Stack-chan 認証トークン (master)",
             "description": "Stack-chan device が gateway の WebSocket に接続する際に提示する Bearer トークン。Phase 1' は手動で 32+ 文字のランダム文字列を入力（Phase 2' のペアリング UX で UI から自動生成・QR コード表示に拡張予定）。device 側にも AP モード設定 UI で同じ値を入力する。",
             "type": "text",
-            "placeholder": "stackchan_xxxxxxxxxxxxxxxxxxxxxxxx"
+            "placeholder": "stackchan_xxxxxxxxxxxxxxxxxxxxxxxx",
+            "advanced": true
         },
         {
             "key": "pcm_token",
             "label": "Stack-chan PCM 経路トークン",
             "description": "SAIVerse の voice-tts → stackchan-mcp gateway の HTTP PCM endpoint (POST /pcm) 認証用 Bearer トークン。master_token と別建て（VISION_TOKEN の前例に倣う）。同じく Phase 2' で自動生成に拡張予定。",
             "type": "text",
-            "placeholder": "pcm_xxxxxxxxxxxxxxxxxxxxxxxx"
+            "placeholder": "pcm_xxxxxxxxxxxxxxxxxxxxxxxx",
+            "advanced": true
         },
         {
             "key": "gateway_host",
             "label": "Gateway listen アドレス",
             "description": "stackchan-mcp gateway が WebSocket / HTTP を listen するアドレス。通常は変更不要。",
             "type": "text",
-            "default": "0.0.0.0"
+            "default": "0.0.0.0",
+            "advanced": true
         },
         {
             "key": "gateway_ws_port",
             "label": "Gateway WebSocket ポート",
             "description": "device ↔ gateway の WebSocket 通信ポート。通常は変更不要。",
             "type": "text",
-            "default": "8765"
+            "default": "8765",
+            "advanced": true
         },
         {
             "key": "gateway_capture_port",
             "label": "Gateway HTTP ポート",
             "description": "device → gateway の HTTP 通信ポート（画像 capture および PCM 受信）。通常は変更不要。",
             "type": "text",
-            "default": "8766"
-        },
-        {
-            "key": "vision_host",
-            "label": "Gateway の LAN IP",
-            "description": "Stack-chan device から到達可能な、この SAIVerse ホストの IP アドレス。device が撮影画像を HTTP POST する宛先になる。`ip addr` や `ipconfig` で LAN 内 IP を確認して入力（例: 192.168.1.10）。",
-            "type": "text",
-            "placeholder": "192.168.x.x"
+            "default": "8766",
+            "advanced": true
         },
         {
             "key": "vessel_building_id",
@@ -65,21 +63,24 @@
             "label": "SAIVerse API ホスト (audio hook 用)",
             "description": "stackchan-mcp gateway が device 主導 listen 音声を POST する SAIVerse 側 endpoint のホスト。gateway と SAIVerse が同一マシンで動く通常運用では変更不要。Phase 3' (Gemini inline 音声認識経路) で device → gateway → SAIVerse の流れを成立させるために使う。",
             "type": "text",
-            "default": "127.0.0.1"
+            "default": "127.0.0.1",
+            "advanced": true
         },
         {
             "key": "saiverse_api_port",
             "label": "SAIVerse API ポート (audio hook 用)",
             "description": "SAIVerse 本体 API のポート。city_a なら 8000、city_b なら 9000 が標準。Vessel Building が所属する city の API ポートを入力。",
             "type": "text",
-            "default": "8000"
+            "default": "8000",
+            "advanced": true
         },
         {
             "key": "firmware_path",
             "label": "Firmware merged-binary.bin の path (UI 書き込み用)",
             "description": "AddonManager UI の「ファームウェア書き込み」ボタンが使う merged-binary.bin の絶対 path。 空欄なら自動検出: (1) <SAIVerse repo>/temp/stackchan-mcp/firmware/build/merged-binary.bin (= ローカル開発者の ESP-IDF build 成果物) → (2) ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/merged-binary.bin (= GitHub Releases から DL した一般ユーザー向け配置場所) の順で fallback。 GPL-3.0 firmware を addon に含めない方針 (intent doc §8)、 一般ユーザーは stackchan-mcp の Releases から DL してください。",
             "type": "text",
-            "placeholder": "(空欄 = 自動検出)"
+            "placeholder": "(空欄 = 自動検出)",
+            "advanced": true
         },
         {
             "key": "unit_env3_enabled",
