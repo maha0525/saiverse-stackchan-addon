@@ -3642,9 +3642,11 @@ const styles: Record<string, React.CSSProperties> = {
     },
     preview: {
         // 画像プレビューは黒背景固定 (= alpha 抜き透明画像の判別のため、
-        // light でも黒のほうが視認しやすい)。
+        // light でも黒のほうが視認しやすい)。 出力画像のアスペクト比 (=
+        // metadata.aspect_ratio の default "4:3") に合わせて枠を作り、
+        // contain で黒帯が出ないようにする。
         width: "100%",
-        height: "100px",
+        aspectRatio: "4 / 3",
         objectFit: "contain",
         background: "var(--stackchan-code-bg)",
         borderRadius: "3px",
@@ -3687,8 +3689,9 @@ const styles: Record<string, React.CSSProperties> = {
         fontFamily: "monospace",
     },
     previewEmpty: {
+        // 「未生成」 セルも 4:3 にして、 画像有セルと高さを揃える。
         width: "100%",
-        height: "100px",
+        aspectRatio: "4 / 3",
         background: "var(--bg-tertiary)",
         borderRadius: "3px",
         display: "flex",
