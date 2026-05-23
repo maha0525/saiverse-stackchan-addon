@@ -581,25 +581,9 @@ export default function AvatarPipelineModal({
                     onUpdate={updateMetadata}
                 />
 
-                {/* アニメーションプレビュー (= 目パチ口パクのレビュー用)。
-                    ③ で目・口差分が生成されないと意味のあるプレビューに
-                    ならない (= 空の枠だけが表示されて初見ユーザーを混乱
-                    させる) ため、 ③ 以降に進んだとき + 実際に差分ファイル
-                    がある時のみ展開する。 */}
-                {currentStageIdx >= 2 && (() => {
-                    const stage3 = stages.find(
-                        (s) => s.stage_id === "03_matrix"
-                            || s.stage_id === "03_layered",
-                    );
-                    if (!stage3 || stage3.files.length === 0) return null;
-                    return (
-                        <AnimationPreviewSection
-                            metadata={info.wip_metadata!}
-                            stages={stages}
-                            imageUrl={imageUrl}
-                        />
-                    );
-                })()}
+                {/* アニメーションプレビューは ③ stage に限定 + 制約プロンプト
+                    の下に配置 (= StagePanel 内、 Stage3ConstraintEditor の
+                    直下)。 ここではレンダリングしない。 */}
 
                 {/* 段階バー: 「完了済み」 はファイル有無で判定。
                     backend の completed_stages フラグは ④ runFinalChain で
@@ -1718,6 +1702,19 @@ function StagePanel({
                 <Stage3ConstraintEditor
                     metadata={metadata}
                     onUpdate={onUpdateMetadata}
+                />
+            )}
+
+            {/* アニメプレビュー: ③ で目・口差分が 1 件以上生成された後に
+                制約プロンプト直下で表示。 ここから下に各画像セルが並ぶ
+                ので、 「生成済みの結果を全体動作で確認 → 個別セルで再
+                生成」 という導線になる。 */}
+            {(stageId === "03_matrix" || stageId === "03_layered")
+                && stage.files.length > 0 && (
+                <AnimationPreviewSection
+                    metadata={metadata}
+                    stages={allStages}
+                    imageUrl={imageUrl}
                 />
             )}
 
