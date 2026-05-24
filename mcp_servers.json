@@ -12,7 +12,7 @@
                 "--with",
                 "opuslib",
                 "--from",
-                "git+https://github.com/maha0525/stackchan-mcp.git@dev/integration#subdirectory=gateway",
+                "git+https://github.com/maha0525/stackchan-mcp.git@integrate/all-fixes-2026-05-25#subdirectory=gateway",
                 "stackchan-mcp"
             ],
             "env": {
