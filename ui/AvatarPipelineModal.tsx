@@ -27,10 +27,8 @@ interface SetMetadata {
     mode: "matrix" | "layered";
     common_prompt: string;
     extra_prompts: Record<string, Record<string, string>>;
-    trim_rect: { x: number; y: number; width: number; height: number } | null;
-    trim_rect_overrides: Record<string, {
-        x: number; y: number; width: number; height: number;
-    }>;
+    trim_rect: TrimRect | null;
+    trim_rect_overrides: Record<string, TrimRect>;
     parallelism: number;
     image_model: string;
     image_quality: string;
@@ -148,6 +146,26 @@ function fitRectToAspect(
         width: imgW,
         height: rectH,
     };
+}
+
+/** 矩形の実アス比に最も近い対応アス比を返す (= backend
+ *  avatar_finalizer.closest_supported_aspect と同じロジック)。 ① の
+ *  crop 矩形が真実で、 セレクト表示と ②③ 生成アス比をこれに同期する。 */
+function closestSupportedAspect(width: number, height: number): string {
+    if (width <= 0 || height <= 0) return "1:1";
+    const actual = width / height;
+    let best = "1:1";
+    let bestDiff = Infinity;
+    for (const name of SUPPORTED_ASPECTS) {
+        const [aw, ah] = name.split(":").map(Number);
+        if (!aw || !ah) continue;
+        const diff = Math.abs(actual - aw / ah);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = name;
+        }
+    }
+    return best;
 }
 
 function buildMatrixTargets(): string[] {
@@ -2345,7 +2363,9 @@ function FaceUploadSubpanel({
     const [targetAspect, setTargetAspect] = useState<string>(
         metadata.aspect_ratio,
     );
-    const [crop, setCrop] = useState({ x: 0, y: 0, width: 0, height: 0 });
+    const [crop, setCrop] = useState<TrimRect>(
+        { x: 0, y: 0, width: 0, height: 0 },
+    );
     const [lockAspect, setLockAspect] = useState<boolean>(true);
     const [analyzing, setAnalyzing] = useState(false);
 
@@ -2360,15 +2380,28 @@ function FaceUploadSubpanel({
         return () => URL.revokeObjectURL(url);
     }, [file]);
 
-    // targetAspect 変更時に crop 初期値を「中央 target アス比」 で再計算
-    // (= まはー要望「4:3 固定 ON のまま 4:3 じゃない画像で初期 rect が
-    // 元画像比率」 問題の解消)。
-    useEffect(() => {
-        if (!analysis) return;
-        setCrop(fitRectToAspect(
-            analysis.width, analysis.height, targetAspect,
-        ));
-    }, [analysis, targetAspect]);
+    // セレクト変更 → crop 枠をそのアス比の中央矩形に refit。
+    // (旧実装は useEffect [analysis, targetAspect] で refit していたが、
+    // crop → セレクト同期 (updateCrop) と相互発火してユーザーのドラッグを
+    // 巻き戻すため、 セレクト onChange / 解析完了時の明示呼び出しに変更。)
+    const applyAspect = (
+        aspect: string,
+        a = analysis,
+    ) => {
+        setTargetAspect(aspect);
+        if (a) {
+            setCrop(fitRectToAspect(a.width, a.height, aspect));
+        }
+    };
+
+    // crop 矩形が single source of truth: 変更されるたびに実アス比へ
+    // セレクト表示を同期する (= 2026-06-10 の「① で 4:3 にトリミング
+    // したのに ②③ が 1:1 生成」 事故の修正。 旧実装はセレクト値を
+    // そのまま送信していて、 crop 枠との乖離に気づけなかった)。
+    const updateCrop = (next: TrimRect) => {
+        setCrop(next);
+        setTargetAspect(closestSupportedAspect(next.width, next.height));
+    };
 
     const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const f = e.target.files?.[0];
@@ -2382,7 +2415,7 @@ function FaceUploadSubpanel({
         try {
             const result = await onAnalyzeImage(f);
             setAnalysis(result);
-            setTargetAspect(result.suggested_aspect);
+            applyAspect(result.suggested_aspect, result);
         } catch {
             setAnalysis(null);
         } finally {
@@ -2392,7 +2425,14 @@ function FaceUploadSubpanel({
 
     const submit = async () => {
         if (!file) return;
-        await onUploadFace(file, targetAspect, crop);
+        // 送信アス比は最終 crop 矩形から導出 (= セレクト表示は同期済みの
+        // はずだが、 真実は常に crop 側)。 backend 側でも同じ導出をして
+        // metadata に保存する 2 重ガード。
+        await onUploadFace(
+            file,
+            closestSupportedAspect(crop.width, crop.height),
+            crop,
+        );
     };
 
     const saveIfDirty = () => {/* state 単体なので何もしない (auto sync) */};
@@ -2423,14 +2463,17 @@ function FaceUploadSubpanel({
                         <label style={styles.label}>アス比:</label>
                         <select
                             value={targetAspect}
-                            onChange={(e) =>
-                                setTargetAspect(e.target.value)}
+                            onChange={(e) => applyAspect(e.target.value)}
                             style={styles.select}
                         >
                             {analysis.supported_aspects.map((a) => (
                                 <option key={a} value={a}>{a}</option>
                             ))}
                         </select>
+                        <span style={styles.subtle}>
+                            ②③ は {targetAspect} で生成されます (= crop
+                            枠の実アス比に自動追従)
+                        </span>
                     </div>
                     <div style={styles.label}>
                         クロップ範囲 (ドラッグで調整可能、 初期値は中央の
@@ -2439,9 +2482,10 @@ function FaceUploadSubpanel({
                     <TrimRectVisualEditor
                         imageSrc={imgPreviewUrl}
                         rect={crop}
-                        onChange={(next) => setCrop(next)}
+                        onChange={updateCrop}
                         lockAspect={lockAspect}
                         onLockAspectChange={setLockAspect}
+                        lockAspectRatio={targetAspect}
                     />
                     <div style={styles.row}>
                         <label style={styles.label}>x:</label>
@@ -2450,7 +2494,7 @@ function FaceUploadSubpanel({
                             value={crop.x}
                             style={styles.numberInputSmall}
                             onChange={(e) =>
-                                setCrop({
+                                updateCrop({
                                     ...crop,
                                     x: parseInt(e.target.value) || 0,
                                 })}
@@ -2462,7 +2506,7 @@ function FaceUploadSubpanel({
                             value={crop.y}
                             style={styles.numberInputSmall}
                             onChange={(e) =>
-                                setCrop({
+                                updateCrop({
                                     ...crop,
                                     y: parseInt(e.target.value) || 0,
                                 })}
@@ -2474,7 +2518,7 @@ function FaceUploadSubpanel({
                             value={crop.width}
                             style={styles.numberInputSmall}
                             onChange={(e) =>
-                                setCrop({
+                                updateCrop({
                                     ...crop,
                                     width: parseInt(e.target.value) || 0,
                                 })}
@@ -2486,7 +2530,7 @@ function FaceUploadSubpanel({
                             value={crop.height}
                             style={styles.numberInputSmall}
                             onChange={(e) =>
-                                setCrop({
+                                updateCrop({
                                     ...crop,
                                     height: parseInt(e.target.value) || 0,
                                 })}
@@ -2747,14 +2791,10 @@ function VariantTrimRow({
     onSaveOverride, onRunVariantTrim, runLabel,
 }: {
     variantKey: string;
-    defaultRect: { x: number; y: number; width: number; height: number } | null;
-    overrides: Record<string, {
-        x: number; y: number; width: number; height: number;
-    }>;
+    defaultRect: TrimRect | null;
+    overrides: Record<string, TrimRect>;
     sampleImageUrl: string | null;
-    onSaveOverride: (
-        rect: { x: number; y: number; width: number; height: number } | null,
-    ) => Promise<unknown>;
+    onSaveOverride: (rect: TrimRect | null) => Promise<unknown>;
     onRunVariantTrim: () => Promise<unknown>;
     runLabel: string;
 }) {
@@ -2768,6 +2808,11 @@ function VariantTrimRow({
     const [w, setW] = useState(init.width);
     const [h, setH] = useState(init.height);
     const [lockAspect, setLockAspect] = useState<boolean>(true);
+    // 編集対象のサンプル画像の natural size (= 数値 input 経由の保存にも
+    // ref_width/ref_height を付与するため visual editor から受け取る)。
+    const [refDims, setRefDims] = useState<{ w: number; h: number } | null>(
+        null,
+    );
 
     useEffect(() => {
         const e = overrides?.[variantKey];
@@ -2787,7 +2832,12 @@ function VariantTrimRow({
             || existing.x !== x || existing.y !== y
             || existing.width !== w || existing.height !== h;
         if (dirty) {
-            onSaveOverride({ x, y, width: w, height: h });
+            const rect: TrimRect = { x, y, width: w, height: h };
+            if (refDims) {
+                rect.ref_width = refDims.w;
+                rect.ref_height = refDims.h;
+            }
+            onSaveOverride(rect);
         }
     };
 
@@ -2817,9 +2867,7 @@ function VariantTrimRow({
     }
 
     const currentRect = { x, y, width: w, height: h };
-    const onVisualChange = (
-        next: { x: number; y: number; width: number; height: number },
-    ) => {
+    const onVisualChange = (next: TrimRect) => {
         setX(next.x); setY(next.y);
         setW(next.width); setH(next.height);
         const stored = existing ?? defaultRect;
@@ -2843,6 +2891,7 @@ function VariantTrimRow({
                 onChange={onVisualChange}
                 lockAspect={lockAspect}
                 onLockAspectChange={setLockAspect}
+                onImageSize={(iw, ih) => setRefDims({ w: iw, h: ih })}
             />
             <div style={styles.row}>
                 <label style={styles.label}>x:</label>
@@ -2914,7 +2963,14 @@ function VariantTrimRow({
 // 無理。 画像 + rect overlay + 8 ハンドル drag/resize + 4:3 アス比固定 toggle
 // で視覚的に編集できるようにする。 数値 input は維持して微調整用に併存。
 
-type TrimRect = { x: number; y: number; width: number; height: number };
+type TrimRect = {
+    x: number; y: number; width: number; height: number;
+    // 編集時に表示していた画像の natural size。 ④ で適用先画像のサイズが
+    // ref と違う時、 backend (_trim_one) が rect を比例スケールして適用する
+    // (= ① 手動アップロード由来 face.png と ②③ 生成画像のサイズ差対策)。
+    ref_width?: number;
+    ref_height?: number;
+};
 
 type DragMode =
     | "move"
@@ -2924,12 +2980,19 @@ type DragMode =
 
 function TrimRectVisualEditor({
     imageSrc, rect, onChange, lockAspect, onLockAspectChange,
+    lockAspectRatio = "4:3", onImageSize,
 }: {
     imageSrc: string | null;
     rect: TrimRect | null;
     onChange: (next: TrimRect) => void;
     lockAspect: boolean;
     onLockAspectChange: (locked: boolean) => void;
+    /** lockAspect ON 時に固定するアス比。 ④ は ⑤ の 160×120 出力に合わせ
+     *  default "4:3"、 ① アップロードでは選択中の target アス比を渡す。 */
+    lockAspectRatio?: string;
+    /** 画像 load 時に natural size を親へ通知 (= 数値 input 経由の保存にも
+     *  ref_width/ref_height を付与するため)。 */
+    onImageSize?: (w: number, h: number) => void;
 }) {
     const containerRef = React.useRef<HTMLDivElement>(null);
     const imgRef = React.useRef<HTMLImageElement>(null);
@@ -2949,33 +3012,49 @@ function TrimRectVisualEditor({
     const [pendingRect, setPendingRect] = useState<TrimRect | null>(null);
     const displayRect = pendingRect ?? rect;
 
+    // lockAspect ON 時に固定する比率 (= lockAspectRatio prop から導出)。
+    const lockRatio = (() => {
+        const [aw, ah] = lockAspectRatio.split(":").map(Number);
+        return aw && ah ? aw / ah : 4 / 3;
+    })();
+
     // 画像の natural size を取って、 「初回 rect 未設定なら画像全体」 を提案。
     // さらに lockAspect ON で rect が画像全体と等しい (= 未補正の初期値)
-    // 場合、 中央 4:3 矩形に自動補正する。 まはー指摘「最初の画像が 4:3
-    // じゃない時、 lockAspect ON でも初期 rect が元画像比率」 の解消。
+    // 場合、 中央 lockAspectRatio 矩形に自動補正する。 まはー指摘「最初の
+    // 画像がアス比違いの時、 lockAspect ON でも初期 rect が元画像比率」 の解消。
     const handleImgLoad = () => {
         if (imgRef.current) {
             const w = imgRef.current.naturalWidth;
             const h = imgRef.current.naturalHeight;
             setImgNatural({ w, h });
+            onImageSize?.(w, h);
             if (!rect || rect.width === 0 || rect.height === 0) {
                 if (lockAspect) {
-                    onChange(fitRectToAspect(w, h, "4:3"));
+                    onChange({
+                        ...fitRectToAspect(w, h, lockAspectRatio),
+                        ref_width: w, ref_height: h,
+                    });
                 } else {
-                    onChange({ x: 0, y: 0, width: w, height: h });
+                    onChange({
+                        x: 0, y: 0, width: w, height: h,
+                        ref_width: w, ref_height: h,
+                    });
                 }
                 return;
             }
             // rect が画像全体と等しい (= backend default) のに lockAspect が
-            // ON なら、 ユーザー意図 (= 4:3 に揃えたい) に合わせて補正。
+            // ON なら、 ユーザー意図 (= lockAspectRatio に揃えたい) に合わせて補正。
             if (
                 lockAspect
                 && rect.x === 0 && rect.y === 0
                 && rect.width === w && rect.height === h
             ) {
                 const imgRatio = w / h;
-                if (Math.abs(imgRatio - 4 / 3) > 0.01) {
-                    onChange(fitRectToAspect(w, h, "4:3"));
+                if (Math.abs(imgRatio - lockRatio) > 0.01) {
+                    onChange({
+                        ...fitRectToAspect(w, h, lockAspectRatio),
+                        ref_width: w, ref_height: h,
+                    });
                 }
             }
         }
@@ -3020,7 +3099,12 @@ function TrimRectVisualEditor({
             const dx = (e.clientX - drag.startClientX) / dispInfo.scale;
             const dy = (e.clientY - drag.startClientY) / dispInfo.scale;
             let { x, y, width, height } = drag.startRect;
-            const aspect = drag.startRect.width / drag.startRect.height;
+            // lockAspect ON は「ラベルに表示している比率」 に固定する
+            // (= startRect 比率の引き継ぎだと、 初期 rect がアス比違い
+            // だった時にそのままズレ続ける)。
+            const aspect = lockAspect
+                ? lockRatio
+                : drag.startRect.width / drag.startRect.height;
             const m = drag.mode;
 
             if (m === "move") {
@@ -3172,9 +3256,14 @@ function TrimRectVisualEditor({
             setPendingRect(next);
         };
         const onUp = () => {
-            // drag 終了で 1 回だけ commit。
+            // drag 終了で 1 回だけ commit (= 編集対象画像の natural size を
+            // ref として添付、 backend の比例スケール適用用)。
             if (latestRect) {
-                onChange(latestRect);
+                onChange({
+                    ...latestRect,
+                    ref_width: imgNatural.w,
+                    ref_height: imgNatural.h,
+                });
             }
             setPendingRect(null);
             setDrag(null);
@@ -3185,7 +3274,7 @@ function TrimRectVisualEditor({
             window.removeEventListener("mousemove", onMove);
             window.removeEventListener("mouseup", onUp);
         };
-    }, [drag, rect, imgNatural, onChange, lockAspect]);
+    }, [drag, rect, imgNatural, onChange, lockAspect, lockRatio]);
 
     // 表示用 rect (= 画像座標 → 表示 px)。 drag 中は pendingRect、
     // それ以外は parent から来る rect。
@@ -3223,7 +3312,11 @@ function TrimRectVisualEditor({
                         checked={lockAspect}
                         onChange={(e) => onLockAspectChange(e.target.checked)}
                     />
-                    4:3 アス比固定 (= ⑤ 160×120 出力で歪まない)
+                    {lockAspectRatio} アス比固定{
+                        lockAspectRatio === "4:3"
+                            ? " (= ⑤ 160×120 出力で歪まない)"
+                            : ""
+                    }
                 </label>
                 {imgNatural && displayRect && (
                     <span style={styles.subtle}>
@@ -3315,10 +3408,8 @@ function handleStyle(mode: DragMode): React.CSSProperties {
 function TrimRectEditor({
     rect, onChange, sampleImageUrl,
 }: {
-    rect: { x: number; y: number; width: number; height: number } | null;
-    onChange: (
-        rect: { x: number; y: number; width: number; height: number },
-    ) => void;
+    rect: TrimRect | null;
+    onChange: (rect: TrimRect) => void;
     sampleImageUrl: string | null;
 }) {
     // 自動保存: onBlur で 4 値まとめて save (= 矩形保存ボタン廃止)。
@@ -3327,6 +3418,10 @@ function TrimRectEditor({
     const [w, setW] = useState(rect?.width ?? 1024);
     const [h, setH] = useState(rect?.height ?? 768);
     const [lockAspect, setLockAspect] = useState<boolean>(true);
+    // 編集対象画像の natural size (= 数値 input 経由の保存にも ref を付与)。
+    const [refDims, setRefDims] = useState<{ w: number; h: number } | null>(
+        null,
+    );
 
     useEffect(() => {
         if (rect) {
@@ -3338,14 +3433,21 @@ function TrimRectEditor({
     const saveIfDirty = () => {
         const dirty = !rect || rect.x !== x || rect.y !== y
             || rect.width !== w || rect.height !== h;
-        if (dirty) onChange({ x, y, width: w, height: h });
+        if (dirty) {
+            const next: TrimRect = { x, y, width: w, height: h };
+            if (refDims) {
+                next.ref_width = refDims.w;
+                next.ref_height = refDims.h;
+            }
+            onChange(next);
+        }
     };
 
     return (
         <div style={styles.trimSection}>
             <div style={styles.label}>
-                トリミング矩形 (= 元画像での絶対座標、 全画像に一律適用、
-                自動保存):
+                トリミング矩形 (= 編集中プレビュー画像での座標、 他の画像
+                にはサイズ比でスケールして適用、 自動保存):
             </div>
             <TrimRectVisualEditor
                 imageSrc={sampleImageUrl}
@@ -3353,6 +3455,7 @@ function TrimRectEditor({
                 onChange={onChange}
                 lockAspect={lockAspect}
                 onLockAspectChange={setLockAspect}
+                onImageSize={(iw, ih) => setRefDims({ w: iw, h: ih })}
             />
             <div style={styles.row}>
                 <label>x:</label>

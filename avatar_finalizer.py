@@ -55,6 +55,33 @@ def _trim_one(src: Path, dst: Path, rect: dict[str, int]) -> None:
         y = int(rect["y"])
         w = int(rect["width"])
         h = int(rect["height"])
+        # rect に「編集時に表示していた画像の natural size」 (ref_width /
+        # ref_height) が入っている場合、 適用先画像のサイズが違えば比例
+        # スケールして適用する。 ① 手動アップロード由来の face.png (= 任意
+        # の crop 実寸) と ②③ 生成画像 (= backend 固定サイズ、 例 gpt 4:3
+        # = 1536×1152) はピクセルサイズが違うため、 絶対座標のままでは
+        # 同 face 内で切り出し位置がズレる。 同アス比前提で相対適用する。
+        ref_w = int(rect.get("ref_width") or 0)
+        ref_h = int(rect.get("ref_height") or 0)
+        img_w, img_h = im.size
+        if ref_w > 0 and ref_h > 0 and (ref_w, ref_h) != (img_w, img_h):
+            sx = img_w / ref_w
+            sy = img_h / ref_h
+            LOGGER.debug(
+                "avatar_finalizer: _trim_one scaling rect %s for %s "
+                "(ref=%dx%d -> img=%dx%d)",
+                rect, src.name, ref_w, ref_h, img_w, img_h,
+            )
+            x = int(round(x * sx))
+            y = int(round(y * sy))
+            w = int(round(w * sx))
+            h = int(round(h * sy))
+        # スケール丸めで 1px はみ出すケースの保険 (= PIL の crop は範囲外を
+        # 黒 pad で握り潰すので、 はみ出しはここで clamp して検出可能にする)。
+        x = max(0, min(x, img_w - 1))
+        y = max(0, min(y, img_h - 1))
+        w = max(1, min(w, img_w - x))
+        h = max(1, min(h, img_h - y))
         crop = im.crop((x, y, x + w, y + h))
     dst.parent.mkdir(parents=True, exist_ok=True)
     crop.save(dst, format="PNG")
@@ -554,14 +581,16 @@ def upload_face_image(
 ) -> dict[str, Any]:
     """① 手動アップロード経路。
 
-    アップロード画像を target_aspect にクロップ (= crop_rect 指定なしなら
-    中央クロップ) して `wip/01_face/face.png` に保存。 加えて
-    `metadata.aspect_ratio` を target_aspect に更新 (= ②③ も同アス比で生成、
-    目パチ口パクの座標ズレ防止)。
+    アップロード画像をクロップして `wip/01_face/face.png` に保存。
+    `metadata.aspect_ratio` は「実際に切り出した矩形に最も近い対応アス比」
+    に更新する (= ②③ も同アス比で生成、 目パチ口パクの座標ズレ防止)。
+    target_aspect は crop_rect 未指定時の中央クロップ比率としてのみ使う。
 
     Args:
         image_bytes: アップロード画像 (= 何形式でも PIL が読めれば OK)
-        target_aspect: SUPPORTED_ASPECTS のキー
+        target_aspect: SUPPORTED_ASPECTS のキー (= crop_rect 無し時の中央
+                       クロップ比率。 crop_rect 有り時は実寸から導出した
+                       値が優先される)
         crop_rect: optional {"x", "y", "width", "height"}。 None なら中央クロップ
     """
     if target_aspect not in SUPPORTED_ASPECTS:
@@ -603,22 +632,37 @@ def upload_face_image(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cropped.save(out_path, format="PNG")
 
-    # metadata の aspect_ratio をユーザー選択値に統一 (= ②③ も同アス比)。
+    # metadata の aspect_ratio は「実際に切り出した矩形」 から導出する
+    # (= ②③ も同アス比で生成)。 UI のセレクト値 (target_aspect) と crop
+    # 矩形の実アス比が食い違っても、 face.png の見た目 = 真実。
+    # 2026-06-10: ① で 4:3 にトリミングしたのに target_aspect=1:1 が
+    # 送られて ②③ が 1:1 生成された事故の再発防止。
+    effective_aspect = closest_supported_aspect(cw, ch)
+    if effective_aspect != target_aspect:
+        LOGGER.warning(
+            "avatar_finalizer: ① upload aspect mismatch: "
+            "target_aspect=%s but crop %dx%d is closest to %s "
+            "-> metadata adopts %s",
+            target_aspect, cw, ch, effective_aspect, effective_aspect,
+        )
     mgr.update_metadata(
-        persona_id, set_name, aspect_ratio=target_aspect,
+        persona_id, set_name, aspect_ratio=effective_aspect,
     )
 
     LOGGER.info(
         "avatar_finalizer: ① upload persona=%s set=%s "
-        "original=%dx%d crop=(%d,%d,%d,%d) target_aspect=%s",
+        "original=%dx%d crop=(%d,%d,%d,%d) target_aspect=%s "
+        "effective_aspect=%s",
         persona_id, set_name, w, h, x, y, cw, ch, target_aspect,
+        effective_aspect,
     )
     return {
         "stage_id": ap.STAGE_FACE,
         "path": str(out_path),
         "original_size": [w, h],
         "crop": {"x": x, "y": y, "width": cw, "height": ch},
-        "target_aspect": target_aspect,
+        "target_aspect": effective_aspect,
+        "requested_aspect": target_aspect,
         "cropped_size": [cw, ch],
     }
 
