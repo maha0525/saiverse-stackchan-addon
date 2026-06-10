@@ -25,9 +25,21 @@ m5stack/M5Unit-ENV から 1:1 で Python に移植している。
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import sys
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from tools.core import ToolSchema
+
+# addon 内 ``tools/hubs/pahub.py`` を import するため、 addon の tools/
+# (= 親ディレクトリ) を sys.path に通す。 SAIVerse の tool ローダーは
+# ``tools/units/`` を sys.path に積むだけなので、 同階層の ``tools/hubs/``
+# を ``import hubs.pahub`` で参照するには 1 段上を別途追加する必要がある。
+_ADDON_TOOLS_DIR = str(Path(__file__).resolve().parent.parent)
+if _ADDON_TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _ADDON_TOOLS_DIR)
+
+from hubs.pahub import PaHub, get_pahub_from_params  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -168,6 +180,94 @@ def _run_on_mcp_loop(coro, timeout_sec: float = _DEFAULT_TIMEOUT_SEC) -> Any:
 
 
 # ============================================================
+# Hub lazy recovery
+# ============================================================
+# Stack-chan の Port A に PaHUB を挟む構成では、 ハブの全 channel が closed
+# 状態 (= power-on default、 Stack-chan 再起動後、 ハブ付け替え直後等) で
+# I2C 操作が失敗する。 「起動時に 1 回 init」 では Stack-chan 側の再起動
+# タイミングを SAIVerse 側から検知しきれないので、 各 i2c 操作で:
+#   1 回目試行 → i2c-level error (ESP_ERR_*) が返ったら hub.open_all_channels()
+#   → 2 回目試行 → そのまま結果を返す
+# の lazy recovery 経路に乗せる。 通常運用 (hub が open 状態を維持してる) では
+# 1 回目で成功して余分な往復ゼロ。 直結 (hub_type=none) のときはリカバリ
+# 機構自体スキップして既存挙動と等価。
+
+def _payload_has_esp_err(payload: Any) -> bool:
+    """i2c_* tool レスポンスに ``ESP_ERR_*`` で始まる error 文字列があるか。
+
+    ハブ起因の典型エラー (ESP_ERR_TIMEOUT = slave 無応答、
+    ESP_ERR_INVALID_STATE = バス state 異常等) を捕捉する判定。 ok=true なら
+    成功なので無条件 False、 ok=false でも error が "ESP_ERR_" 接頭辞を持たない
+    なら gateway 側エラー等として recover 対象外にする (= 無駄な hub init を
+    走らせない)。
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("ok"):
+        return False
+    err = payload.get("error", "")
+    return isinstance(err, str) and err.startswith("ESP_ERR_")
+
+
+def _sht30_is_i2c_failure(result: Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]) -> bool:
+    write_payload, read_payload = result
+    return _payload_has_esp_err(write_payload) or _payload_has_esp_err(read_payload)
+
+
+def _qmp6988_is_i2c_failure(result: Tuple[Optional[float], Optional[float], Optional[str]]) -> bool:
+    _pressure_pa, _temperature_c, err = result
+    if not isinstance(err, str):
+        return False
+    return "ESP_ERR_" in err
+
+
+async def _execute_with_hub_recovery(
+    operation: Callable[[], Awaitable[Any]],
+    is_i2c_failure: Callable[[Any], bool],
+) -> Any:
+    """Hub 経由の i2c 操作を lazy recovery 付きで実行。
+
+    ハブ無し (hub_type=none) なら ``operation`` を 1 回呼んでそのまま返す。
+    ハブ有りで 1 回目が i2c-level failure を返した時のみ
+    ``PaHub.open_all_channels()`` を試みて、 成功したら ``operation`` を
+    もう 1 回呼ぶ。 リカバリ後の結果はそのまま返す (= 2 度目もダメなら user-
+    facing エラーになる、 リトライは 1 回限り)。
+
+    Args:
+        operation: 引数なし async コール (各測定 sequence)。
+        is_i2c_failure: 操作結果から「ハブ起因リカバリ対象か」 を判定する callable。
+    """
+    hub: Optional[PaHub] = get_pahub_from_params()
+    result = await operation()
+
+    if hub is None:
+        # 直結構成: リカバリ機構自体スキップして既存挙動と等価
+        return result
+
+    if not is_i2c_failure(result):
+        return result
+
+    LOGGER.info(
+        "env3: I2C failure on hub-routed access (addr=0x%02X), "
+        "attempting PaHub recovery (open all channels)",
+        hub.address,
+    )
+    recovered = await hub.open_all_channels()
+    if not recovered:
+        # hub への write 自体が通らない → 結線 / アドレス本物の問題なので
+        # オリジナルのエラーをそのまま呼び元に返す (= ユーザーに「ハブ設定 / 配線
+        # を確認してください」 系のメッセージが表示される)
+        LOGGER.warning(
+            "env3: PaHub recovery (open_all_channels) failed; "
+            "returning original i2c error to caller"
+        )
+        return result
+
+    LOGGER.info("env3: PaHub recovery succeeded, retrying operation once")
+    return await operation()
+
+
+# ============================================================
 # SHT30 (温湿度、 0x44)
 # ============================================================
 
@@ -205,7 +305,9 @@ def get_env3_temperature_humidity() -> str:
         )
 
     try:
-        write_payload, read_payload = _run_on_mcp_loop(_measure_sht30())
+        write_payload, read_payload = _run_on_mcp_loop(
+            _execute_with_hub_recovery(_measure_sht30, _sht30_is_i2c_failure)
+        )
     except Exception as exc:
         LOGGER.exception("env3.temperature_humidity: SHT30 sequence failed")
         return f"ENV III の測定に失敗しました (I2C 通信エラー): {exc}"
@@ -543,7 +645,9 @@ def get_env3_air_pressure() -> str:
         )
 
     try:
-        pressure_pa, temperature_c, err = _run_on_mcp_loop(_measure_qmp6988())
+        pressure_pa, temperature_c, err = _run_on_mcp_loop(
+            _execute_with_hub_recovery(_measure_qmp6988, _qmp6988_is_i2c_failure)
+        )
     except Exception as exc:
         LOGGER.exception("env3.air_pressure: QMP6988 sequence failed")
         return f"ENV III (気圧) の測定に失敗しました (I2C 通信エラー): {exc}"
