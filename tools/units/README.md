@@ -305,6 +305,7 @@ QMP6988 の calibration coefficients のように **device 再起動まで変化
 
 - **`sonic.py`** — M5Stack 超音波測距ユニット I2C (RCWL-9620、 0x57)。 「write (測距トリガ) → 120 ms wait → 3 byte read → 24-bit raw を /1000 で mm 換算」 だけの**最小サンプル** (CRC も calibration も無し)。 新規 Unit がこの単純パターンに収まるなら sonic.py を雛形にすると速い
 - **`env3.py`** — M5Stack ENV III (温湿度: SHT30 0x44 + 気圧: QMP6988 0x70)。 1 file で「clock stretching enable cmd + 単純 measurement」 (SHT30) と「OTP calibration register 読み出し + cache + Q-format compensation」 (QMP6988) の両パターンを実装。 包括的なサンプル
+- **`servo8.py`** — M5Stack 8Servos Unit (U165、 0x25)。 read を伴わない **write-only 制御系** + 「MODE → 値の 2 段書き込み」 + 引数付き spell (channel / angle / speed) のサンプル
 
 ## 関連 doc
 

@@ -90,6 +90,13 @@
             "default": false
         },
         {
+            "key": "unit_servo8_enabled",
+            "label": "8Servos Unit (サーボドライバ) を有効化",
+            "description": "Stack-chan の Port A に接続した M5Stack 8Servos Unit (U165、 STM32F030F4、 I2C 0x25) を spell として公開する。 有効化するとペルソナが「サーボを動かす」 spell (servo8_set_angle: チャンネル 0〜7 を 0〜180度) を呼べるようになる。 どのチャンネルに何のサーボ (腕・首・車輪など) が繋がっているかは物理配線次第なので、 意味のある動作は複合アクションとして名前付きで定義する。 物理 Unit を接続していない場合は無効のままにしておく (= spell が出ない)。 ファーム書き換え不要で Port A I2C bus 経由で動作 (PR ② Port A I2C generic tools 必須)。",
+            "type": "toggle",
+            "default": false
+        },
+        {
             "key": "unit_sonic_enabled",
             "label": "超音波測距ユニット (距離センサー) を有効化",
             "description": "Stack-chan の Port A に接続した M5Stack 超音波測距ユニット I2C (RCWL-9620、 I2C 0x57) を spell として公開する。 有効化するとペルソナが「距離を測る」 spell (get_sonic_distance: 正面の物体までの距離を cm で取得) を呼べるようになる。 指向角およそ 60°、 測定レンジ 2〜450 cm。 「近づいてきた」「目の前に何かある」 等の空間把握の根拠に使える。 物理 Unit を接続していない場合は無効のままにしておく (= spell が出ない)。 ファーム書き換え不要で Port A I2C bus 経由で動作 (PR ② Port A I2C generic tools 必須)。",
