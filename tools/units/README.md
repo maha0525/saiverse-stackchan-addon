@@ -233,6 +233,34 @@ await conn.call_tool("i2c_read", {"addr": 0x44, "n_bytes": 6})
 
 例外: 「register pointer + read」 (= measurement trigger ではなく単純な register 読み出し) なら `i2c_write_read` 1 発で OK。 例: QMP6988 の chip ID register 0xD1 や、 SHT30 の status register 0xF32D。
 
+### 遅い Unit は 400 kHz だと `ESP_ERR_INVALID_STATE` で落ちる
+
+Port A 汎用 i2c tool (`i2c_read` / `i2c_write` / `i2c_write_read`) は I2C クロックを既定 **400 kHz** で叩きます。 これに追従できない遅い Unit は **`i2c_scan` (probe) では ACK を返すのに、 実際の `i2c_write` / `i2c_read` の transmit が `ESP_ERR_INVALID_STATE` (= esp_err 0x103) で毎回失敗** します (= ファームの PY32 IO expander が 100 kHz で踏んだのと同じ罠。 stackchan.cc の該当コメント参照)。
+
+代表例が **RCWL-9620 超音波測距ユニット** (`sonic.py`)。 各 i2c 呼び出しの args に **`scl_speed_hz`** を渡してクロックを下げます (firmware の optional property、 既定 400000、 range 100000〜1000000)。
+
+**write と read で必要な速度が違う (read のほうがシビア)**。 RCWL-9620 の実機検証 (PaHUB ch5 単独 / 全 channel 開放いずれでも同じ) で判明:
+
+| 操作 | 駆動側 | 200 kHz | 100 kHz |
+|---|---|---|---|
+| trigger `i2c_write` | master が SDA 駆動 | ACK する | OK |
+| 測定値 `i2c_read` | slave が SDA 駆動 (ESP-IDF `i2c_master_receive` がサンプリング) | `ESP_ERR_INVALID_STATE` / 不定値で erratic | 安定 (5/5 同値) |
+
+master がバスを駆動する write は速度耐性が高く、 slave が駆動して master が読む read はタイミング/信号品質に敏感で律速になります。 **read が通る速度に両方を合わせる** (RCWL-9620 では 100 kHz) のが安全。
+
+**裏付け**: RCWL-9620 の I2C 上限速度は datasheet に明記が無く (チップ自体マイナーで仕様が薄い)、 M5 公式材料も一貫しません — `m5stack/M5Unit-Sonic` の `Unit_Sonic.h` は `begin(..., speed=200000L)` (200 kHz) を既定にする一方、 一部 example は `400000U` (400 kHz) を渡しています。 つまり「100 kHz でないとダメ」 と公式に書いてある一次情報は無い。 ただし M5 コミュニティで同型ユニットの同じ症状が独立に報告されており (高速だと「毎サンプルの半分が 4500 mm を返す」 = 本実装で 300 kHz 時に観測した `0xFFFFFF`→クランプと一致)、 解決策が `"if I set the i2c rate to 100Khz this works"` と確認されています ([M5Stack Community: Ultrasonic I2C problems](https://community.m5stack.com/topic/4255/ultrasonic-i2c-problems/2))。 本実装の 100 kHz はこの実測 + コミュニティ報告に基づく値で、 write/read の非対称自体は ESP-IDF `i2c_master_receive` + PaHUB 経由での挙動 (datasheet には載らない実装側の事実)。
+
+```python
+# 遅い Unit: read が律速。 両方 100 kHz に下げる
+await conn.call_tool("i2c_write",
+    {"addr": 0x57, "bytes": [0x01], "scl_speed_hz": 100000})
+await asyncio.sleep(0.120)
+await conn.call_tool("i2c_read",
+    {"addr": 0x57, "n_bytes": 3, "scl_speed_hz": 100000})
+```
+
+`scl_speed_hz` property は firmware 側 (`temp/stackchan-mcp` の `boards/stackchan/stackchan.cc`、 `self.i2c.read/write/write_read` の 3 tool) に実装されています。 **未対応の旧 firmware では未知 arg として無視される**ので、 古いファームのまま動かすと 400 kHz のままで遅い Unit は動きません (= firmware 更新 + flash が前提)。 症状の切り分けには `i2c_scan` を使い、 「scan には出るが read/write が INVALID_STATE」 なら速度問題と判断できます。
+
 ### 戻り値型は `str` か `(str, dict)`、 4-tuple は NG
 
 SAIVerse の SEA runtime は **`str` または `(str, dict)` の 2-tuple** しか正規対応していません。 4-tuple `(text, ToolResult, file_path, metadata)` を return すると tuple 全体が `str()` 化されて LLM に repr 文字列がそのまま渡ります (= 既存 `see.py` も同じ bug を抱えている、 詳細は `docs/issues/native_tool_return_4tuple_bug.md`)。
@@ -275,6 +303,7 @@ QMP6988 の calibration coefficients のように **device 再起動まで変化
 
 ## 参考実装
 
+- **`sonic.py`** — M5Stack 超音波測距ユニット I2C (RCWL-9620、 0x57)。 「write (測距トリガ) → 120 ms wait → 3 byte read → 24-bit raw を /1000 で mm 換算」 だけの**最小サンプル** (CRC も calibration も無し)。 新規 Unit がこの単純パターンに収まるなら sonic.py を雛形にすると速い
 - **`env3.py`** — M5Stack ENV III (温湿度: SHT30 0x44 + 気圧: QMP6988 0x70)。 1 file で「clock stretching enable cmd + 単純 measurement」 (SHT30) と「OTP calibration register 読み出し + cache + Q-format compensation」 (QMP6988) の両パターンを実装。 包括的なサンプル
 
 ## 関連 doc
