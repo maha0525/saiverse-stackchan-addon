@@ -24,9 +24,11 @@ I2C addr 0x57) で距離を測定する。 内部で stackchan-mcp の汎用 I2C
 測定対象 / レンジ: 正面 60° の指向角内で最も近い物体までの距離。 2 cm 〜
 450 cm、 精度 ±2% (datasheet)。
 
-有効化フロー: AddonConfig の ``unit_sonic_enabled`` を true にすると spell
-として公開される (= addon UI の toggle で ON/OFF)。 物理 Unit が無い時は
-無効化したままにすることで「効かない tool」 が LLM に出ないようにする。
+可視化フロー (v0.10 マルチ機体): 機体ごとの capability (vessels.db の
+``sonic``、 機体管理 UI で手動設定) が True の機体に降りたペルソナにだけ
+spell として公開される (intent K-5、 不変条件 #14)。 物理 Unit が無い機体
+では capability を OFF にしておくことで「効かない tool」 が LLM に出ない。
+旧 addon 単一 ``unit_sonic_enabled`` toggle は廃止。
 
 戻り値型: native tool は ``str`` を返す (SEA runtime は str / (str, dict) の
 2 形式しか正規対応しない。 詳細: docs/issues/native_tool_return_4tuple_bug.md)。
@@ -88,28 +90,23 @@ SONIC_SCL_SPEED_HZ = 100000
 _DEFAULT_TIMEOUT_SEC = 10.0
 
 
-def _addon_params() -> Dict[str, Any]:
+def _unit_present() -> bool:
+    """現在ペルソナが降りている機体が超音波測距ユニットを搭載しているか。
+
+    機体ごとの capability (vessels.db の ``sonic``、 機体管理 UI で手動設定)
+    を見る。 旧 addon 単一 ``unit_sonic_enabled`` toggle を置換 (intent K-5、
+    不変条件 #14)。 ペルソナ context が無い / 機体が解決できない場合は False
+    (= 安全側、 搭載なし扱い)。 スキーマ可視性 (``_build_schema``) と同じ
+    capability を参照する。
+    """
+    from vessel_dispatch import VesselNotAvailable, resolve_vessel
+
     try:
-        from saiverse.addon_config import get_params
-
-        return get_params(ADDON_NAME) or {}
-    except Exception:
-        LOGGER.exception("sonic: failed to load AddonConfig params")
-        return {}
-
-
-def _vessel_building_id() -> Optional[str]:
-    vbid = _addon_params().get("vessel_building_id")
-    return str(vbid) if vbid else None
-
-
-def _unit_enabled() -> bool:
-    val = _addon_params().get("unit_sonic_enabled", False)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.lower() in ("true", "1", "yes", "on")
-    return bool(val)
+        vessel = resolve_vessel()
+    except VesselNotAvailable:
+        return False
+    caps = vessel.capabilities or {}
+    return bool(caps.get("sonic"))
 
 
 def _get_mcp_connection():
@@ -233,10 +230,11 @@ def get_sonic_distance() -> str:
     Returns:
         距離を整形した日本語文字列、 もしくはエラーメッセージ。
     """
-    if not _unit_enabled():
+    if not _unit_present():
         return (
-            "超音波測距ユニットは無効化されています。 アドオン管理 UI で"
-            "「超音波測距ユニット (距離センサー) を有効化」 を ON にしてください。"
+            "この身体 (Stack-chan) には超音波距離センサー (RCWL-9620) が"
+            " 搭載されていません。 搭載機体なら機体管理 UI で「超音波距離"
+            "センサー」 を ON にしてください。"
         )
 
     try:
@@ -341,18 +339,18 @@ def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
 def schemas() -> List[ToolSchema]:
     """1 ファイル複数 spell の登録 entry point (env3.py / servo8.py と同形)。
 
-    ``spell_visible`` は AddonConfig の ``unit_sonic_enabled`` + 有効な
-    ``vessel_building_id`` が両方揃った時だけ True。 schemas() は spell surface
-    構築のたびに呼ばれるので、 toggle 切り替え後の reconnect で即時に visibility
-    が反映される (= subprocess restart 不要)。
+    ``spell_visible`` / ``building_ids`` は sonic capability を持つ機体の
+    Vessel Building 集合から決まる (= ``list_building_ids_with_capability``)。
+    schemas() は spell surface 構築のたびに呼ばれるので、 機体管理 UI で
+    capability を切り替えた後の reconnect で即時に visibility が反映される
+    (= subprocess restart 不要)。
     """
-    enabled = _unit_enabled()
-    vbid = _vessel_building_id()
-    if not enabled:
-        LOGGER.debug("sonic: unit_sonic_enabled is false; spells hidden from persona")
-    elif vbid is None:
-        LOGGER.warning(
-            "sonic: vessel_building_id not configured; spells will not be visible"
+    from vessel_dispatch import list_building_ids_with_capability
+
+    if not list_building_ids_with_capability("sonic"):
+        LOGGER.debug(
+            "sonic: no vessel declares sonic capability; spells hidden until "
+            "set in 機体管理 UI"
         )
 
     return [

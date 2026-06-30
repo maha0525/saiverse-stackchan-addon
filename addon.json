@@ -83,27 +83,6 @@
             "advanced": true
         },
         {
-            "key": "unit_env3_enabled",
-            "label": "ENV III (温湿度・気圧) を有効化",
-            "description": "Stack-chan の Port A に接続した M5Stack ENV III Unit (SHT30 温湿度 0x44 + QMP6988 気圧 0x70) を spell として公開する。 有効化するとペルソナが「温度を取得」「気圧を取得」 系の spell を呼べるようになる。 物理 Unit を接続していない場合は無効のままにしておく (= spell が出ない)。 ファーム書き換え不要で Port A I2C bus 経由で動作 (PR ② Port A I2C generic tools 必須)。",
-            "type": "toggle",
-            "default": false
-        },
-        {
-            "key": "unit_servo8_enabled",
-            "label": "8Servos Unit (サーボドライバ) を有効化",
-            "description": "Stack-chan の Port A に接続した M5Stack 8Servos Unit (U165、 STM32F030F4、 I2C 0x25) を spell として公開する。 有効化するとペルソナが「サーボを動かす」 spell (servo8_set_angle: チャンネル 0〜7 を 0〜180度) を呼べるようになる。 どのチャンネルに何のサーボ (腕・首・車輪など) が繋がっているかは物理配線次第なので、 意味のある動作は複合アクションとして名前付きで定義する。 物理 Unit を接続していない場合は無効のままにしておく (= spell が出ない)。 ファーム書き換え不要で Port A I2C bus 経由で動作 (PR ② Port A I2C generic tools 必須)。",
-            "type": "toggle",
-            "default": false
-        },
-        {
-            "key": "unit_sonic_enabled",
-            "label": "超音波測距ユニット (距離センサー) を有効化",
-            "description": "Stack-chan の Port A に接続した M5Stack 超音波測距ユニット I2C (RCWL-9620、 I2C 0x57) を spell として公開する。 有効化するとペルソナが「距離を測る」 spell (get_sonic_distance: 正面の物体までの距離を cm で取得) を呼べるようになる。 指向角およそ 60°、 測定レンジ 2〜450 cm。 「近づいてきた」「目の前に何かある」 等の空間把握の根拠に使える。 物理 Unit を接続していない場合は無効のままにしておく (= spell が出ない)。 ファーム書き換え不要で Port A I2C bus 経由で動作 (PR ② Port A I2C generic tools 必須)。",
-            "type": "toggle",
-            "default": false
-        },
-        {
             "key": "hub_type",
             "label": "Port A I2C ハブ",
             "description": "Port A に I2C ハブを挟んで複数 Unit を接続する場合の種別。 ハブを使わず Unit 直結なら none のまま。 pahub を選んだ場合は下の hub_addr_a0 / a1 / a2 で物理デバイスのアドレス選択パッド状態を反映する。 ハブ経由 ENV III では Stack-chan 起動直後や Stack-chan 再起動後にハブの全 channel が closed 状態から始まるため、 失敗時に自動で全 channel open を試みるリカバリが組まれている (= ユーザーが手動で初期化操作する必要はない)。",

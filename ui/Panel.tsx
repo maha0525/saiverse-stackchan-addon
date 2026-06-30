@@ -117,13 +117,16 @@ export default function StackchanVesselPanel({
     );
 }
 
-// ----- Vessel Pairing section (Phase 2') -----
+// ----- Vessel Pairing section (Phase 2' / v0.10 マルチ機体) -----
 //
-// Stack-chan device の登録・解除を addon UI から実行する。
+// Stack-chan device の登録・解除・機体管理を addon UI から実行する。
 // - POST /pair → device_token + vessel_id を発行、AddonConfig も自動更新
-// - GET /vessels → 登録済み vessel 一覧
+// - GET /vessels → 登録済み vessel 一覧 (ポート・接続先 URL・capability 込み)
 // - DELETE /vessels/{id} → 解除
-// Phase 1' single vessel 前提に従い、1 機体が登録済みなら追加 UI は非表示。
+// - POST /vessels/{id}/capabilities → 搭載ユニット (capability) 手動設定
+// v0.10 で複数機体に対応 (intent 設計 K)。 追加フォームは常に表示し、 既に
+// ペアリング済みの Building は select から除外する。 機体ごとに per-vessel の
+// ポート・接続先 URL を表示し、 搭載ユニットを capability トグルで設定する。
 
 interface VesselSummary {
     vessel_id: string;
@@ -134,7 +137,21 @@ interface VesselSummary {
     paired_at: string;
     last_seen_at: string | null;
     connected: boolean;
+    // マルチ機体 (v0.10): per-vessel のポート・接続先 URL・capability。
+    ws_port: number | null;
+    capture_port: number | null;
+    capabilities: Record<string, boolean>;
+    gateway_ws_url: string;
 }
+
+// 機体管理 UI で手動トグルする capability (= 搭載ユニット集合)。 key は
+// backend の _KNOWN_CAPABILITIES / vessel_dispatch の cap_key と一致させる。
+// label は「何も知らない人が分かる」表示名 (ユニット名 + 何のセンサーか)。
+const CAPABILITY_OPTIONS: { key: string; label: string }[] = [
+    { key: "env3", label: "環境センサー (ENV III: 温湿度・気圧)" },
+    { key: "servo8", label: "8 サーボユニット (首・腕などの追加サーボ)" },
+    { key: "sonic", label: "超音波距離センサー (RCWL-9620)" },
+];
 
 interface PairResponse {
     vessel_id: string;
@@ -272,7 +289,48 @@ function VesselPairingSection({
         }
     };
 
-    const canCreate = vessels !== null && vessels.length === 0;
+    // capability トグル: 現在の capabilities をベースに該当 key だけ差し替えて
+    // 全体を POST する (= backend の set_capabilities は dict 全体上書き)。
+    // 成功時のみ fetchVessels で一覧を更新する (= 楽観更新しない、 失敗時に
+    // トグルが実機状態とズレないように)。
+    const commitCapability = async (
+        vessel: VesselSummary, capKey: string, enabled: boolean,
+    ) => {
+        setBusy(true);
+        setError(null);
+        try {
+            const next = { ...(vessel.capabilities ?? {}), [capKey]: enabled };
+            const res = await fetch(
+                `${addonApiBase}/vessels/${encodeURIComponent(vessel.vessel_id)}/capabilities`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ capabilities: next }),
+                },
+            );
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            await fetchVessels();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    // 複数機体対応 (v0.10): single vessel ガードを撤廃。 追加フォームは常に
+    // 出す。 ただし既にペアリング済みの Building は select から除外する
+    // (= 同じ Building への二重ペアリングは backend が 409 で弾くので、 UX
+    // 上あらかじめ選べないようにする)。
+    const canCreate = vessels !== null;
+    const boundBuildingIds = new Set(
+        (vessels ?? []).map((v) => v.bound_building_id),
+    );
+    const availableBuildings = buildings.filter(
+        (b) => !boundBuildingIds.has(b.id),
+    );
 
     return (
         <div style={panelStyles.section}>
@@ -314,6 +372,19 @@ function VesselPairingSection({
                                     <div style={panelStyles.subtle}>
                                         paired: {formatPairedAt(v.paired_at)}
                                     </div>
+                                    {(v.ws_port !== null
+                                        || v.capture_port !== null) && (
+                                        <div style={panelStyles.subtle}>
+                                            ポート: ws {v.ws_port ?? "—"} /
+                                            capture {v.capture_port ?? "—"}
+                                        </div>
+                                    )}
+                                    <div style={panelStyles.subtle}>
+                                        接続先:{" "}
+                                        <code style={panelStyles.inlineCode}>
+                                            {v.gateway_ws_url}
+                                        </code>
+                                    </div>
                                 </div>
                                 <button
                                     onClick={() => deletePairing(
@@ -329,6 +400,44 @@ function VesselPairingSection({
                                     解除
                                 </button>
                             </div>
+
+                            {/* 搭載ユニット (capability) の手動設定。 ここで ON に
+                                した機体に降りたペルソナにだけ、 対応するユニット
+                                ツール (env3 / servo8 / sonic) が見える。 */}
+                            <div style={panelStyles.capabilityBlock}>
+                                <div style={panelStyles.subtle}>
+                                    搭載ユニット:
+                                </div>
+                                <div style={panelStyles.capabilityRow}>
+                                    {CAPABILITY_OPTIONS.map((cap) => (
+                                        <label
+                                            key={cap.key}
+                                            style={{
+                                                ...panelStyles.capabilityLabel,
+                                                cursor: busy
+                                                    ? "not-allowed"
+                                                    : "pointer",
+                                            }}
+                                            title={cap.label}
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={
+                                                    v.capabilities?.[cap.key]
+                                                    === true
+                                                }
+                                                onChange={(e) =>
+                                                    commitCapability(
+                                                        v, cap.key,
+                                                        e.target.checked,
+                                                    )}
+                                                disabled={busy}
+                                            />
+                                            {cap.label}
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
                         </div>
                     ))}
                 </div>
@@ -336,7 +445,7 @@ function VesselPairingSection({
 
             {canCreate && (
                 <div style={panelStyles.formRow}>
-                    {buildings.length > 0 ? (
+                    {availableBuildings.length > 0 ? (
                         <select
                             value={selectedBuildingId}
                             onChange={(e) =>
@@ -345,7 +454,7 @@ function VesselPairingSection({
                             style={panelStyles.select}
                         >
                             <option value="">Building を選択…</option>
-                            {buildings.map((b) => (
+                            {availableBuildings.map((b) => (
                                 <option key={b.id} value={b.id}>
                                     {b.name} ({b.id})
                                 </option>
@@ -735,6 +844,11 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
     const [volume, setVolume] = useState<number | null>(null);
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    // 頭タッチセンサー: null = 初期 fetch 未完 / 取得失敗。 firmware は NVS で
+    // 永続化された有効状態を返す (= #314)。 false にすると頭をなでても反応
+    // しなくなる (= HandleTap / HandleStroke がローカル応答と event 送出の
+    // 両方をスキップ)。
+    const [touchEnabled, setTouchEnabled] = useState<boolean | null>(null);
 
     // マウント時 1 回だけ device 状態を fetch。 polling はしない (= 他経路で
     // 音量変わった場合は AddonManager を開き直すまで Panel の値はズレる、
@@ -765,6 +879,32 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                 if (!cancelled) {
                     setError(e instanceof Error ? e.message : String(e));
                     setVolume(50);
+                }
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [addonApiBase]);
+
+    // 頭タッチセンサーの有効状態をマウント時 1 回 fetch。 音量と同様 polling
+    // はしない。 取得失敗時は touchEnabled を null のままにしてトグルを
+    // 無効化する (= 不定値で誤操作させない、 詳細は errorBox に出る)。
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch(`${addonApiBase}/device/touch-sensor`);
+                if (!res.ok) {
+                    const body = await res.json().catch(() => null);
+                    throw new Error(body?.detail ?? `HTTP ${res.status}`);
+                }
+                const data = await res.json();
+                if (cancelled) return;
+                if (typeof data?.enabled === "boolean") {
+                    setTouchEnabled(data.enabled);
+                }
+            } catch (e) {
+                if (!cancelled) {
+                    setError(e instanceof Error ? e.message : String(e));
                 }
             }
         })();
@@ -809,6 +949,29 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
         }
     };
 
+    const commitTouch = async (enabled: boolean) => {
+        setBusy(true);
+        setError(null);
+        try {
+            const res = await fetch(`${addonApiBase}/device/touch-sensor`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ enabled }),
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            // 成功して初めて state を更新 (= 楽観更新しない、 失敗時に
+            // トグルが実機状態とズレないように)。
+            setTouchEnabled(enabled);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(false);
+        }
+    };
+
     return (
         <div style={panelStyles.section}>
             <div style={panelStyles.sectionLabel}>デバイス操作</div>
@@ -831,6 +994,36 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                 <span style={panelStyles.volumeValue}>
                     {volume ?? "…"}
                 </span>
+            </div>
+
+            <div style={panelStyles.row}>
+                <label
+                    style={{
+                        ...panelStyles.label,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        cursor: (touchEnabled === null || busy)
+                            ? "not-allowed" : "pointer",
+                    }}
+                >
+                    <input
+                        type="checkbox"
+                        checked={touchEnabled === true}
+                        onChange={(e) => commitTouch(e.target.checked)}
+                        disabled={touchEnabled === null || busy}
+                    />
+                    頭タッチセンサー
+                    <span style={panelStyles.subtle}>
+                        {touchEnabled === null
+                            ? "（状態取得中…）"
+                            : touchEnabled ? "（有効）" : "（無効）"}
+                    </span>
+                </label>
+            </div>
+            <div style={{ ...panelStyles.subtle, marginBottom: "6px" }}>
+                OFF にすると頭をなでても反応しなくなります（誤作動対策・
+                再起動後も保持されます）。
             </div>
 
             <div style={panelStyles.row}>
@@ -1357,6 +1550,33 @@ const panelStyles: Record<string, React.CSSProperties> = {
         fontWeight: 600,
         color: "var(--text-primary)",
         fontSize: "12px",
+    },
+    inlineCode: {
+        padding: "1px 4px",
+        background: "var(--bg-tertiary)",
+        color: "var(--text-primary)",
+        fontFamily: "monospace",
+        fontSize: "10px",
+        borderRadius: "2px",
+        wordBreak: "break-all",
+    },
+    capabilityBlock: {
+        marginTop: "6px",
+        paddingTop: "6px",
+        borderTop: "1px solid var(--border-color)",
+    },
+    capabilityRow: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "3px",
+        marginTop: "3px",
+    },
+    capabilityLabel: {
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        fontSize: "11px",
+        color: "var(--text-secondary)",
     },
     pairingResult: {
         marginTop: "8px",

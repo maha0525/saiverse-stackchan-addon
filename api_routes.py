@@ -1067,6 +1067,13 @@ class VesselSummary(BaseModel):
     paired_at: str
     last_seen_at: Optional[str]
     connected: bool
+    # マルチ機体 (v0.10): 機体管理 UI で per-vessel のポート・接続先 URL・
+    # capability を一望できるように一覧に含める。capabilities は
+    # {cap_key: bool} の dict (= env3 / servo8 / sonic 等、 搭載ユニット集合)。
+    ws_port: Optional[int]
+    capture_port: Optional[int]
+    capabilities: dict
+    gateway_ws_url: str
 
 
 def _get_existing_master_token(db) -> Optional[str]:
@@ -1140,13 +1147,15 @@ def _update_addon_config_after_pair(
 def pair_vessel(
     req: PairRequest, manager=Depends(get_manager),
 ) -> PairResponse:
-    """新規ペアリング発行 (Phase 2')。
+    """新規ペアリング発行 (Phase 2' / v0.10 マルチ機体)。
 
-    1. Phase 1' single vessel 前提: 既に vessel が登録されていれば 409 を返す
-    2. Building 存在確認 + PHYSICAL_VESSEL_ID 未割り当て確認
-    3. vessel_manager.create_pairing で vessel_id + device_token 発行
-    4. Building.PHYSICAL_VESSEL_ID + CAPACITY=1 (不変条件 2) 強制
-    5. AddonConfig.master_token / vessel_building_id 自動更新
+    1. Building 存在確認 + PHYSICAL_VESSEL_ID 未割り当て確認 (= 同じ Building
+       への二重ペアリングは 409)。 v0.10 で「既に別 vessel があれば 409」 の
+       single vessel ガードは撤廃 (= 複数機体を別 Building にペアリング可能)
+    2. vessel_manager.create_pairing で vessel_id + device_token 発行
+       (token は全機体共通・既存 master_token を再利用、 機体区別はポート)
+    3. Building.PHYSICAL_VESSEL_ID + CAPACITY=1 (不変条件 2) 強制
+    4. AddonConfig.master_token / vessel_building_id 自動更新
 
     device_token は平文で 1 回だけレスポンスに含まれる。DB には sha256 ハッシュ
     のみが保存されるため、紛失時は再ペアリングが必要。
@@ -1313,6 +1322,12 @@ def list_vessels() -> dict:
                 paired_at=r.paired_at,
                 last_seen_at=r.last_seen_at,
                 connected=r.vessel_id in connected_ids,
+                ws_port=r.ws_port,
+                capture_port=r.capture_port,
+                capabilities=r.capabilities or {},
+                # 各 device は自分の機体の per-vessel ポートに繋ぐので、
+                # 機体ごとに ws_port を反映した URL を組み立てる (intent K-3)。
+                gateway_ws_url=_build_gateway_ws_url(ws_port=r.ws_port),
             ).model_dump()
             for r in records
         ]
@@ -1356,6 +1371,64 @@ def delete_vessel(
         vessel_id, target.bound_building_id, deleted,
     )
     return {"deleted": deleted}
+
+
+# 機体管理 UI が手動設定する capability の既知キー (= 搭載ユニット集合)。
+# vessel_dispatch.list_building_ids_with_capability がこのキーで機体を絞り、
+# 対応するユニット由来ツール (env3 / servo8 / sonic) の可視性を決める
+# (intent K-5、 不変条件 #14)。Phase 8' の自動検出もこのキー集合に書く。
+_KNOWN_CAPABILITIES = ("env3", "servo8", "sonic")
+
+
+class SetCapabilitiesRequest(BaseModel):
+    """機体の capability 一括設定。
+
+    ``capabilities`` は ``{cap_key: bool}`` の dict。 既知キー
+    (env3 / servo8 / sonic) のみ受け付け、 値は bool に正規化する。 未知キーは
+    400 で弾く (= UI のタイポや古いクライアントの混入を防ぐ)。
+    """
+    capabilities: dict
+
+
+@router.post("/vessels/{vessel_id}/capabilities")
+def set_vessel_capabilities(
+    vessel_id: str, req: SetCapabilitiesRequest,
+) -> dict:
+    """機体の搭載ユニット (capability) を手動設定する (機体管理 UI から)。
+
+    ペルソナがその機体に降りているとき、 ユニット由来ツール (env3 / servo8 /
+    sonic) の可視性をこの値から決める (intent K-5)。 手動設定が基盤で、
+    Phase 8' の自動検出は後付けでこの値を埋める。
+    """
+    vm = get_vessel_manager()
+    if vm.get_vessel(vessel_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Vessel '{vessel_id}' not found",
+        )
+
+    unknown = set(req.capabilities) - set(_KNOWN_CAPABILITIES)
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown capability key(s): {sorted(unknown)} "
+                f"(allowed: {list(_KNOWN_CAPABILITIES)})"
+            ),
+        )
+
+    normalized = {k: bool(v) for k, v in req.capabilities.items()}
+    ok = vm.set_capabilities(vessel_id, normalized)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Vessel '{vessel_id}' not found (update failed)",
+        )
+    LOGGER.info(
+        "set_vessel_capabilities: vessel_id=%s capabilities=%s",
+        vessel_id, normalized,
+    )
+    return {"vessel_id": vessel_id, "capabilities": normalized}
 
 
 # ============================================================================

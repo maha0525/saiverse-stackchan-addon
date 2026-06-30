@@ -6,9 +6,11 @@ Stack-chan の Grove Port A に接続した ENV III Unit から温湿度・気�
 解釈は本ファイル内で行う。 ペルソナは「温度教えて」 「気圧教えて」 と呼ぶ
 だけで具体的な数値が返る。
 
-有効化フロー: AddonConfig の ``unit_env3_enabled`` を true にすると spell
-として公開される (= addon UI の toggle で ON/OFF)。 物理 Unit が無い時は
-無効化したままにすることで「効かない tool」 が LLM に出ないようにする。
+可視化フロー (v0.10 マルチ機体): 機体ごとの capability (vessels.db の
+``env3``、 機体管理 UI で手動設定) が True の機体に降りたペルソナにだけ
+spell として公開される (intent K-5、 不変条件 #14)。 物理 Unit が無い機体
+では capability を OFF にしておくことで「効かない tool」 が LLM に出ない。
+旧 addon 単一 ``unit_env3_enabled`` toggle は廃止。
 
 戻り値型: native tool は ``str`` を返す。 SEA runtime
 (``sea/runtime_llm.py:_run_spell_tool_async``) は ``str`` または
@@ -107,28 +109,23 @@ _DEFAULT_TIMEOUT_SEC = 10.0
 _qmp6988_ik_cache: Optional[Dict[str, int]] = None
 
 
-def _addon_params() -> Dict[str, Any]:
+def _unit_present() -> bool:
+    """現在ペルソナが降りている機体が ENV III を搭載しているか。
+
+    機体ごとの capability (vessels.db、 機体管理 UI で手動設定) を見る。 旧
+    addon 単一 ``unit_env3_enabled`` toggle を置換 (intent K-5、 不変条件 #14)。
+    ペルソナ context が無い / 機体が解決できない場合は False (= 安全側、
+    搭載なし扱い)。 スキーマ可視性 (``_build_schema``) と同じ capability を
+    参照するので、 可視な機体では True、 非搭載機体では False に揃う。
+    """
+    from vessel_dispatch import VesselNotAvailable, resolve_vessel
+
     try:
-        from saiverse.addon_config import get_params
-
-        return get_params(ADDON_NAME) or {}
-    except Exception:
-        LOGGER.exception("env3: failed to load AddonConfig params")
-        return {}
-
-
-def _vessel_building_id() -> Optional[str]:
-    vbid = _addon_params().get("vessel_building_id")
-    return str(vbid) if vbid else None
-
-
-def _unit_enabled() -> bool:
-    val = _addon_params().get("unit_env3_enabled", False)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.lower() in ("true", "1", "yes", "on")
-    return bool(val)
+        vessel = resolve_vessel()
+    except VesselNotAvailable:
+        return False
+    caps = vessel.capabilities or {}
+    return bool(caps.get("env3"))
 
 
 def _get_mcp_connection():
@@ -295,10 +292,11 @@ def get_env3_temperature_humidity() -> str:
     Returns:
         温度・湿度を整形した日本語文字列、 もしくはエラーメッセージ。
     """
-    if not _unit_enabled():
+    if not _unit_present():
         return (
-            "ENV III は無効化されています。 アドオン管理 UI で「ENV III "
-            "(温湿度・気圧) を有効化」 を ON にしてください。"
+            "この身体 (Stack-chan) には ENV III (温湿度・気圧センサー) が"
+            " 搭載されていません。 搭載機体なら機体管理 UI で「環境センサー"
+            " (ENV III)」 を ON にしてください。"
         )
 
     try:
@@ -635,10 +633,11 @@ def get_env3_air_pressure() -> str:
     Returns:
         気圧を整形した日本語文字列、 もしくはエラーメッセージ。
     """
-    if not _unit_enabled():
+    if not _unit_present():
         return (
-            "ENV III は無効化されています。 アドオン管理 UI で「ENV III "
-            "(温湿度・気圧) を有効化」 を ON にしてください。"
+            "この身体 (Stack-chan) には ENV III (温湿度・気圧センサー) が"
+            " 搭載されていません。 搭載機体なら機体管理 UI で「環境センサー"
+            " (ENV III)」 を ON にしてください。"
         )
 
     try:
@@ -700,10 +699,11 @@ def schemas() -> List[ToolSchema]:
     が ``schemas()`` を持てば優先で呼ぶ仕様で、 list で返したぶんだけ複数
     tool が登録される。 ``schema()`` ではなく ``schemas()`` を返す点に注意。
 
-    ``spell_visible`` は AddonConfig の ``unit_env3_enabled`` + 有効な
-    ``vessel_building_id`` が両方揃った時だけ True。 schemas() は spell
-    surface 構築のたびに呼ばれるので、 toggle 切り替え後の reconnect で
-    即時に visibility が反映される (= subprocess restart 不要)。
+    ``spell_visible`` / ``building_ids`` は env3 capability を持つ機体の
+    Vessel Building 集合から決まる (= ``list_building_ids_with_capability``)。
+    schemas() は spell surface 構築のたびに呼ばれるので、 機体管理 UI で
+    capability を切り替えた後の reconnect で即時に visibility が反映される
+    (= subprocess restart 不要)。
     """
     from vessel_dispatch import list_building_ids_with_capability
 

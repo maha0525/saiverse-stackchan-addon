@@ -37,9 +37,11 @@ stackchan-mcp の汎用 I2C tool (PR ②、 ``i2c_write``) を呼び、 レジ�
 乱れる (= twitch) としても挙動が目に見えるので実機デバッグが速い。 実機で
 twitch が観測されたらキャッシュ化 (= 初回のみ MODE 書き込み) に倒す。
 
-有効化フロー: AddonConfig の ``unit_servo8_enabled`` を true にすると spell
-として公開される (= addon UI の toggle で ON/OFF)。 物理 Unit が無い時は
-無効化したままにすることで「効かない tool」 が LLM に出ないようにする。
+可視化フロー (v0.10 マルチ機体): 機体ごとの capability (vessels.db の
+``servo8``、 機体管理 UI で手動設定) が True の機体に降りたペルソナにだけ
+spell として公開される (intent K-5、 不変条件 #14)。 物理 Unit が無い機体
+では capability を OFF にしておくことで「効かない tool」 が LLM に出ない。
+旧 addon 単一 ``unit_servo8_enabled`` toggle は廃止。
 
 戻り値型: native tool は ``str`` を返す (SEA runtime は str / (str, dict) の
 2 形式しか正規対応しない。 詳細: docs/issues/native_tool_return_4tuple_bug.md)。
@@ -100,28 +102,23 @@ SPEED_HALF_SPAN_US = 500
 _DEFAULT_TIMEOUT_SEC = 10.0
 
 
-def _addon_params() -> Dict[str, Any]:
+def _unit_present() -> bool:
+    """現在ペルソナが降りている機体が 8Servos Unit を搭載しているか。
+
+    機体ごとの capability (vessels.db の ``servo8``、 機体管理 UI で手動設定)
+    を見る。 旧 addon 単一 ``unit_servo8_enabled`` toggle を置換 (intent K-5、
+    不変条件 #14)。 ペルソナ context が無い / 機体が解決できない場合は False
+    (= 安全側、 搭載なし扱い)。 スキーマ可視性 (``_build_schema``) と同じ
+    capability を参照する。
+    """
+    from vessel_dispatch import VesselNotAvailable, resolve_vessel
+
     try:
-        from saiverse.addon_config import get_params
-
-        return get_params(ADDON_NAME) or {}
-    except Exception:
-        LOGGER.exception("servo8: failed to load AddonConfig params")
-        return {}
-
-
-def _vessel_building_id() -> Optional[str]:
-    vbid = _addon_params().get("vessel_building_id")
-    return str(vbid) if vbid else None
-
-
-def _unit_enabled() -> bool:
-    val = _addon_params().get("unit_servo8_enabled", False)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.lower() in ("true", "1", "yes", "on")
-    return bool(val)
+        vessel = resolve_vessel()
+    except VesselNotAvailable:
+        return False
+    caps = vessel.capabilities or {}
+    return bool(caps.get("servo8"))
 
 
 def _get_mcp_connection():
@@ -319,10 +316,11 @@ def servo8_set_angle(channel: int = 0, angle: int = 90) -> str:
     Returns:
         設定結果を表す客観的なテキスト。
     """
-    if not _unit_enabled():
+    if not _unit_present():
         return (
-            "8Servos Unit は無効化されています。 アドオン管理 UI で「8Servos "
-            "Unit (サーボドライバ) を有効化」 を ON にしてください。"
+            "この身体 (Stack-chan) には 8Servos Unit (サーボドライバ) が"
+            " 搭載されていません。 搭載機体なら機体管理 UI で「8 サーボユニット」"
+            " を ON にしてください。"
         )
 
     channel, err = _validate_channel(channel)
@@ -372,10 +370,11 @@ def servo8_set_speed(channel: int = 0, speed: int = 0) -> str:
     Returns:
         設定結果を表す客観的なテキスト。
     """
-    if not _unit_enabled():
+    if not _unit_present():
         return (
-            "8Servos Unit は無効化されています。 アドオン管理 UI で「8Servos "
-            "Unit (サーボドライバ) を有効化」 を ON にしてください。"
+            "この身体 (Stack-chan) には 8Servos Unit (サーボドライバ) が"
+            " 搭載されていません。 搭載機体なら機体管理 UI で「8 サーボユニット」"
+            " を ON にしてください。"
         )
 
     channel, err = _validate_channel(channel)
@@ -432,18 +431,18 @@ def _build_schema(name: str, description: str, display_name: str, parameters: Di
 def schemas() -> List[ToolSchema]:
     """1 ファイル複数 spell の登録 entry point (env3.py と同形、 ``schemas()`` 複数形)。
 
-    ``spell_visible`` は AddonConfig の ``unit_servo8_enabled`` + 有効な
-    ``vessel_building_id`` が両方揃った時だけ True。 schemas() は spell surface
-    構築のたびに呼ばれるので、 toggle 切り替え後の reconnect で即時に visibility
-    が反映される (= subprocess restart 不要)。
+    ``spell_visible`` / ``building_ids`` は servo8 capability を持つ機体の
+    Vessel Building 集合から決まる (= ``list_building_ids_with_capability``)。
+    schemas() は spell surface 構築のたびに呼ばれるので、 機体管理 UI で
+    capability を切り替えた後の reconnect で即時に visibility が反映される
+    (= subprocess restart 不要)。
     """
-    enabled = _unit_enabled()
-    vbid = _vessel_building_id()
-    if not enabled:
-        LOGGER.debug("servo8: unit_servo8_enabled is false; spells hidden from persona")
-    elif vbid is None:
-        LOGGER.warning(
-            "servo8: vessel_building_id not configured; spells will not be visible"
+    from vessel_dispatch import list_building_ids_with_capability
+
+    if not list_building_ids_with_capability("servo8"):
+        LOGGER.debug(
+            "servo8: no vessel declares servo8 capability; spells hidden until "
+            "set in 機体管理 UI"
         )
 
     return [

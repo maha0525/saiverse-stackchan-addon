@@ -7,26 +7,19 @@
 - **stackchan-mcp firmware** に Port A I2C 汎用 tool (`self.i2c.scan` / `read` / `write` / `write_read`) が実装されていること
   - upstream PR #195 (kPropertyTypeArray) + #196 (Port A bus + I2C tools) の merge 後、 もしくは fork `dev/integration` で先行利用
 - Stack-chan device がペアリング済み、 SAIVerse の MCP client が gateway subprocess を正常起動できる状態
-- AddonConfig の `vessel_building_id` が設定済み (= Vessel Building 限定 spell の前提)
+- 機体管理 UI でその機体に capability (= 搭載ユニット集合) を設定できる状態。 v0.10 マルチ機体では「Unit を有効化」 は addon 単一トグルではなく **機体ごとの capability** で持つ (= ENV III を積んだ機体にだけ ENV III spell が出る、 intent K-5 / 不変条件 #14)
 - Unit を Grove Port A に物理接続済み (PaHub 経由で複数同時 OK、 アドレス衝突に注意)
 
 ## 追加手順
 
-### Step 1. AddonConfig に enable toggle を追加
+### Step 1. capability key を登録する
 
-`addon.json` の `params_schema` に Unit ごとの toggle を追加します。
+Unit ごとに `cap_key` (例: `env3` / `servo8` / `sonic`) を決め、 2 箇所に登録します。 これで機体管理 UI に「搭載ユニット」 トグルが出て、 ON にした機体の Vessel Building でだけ spell が visible になります。
 
-```json
-{
-    "key": "unit_<name>_enabled",
-    "label": "<Display Name> を有効化",
-    "description": "Stack-chan の Port A に接続した <Unit 説明> を spell として公開します。 物理 Unit を接続していない場合は無効のままにしてください。",
-    "type": "toggle",
-    "default": false
-}
-```
+1. **`api_routes.py`** の `_KNOWN_CAPABILITIES` に `cap_key` を追加 (= 未知キーを 400 で弾く検証用)
+2. **`ui/Panel.tsx`** の `CAPABILITY_OPTIONS` に `{ key: "<cap_key>", label: "<表示名>" }` を追加 (= 機体管理 UI のトグル。 label は「何も知らない人が分かる」 表示名 = ユニット名 + 何のセンサーか)
 
-`type: "toggle"` で AddonManager UI に boolean ON/OFF switch が出ます。
+旧 `addon.json` の `unit_<name>_enabled` 単一トグルは廃止 (= 全機体一律 ON/OFF で、 機体ごとの差を表現できなかった)。 capability は per-vessel で `vessels.db` に保存され、 `POST /vessels/{id}/capabilities` で設定されます。
 
 ### Step 2. `tools/units/<unit>.py` を実装
 
@@ -36,13 +29,27 @@
 import asyncio
 import json
 import logging
+import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tools.core import ToolSchema
 
+# addon root (vessel_dispatch.py と同階層) を import 可能にする。 tool loader は
+# addon の tools/ しか sys.path に積まないため (units/ から 2 段上)。
+_ADDON_ROOT = str(Path(__file__).resolve().parents[2])
+if _ADDON_ROOT not in sys.path:
+    sys.path.insert(0, _ADDON_ROOT)
+
+from vessel_dispatch import resolve_vessel_connection  # noqa: E402
+
 ADDON_NAME = "saiverse-stackchan-addon"
 MCP_QUALIFIED_SERVER = f"{ADDON_NAME}__stackchan"
 LOGGER = logging.getLogger(__name__)
+
+# このユニットの capability key (= api_routes._KNOWN_CAPABILITIES /
+# ui/Panel.tsx CAPABILITY_OPTIONS と一致させる)。
+MY_UNIT_CAP_KEY = "<cap_key>"
 
 # --- Unit 固有定数 ---
 MY_UNIT_ADDR = 0x..               # I2C 7-bit address
@@ -51,35 +58,29 @@ MY_UNIT_MEASURE_WAIT_SEC = 0.020  # measurement 完了までの wait
 MY_UNIT_RESULT_BYTES = N
 
 
-def _addon_params() -> Dict[str, Any]:
-    from saiverse.addon_config import get_params
-    return get_params(ADDON_NAME) or {}
+def _unit_present() -> bool:
+    """現在ペルソナが降りている機体がこの Unit を搭載しているか。
 
+    機体ごとの capability (vessels.db、 機体管理 UI で手動設定) を見る。
+    ペルソナ context が無い / 機体が解決できない場合は False (= 安全側)。
+    スキーマ可視性 (_build_schema) と同じ capability を参照するので、 可視な
+    機体では True に揃う。
+    """
+    from vessel_dispatch import VesselNotAvailable, resolve_vessel
 
-def _unit_enabled() -> bool:
-    val = _addon_params().get("unit_<name>_enabled", False)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.lower() in ("true", "1", "yes", "on")
-    return bool(val)
-
-
-def _vessel_building_id() -> Optional[str]:
-    vbid = _addon_params().get("vessel_building_id")
-    return str(vbid) if vbid else None
+    try:
+        vessel = resolve_vessel()
+    except VesselNotAvailable:
+        return False
+    caps = vessel.capabilities or {}
+    return bool(caps.get(MY_UNIT_CAP_KEY))
 
 
 def _get_mcp_connection():
-    from tools.mcp_client import _make_instance_key, get_mcp_manager
-    manager = get_mcp_manager()
-    if manager is None:
-        raise RuntimeError("MCP manager is not initialized")
-    conn = manager._connections.get(
-        _make_instance_key(MCP_QUALIFIED_SERVER, persona_id=None)
-    )
-    if conn is None:
-        raise RuntimeError(f"MCP server '{MCP_QUALIFIED_SERVER}' is not connected.")
+    # 現在ペルソナが降りている機体の gateway インスタンスを解決する
+    # (vessel_dispatch、 intent K-4)。 複数機体では機体ごとに別 gateway なので、
+    # 「いまその身体が降りている機体」 へ i2c を向ける。
+    _vessel, conn = resolve_vessel_connection()
     return conn
 
 
@@ -112,10 +113,10 @@ async def _measure_my_unit():
 
 def get_my_unit_value() -> str:
     """Spell entry point。 戻り値は str (= 4-tuple NG)。"""
-    if not _unit_enabled():
+    if not _unit_present():
         return (
-            "<Display Name> は無効化されています。 アドオン管理 UI で"
-            " 「<Display Name> を有効化」 を ON にしてください。"
+            "この身体 (Stack-chan) には <Display Name> が搭載されていません。"
+            " 搭載機体なら機体管理 UI で「<表示名>」 を ON にしてください。"
         )
 
     try:
@@ -151,8 +152,12 @@ def get_my_unit_value() -> str:
 
 
 def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
-    vbid = _vessel_building_id()
-    enabled = _unit_enabled()
+    # この Unit の capability を持つ機体の Vessel Building でだけ visible に
+    # する (intent 不変条件 #14 ユニット側)。 capability は per-vessel
+    # (vessels.db、 機体管理 UI で手動設定)。
+    from vessel_dispatch import list_building_ids_with_capability
+
+    building_ids = list_building_ids_with_capability(MY_UNIT_CAP_KEY) or None
     return ToolSchema(
         name=name,
         description=description,
@@ -160,8 +165,8 @@ def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
         result_type="string",
         spell=True,
         spell_display_name=display_name,
-        spell_visible=bool(enabled and vbid),
-        building_ids=[vbid] if vbid else None,
+        spell_visible=bool(building_ids),
+        building_ids=building_ids,
     )
 
 
@@ -202,14 +207,14 @@ curl -s -X POST http://localhost:8000/api/mcp/tool-call \
 
 補正計算 (calibration register parse + Q-format 演算など) が要る Unit は、 取得した raw bytes を `temp/<unit>_inline_test.py` で Python inline 実行 → 値が reasonable か確認 → 同じロジックを `tools/units/<unit>.py` に移植、 の順で進めると compensation の bug を踏みません。 `env3.py` の QMP6988 実装 + `temp/qmp6988_inline_test.py` (検証時に作成) が参考例。
 
-### Step 4. 動作確認 (= SAIVerse 再起動 → toggle ON → ペルソナ)
+### Step 4. 動作確認 (= SAIVerse 再起動 → 機体に capability ON → ペルソナ)
 
 1. SAIVerse 再起動 → `tools/__init__.py:_autodiscover_tools()` が新 file を picked up
 2. backend.log で `Registered tool from .../<unit>.py (addon=saiverse-stackchan-addon)` が出ているか確認
-3. AddonManager UI で「<Display Name> を有効化」 toggle を ON
-   - toggle ON で AddonConfig が更新 + `tools/mcp_client.py:reconnect_server` で MCP subprocess が新 env で再起動
-   - native tool の `schemas()` は spell surface 構築のたびに呼ばれるので、 reconnect 後に即時 spell visibility が反映される
-4. Vessel Building にペルソナを配置、 spell の description に該当する話題を振る (= 「温度教えて」 等)
+3. 機体管理 UI (AddonManager の Stack-chan Vessel パネル) で、 対象機体の「搭載ユニット」 で `<表示名>` を ON
+   - `POST /vessels/{id}/capabilities` で per-vessel capability が `vessels.db` に保存される
+   - native tool の `schemas()` は spell surface 構築のたびに呼ばれるので、 capability 変更後の reconnect で即時に spell visibility が反映される (= subprocess restart 不要)
+4. その機体の Vessel Building にペルソナを配置、 spell の description に該当する話題を振る (= 「温度教えて」 等)
 5. spell 発動 → 想定値が返答に出るか確認。 失敗時は backend.log の `[sea][spell] Executed get_<unit>_<m> →` 行で実際の戻り値を確認
 
 ## Pitfalls (既知の落とし穴)
@@ -290,7 +295,7 @@ QMP6988 の calibration coefficients のように **device 再起動まで変化
 
 新 Unit driver 完成までの確認項目:
 
-- [ ] `addon.json` に `unit_<name>_enabled` toggle を追加
+- [ ] `cap_key` を `api_routes._KNOWN_CAPABILITIES` と `ui/Panel.tsx` の `CAPABILITY_OPTIONS` に登録
 - [ ] `tools/units/<unit>.py` を作成、 `schemas()` で spell list を return
 - [ ] 戻り値型は `str` (4-tuple は使わない)
 - [ ] エラー文を含めて全 text は丁寧語 + 客観表現
@@ -298,7 +303,7 @@ QMP6988 の calibration coefficients のように **device 再起動まで変化
 - [ ] curl 直叩きで chip ID / measurement の正常動作確認 (= 仮説検証)
 - [ ] (補正計算が要る Unit) Python inline で raw → 物理単位の換算が reasonable と確認
 - [ ] SAIVerse 再起動 → backend.log に `Registered tool from .../<unit>.py` が出る
-- [ ] AddonManager UI で `unit_<name>_enabled` を ON にして spell が persona に visible になる
+- [ ] 機体管理 UI で対象機体の「搭載ユニット」 `<表示名>` を ON にして spell が persona に visible になる
 - [ ] ペルソナ会話で spell 発動 + 想定値が返答に含まれる
 
 ## 参考実装
