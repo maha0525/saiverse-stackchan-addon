@@ -118,12 +118,33 @@ async def receive_device_audio(request: Request) -> dict:
     token = auth[len("Bearer "):].strip()
 
     vessel_manager = get_vessel_manager()
-    vessel = vessel_manager.verify_token(token)
-    if vessel is None:
-        LOGGER.warning("audio_input_relay: token not recognized (no vessel match)")
+    # 認証: token が登録済みのいずれかの vessel と一致するか確認する。token は
+    # 全機体共通の master_token で、機体の区別はポート + ?vessel= クエリで行う
+    # (intent K-7)。よって token は正規性チェックにのみ使い、vessel 特定には
+    # 使わない (複数機体で同一 token を送ると取り違えるため)。
+    if vessel_manager.verify_token(token) is None:
+        LOGGER.warning("audio_input_relay: token not recognized")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
+        )
+
+    # vessel 特定: gateway が audio-in URL に載せた ?vessel=<vessel_id> で
+    # どの機体からの音声かを引く (mcp_servers.json の STACKCHAN_AUDIO_HOOK_URL
+    # に ${instance.vessel_id})。?vessel= が無い旧 gateway は token 逆引きへ
+    # フォールバック (単一機体時代の後方互換)。
+    vessel_id_q = request.query_params.get("vessel")
+    if vessel_id_q:
+        vessel = vessel_manager.get_vessel(vessel_id_q)
+    else:
+        vessel = vessel_manager.verify_token(token)
+    if vessel is None:
+        LOGGER.warning(
+            "audio_input_relay: vessel not found (query=%s)", vessel_id_q
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unknown vessel",
         )
 
     # --- Body 検証 ---

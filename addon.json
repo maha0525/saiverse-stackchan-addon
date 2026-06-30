@@ -144,11 +144,19 @@
         },
         {
             "event": "persona_entered_building",
+            "handler": "vessel_gateways:on_persona_entered_building"
+        },
+        {
+            "event": "persona_entered_building",
             "handler": "avatar_loader:on_persona_entered_building"
         },
         {
             "event": "persona_exited_building",
             "handler": "avatar_loader:on_persona_exited_building"
+        },
+        {
+            "event": "persona_exited_building",
+            "handler": "vessel_gateways:on_persona_exited_building"
         }
     ]
 }

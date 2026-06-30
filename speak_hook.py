@@ -560,7 +560,14 @@ def on_persona_speak(
 
     params = _load_addon_params()
     pcm_token = str(params.get("pcm_token") or "")
-    capture_port = str(params.get("gateway_capture_port") or "8766")
+    # 複数機体 (intent K-7): vessel ごとに別ポートの gateway なので
+    # vessel.capture_port へ POST する。ポート未設定の旧データは単一
+    # gateway_capture_port にフォールバック。
+    capture_port = str(
+        vessel.capture_port
+        or params.get("gateway_capture_port")
+        or "8766"
+    )
     # gateway は SAIVerse プロセスと同じホストの subprocess なので 127.0.0.1
     # で到達できる。VISION_HOST (LAN IP) は device → gateway 用で、本 hook
     # の SAIVerse → gateway は loopback で十分。

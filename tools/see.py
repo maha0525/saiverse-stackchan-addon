@@ -17,11 +17,22 @@ import asyncio
 import json
 import logging
 import mimetypes
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from tools.core import ToolResult, ToolSchema
 from saiverse.media_utils import store_image_bytes
+
+# addon root (vessel_dispatch.py) を import 可能にする。詳細は move_head.py の
+# 同コメント参照。
+_ADDON_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ADDON_ROOT not in sys.path:
+    sys.path.insert(0, _ADDON_ROOT)
+from vessel_dispatch import (  # noqa: E402
+    list_vessel_building_ids,
+    resolve_vessel_connection,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,18 +58,7 @@ def _vessel_building_id() -> Optional[str]:
 
 async def _call_take_photo(question: str) -> str:
     """Call the raw ``take_photo`` MCP tool and return its rendered string."""
-    from tools.mcp_client import get_mcp_manager, _make_instance_key
-
-    manager = get_mcp_manager()
-    if manager is None:
-        raise RuntimeError("MCP manager is not initialized")
-    instance_key = _make_instance_key(MCP_QUALIFIED_SERVER, persona_id=None)
-    conn = manager._connections.get(instance_key)
-    if conn is None:
-        raise RuntimeError(
-            f"MCP server '{MCP_QUALIFIED_SERVER}' is not connected. "
-            "Make sure the stackchan-mcp gateway is running."
-        )
+    _vessel, conn = resolve_vessel_connection()
     return await conn.call_tool(MCP_TOOL_TAKE_PHOTO, {"question": question})
 
 
@@ -151,12 +151,12 @@ def see(
 
 
 def schema() -> ToolSchema:
-    vbid = _vessel_building_id()
-    building_ids = [vbid] if vbid else None
-    if vbid is None:
-        LOGGER.warning(
-            "see: vessel_building_id not configured; tool will be visible in all buildings. "
-            "Set 'vessel_building_id' in addon settings to restrict."
+    # 共通身体ツールは全 Vessel Building で visible (intent 不変条件 #14
+    # 共通ツール側)。機体未登録なら None = 非表示。
+    building_ids = list_vessel_building_ids() or None
+    if not building_ids:
+        LOGGER.info(
+            "see: no vessel registered yet; tool hidden until pairing."
         )
     return ToolSchema(
         name="see",

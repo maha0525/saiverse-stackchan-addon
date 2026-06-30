@@ -38,8 +38,13 @@ from tools.core import ToolSchema
 _ADDON_TOOLS_DIR = str(Path(__file__).resolve().parent.parent)
 if _ADDON_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _ADDON_TOOLS_DIR)
+# addon root (vessel_dispatch.py) も import 可能にする (units/ から 2 段上)。
+_ADDON_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _ADDON_ROOT not in sys.path:
+    sys.path.insert(0, _ADDON_ROOT)
 
 from hubs.pahub import PaHub, get_pahub_from_params  # noqa: E402
+from vessel_dispatch import resolve_vessel_connection  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -127,18 +132,10 @@ def _unit_enabled() -> bool:
 
 
 def _get_mcp_connection():
-    from tools.mcp_client import _make_instance_key, get_mcp_manager
-
-    manager = get_mcp_manager()
-    if manager is None:
-        raise RuntimeError("MCP manager is not initialized")
-    instance_key = _make_instance_key(MCP_QUALIFIED_SERVER, persona_id=None)
-    conn = manager._connections.get(instance_key)
-    if conn is None:
-        raise RuntimeError(
-            f"MCP server '{MCP_QUALIFIED_SERVER}' is not connected. "
-            "Make sure the stackchan-mcp gateway is running and paired."
-        )
+    # 現在ペルソナが降りている機体の gateway インスタンスを解決する
+    # (vessel_dispatch、 intent K-4)。複数機体の同時稼働では機体ごとに別
+    # gateway なので、 ここで「いまその身体が降りている機体」へ i2c を向ける。
+    _vessel, conn = resolve_vessel_connection()
     return conn
 
 
@@ -677,10 +674,13 @@ def get_env3_air_pressure() -> str:
 # ============================================================
 
 def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
-    vbid = _vessel_building_id()
-    enabled = _unit_enabled()
-    visible = bool(enabled and vbid)
-    building_ids = [vbid] if vbid else None
+    # 複数機体 (intent 不変条件 #14 ユニット側): env3 を積んだ機体の Vessel
+    # Building でだけ visible にする。capability は vessels.db の per-vessel 値
+    # (機体管理 UI で手動設定)。単一 unit_env3_enabled toggle をやめる。
+    from vessel_dispatch import list_building_ids_with_capability
+
+    building_ids = list_building_ids_with_capability("env3") or None
+    visible = bool(building_ids)
     return ToolSchema(
         name=name,
         description=description,
@@ -705,15 +705,12 @@ def schemas() -> List[ToolSchema]:
     surface 構築のたびに呼ばれるので、 toggle 切り替え後の reconnect で
     即時に visibility が反映される (= subprocess restart 不要)。
     """
-    enabled = _unit_enabled()
-    vbid = _vessel_building_id()
-    if not enabled:
+    from vessel_dispatch import list_building_ids_with_capability
+
+    if not list_building_ids_with_capability("env3"):
         LOGGER.debug(
-            "env3: unit_env3_enabled is false; spells hidden from persona"
-        )
-    elif vbid is None:
-        LOGGER.warning(
-            "env3: vessel_building_id not configured; spells will not be visible"
+            "env3: no vessel declares env3 capability; spells hidden until set "
+            "in 機体管理 UI"
         )
 
     return [

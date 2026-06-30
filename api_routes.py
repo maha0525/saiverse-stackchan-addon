@@ -953,6 +953,49 @@ def clear_device_leds() -> dict:
     return {"ok": True}
 
 
+class SetTouchSensorRequest(BaseModel):
+    """head-touch センサー有効/無効。
+
+    stackchan-mcp の `set_touch_sensor_enabled` schema (= boolean `enabled`)
+    と一致 (= firmware #314 / stackchan.cc)。
+    """
+    enabled: bool
+
+
+@router.get("/device/touch-sensor")
+def get_device_touch_sensor() -> dict:
+    """ｽﾀｯｸﾁｬﾝ head-touch センサーの有効状態 (NVS 永続) を取得。
+
+    Panel.tsx のマウント時に 1 回呼んでトグルの初期値に使う。 firmware は
+    `{"enabled": bool}` を返す (= stackchan.cc get_touch_sensor_enabled)。
+    非 JSON 等で `enabled` が読めない場合は null + raw を載せて返し、 UI 側で
+    取得失敗を表示できるようにする (= get_device_status と同方針)。
+    """
+    raw = _call_device_mcp_tool("get_touch_sensor_enabled", {})
+    parsed = _parse_mcp_text_as_dict(raw)
+    return {
+        "enabled": bool(parsed.get("enabled")) if "enabled" in parsed else None,
+        "raw": parsed,
+    }
+
+
+@router.post("/device/touch-sensor")
+def set_device_touch_sensor(req: SetTouchSensorRequest) -> dict:
+    """ｽﾀｯｸﾁｬﾝ head-touch センサーの有効/無効を切替 (NVS 永続)。
+
+    無効化すると firmware 側の HandleTap / HandleStroke が即座にローカル
+    モーション応答と stackchan/event 送出の両方をスキップする (= 誤作動
+    対策のユーザー設定、 reboot 後も保持)。 ペルソナの spell 経路とは別で、
+    ユーザーが Addon Panel から直接叩く管理操作。
+    """
+    raw = _call_device_mcp_tool(
+        "set_touch_sensor_enabled", {"enabled": req.enabled},
+    )
+    parsed = _parse_mcp_text_as_dict(raw)
+    LOGGER.info("device: set_touch_sensor_enabled %s", req.enabled)
+    return {"ok": True, "enabled": req.enabled, "raw": parsed}
+
+
 _bootstrap_executors()
 
 
@@ -994,18 +1037,23 @@ class PairResponse(BaseModel):
     gateway_ws_url: str  # ws://<vision_host>:<gateway_ws_port>/ (= AddonConfig 経由)
 
 
-def _build_gateway_ws_url() -> str:
+def _build_gateway_ws_url(ws_port: Optional[int] = None) -> str:
     """device の AP モード設定 UI で入力する Gateway URL を組み立てる。
 
-    AddonConfig から ``vision_host`` (= LAN IP) と ``gateway_ws_port``
-    (= WS 待受 port) を読んで合成する。 未設定なら placeholder 文字列を
-    返して UI に「ここを埋めてね」 と気づかせる。
+    AddonConfig から ``vision_host`` (= LAN IP) を読み、 port は引数の
+    ``ws_port`` (= その機体に割り当てた per-vessel ポート、 intent K-3) を
+    優先する。 未指定なら単一 ``gateway_ws_port`` にフォールバック。 複数機体
+    では各 device が自分の機体のポートに繋ぐので、 ペアリングした vessel の
+    ws_port を渡すこと。
     """
     from saiverse.addon_config import get_params
 
     params = get_params(_ADDON_NAME_FOR_CONFIG)
     host = (params.get("vision_host") or "").strip() or "<vision_host 未設定>"
-    port = (params.get("gateway_ws_port") or "").strip() or "8765"
+    if ws_port is not None:
+        port = str(ws_port)
+    else:
+        port = (params.get("gateway_ws_port") or "").strip() or "8765"
     return f"ws://{host}:{port}/"
 
 
@@ -1019,6 +1067,28 @@ class VesselSummary(BaseModel):
     paired_at: str
     last_seen_at: Optional[str]
     connected: bool
+
+
+def _get_existing_master_token(db) -> Optional[str]:
+    """AddonConfig に保存済みの master_token を返す (無ければ None)。
+
+    複数機体ペアリングで全機体に共通トークンを使うため、 2 台目以降は 1 台目で
+    確定した master_token を再利用する (token 共通・機体区別はポート、 intent
+    K-7)。
+    """
+    from database.models import AddonConfig
+
+    row = db.query(AddonConfig).filter_by(
+        addon_name=_ADDON_NAME_FOR_CONFIG,
+    ).first()
+    if row is None or not row.params_json:
+        return None
+    try:
+        params = json.loads(row.params_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    token = params.get("master_token")
+    return str(token) if token else None
 
 
 def _update_addon_config_after_pair(
@@ -1085,18 +1155,6 @@ def pair_vessel(
 
     vm = get_vessel_manager()
 
-    # Phase 1' single vessel 前提
-    existing = vm.list_vessels()
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Already paired with vessel '{existing[0].vessel_id}'. "
-                "Phase 1' は single vessel 前提、 先に DELETE /vessels/<id> で "
-                "既存ペアリングを解除してから再実行してください。"
-            ),
-        )
-
     db = manager.SessionLocal()
     try:
         building = db.query(Building).filter_by(
@@ -1116,10 +1174,17 @@ def pair_vessel(
                 ),
             )
 
+        # token は全機体共通 (機体区別はポート、 intent K-7)。既存の master_token
+        # があれば共通トークンとして再利用、 無ければ create_pairing が新規生成
+        # する (1 台目)。2 台目以降は同じトークンを各 device の captive portal に
+        # 入力すればよい。
+        existing_master = _get_existing_master_token(db)
+
         vessel_id, device_token = vm.create_pairing(
             building_id=req.building_id,
             persona_id=req.persona_id,
             hardware_model=req.hardware_model,
+            device_token=existing_master or None,
         )
 
         # 不変条件 2: Vessel Building は capacity=1 強制
@@ -1147,16 +1212,18 @@ def pair_vessel(
     # 再起動が必須 (= さもなければ device は新 token で接続するが gateway
     # は古い token で 401 reject の連発になる)。
     #
-    # tools.mcp_client.reconnect_mcp_server は内部で _server_meta の
-    # raw_config を re-resolve してから disconnect → connect する (= 改修
-    # 済み、 docs/intent/stackchan_vessel.md Phase 2' 改修参照)。
-    _reconnect_stackchan_mcp_or_log()
-
+    # instance_template では global gateway を起動しない。各機体の gateway は
+    # ペルソナの Vessel Building 入室時に vessel_gateways フックが
+    # register_instance で起動する (intent K-2)。よってペアリング直後の
+    # global reconnect は不要 (= 旧 single-gateway 時代の経路)。
+    paired_vessel = vm.get_vessel(vessel_id)
     return PairResponse(
         vessel_id=vessel_id,
         device_token=device_token,
         building_id=req.building_id,
-        gateway_ws_url=_build_gateway_ws_url(),
+        gateway_ws_url=_build_gateway_ws_url(
+            ws_port=paired_vessel.ws_port if paired_vessel else None
+        ),
     )
 
 

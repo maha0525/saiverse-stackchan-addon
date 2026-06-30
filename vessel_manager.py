@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import sqlite3
@@ -35,13 +36,26 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from saiverse.addon_paths import get_addon_data_dir
 
 LOGGER = logging.getLogger(__name__)
 
 ADDON_NAME = "saiverse-stackchan-addon"
+
+# ペアリング時のポート割当の起点。device は NVS の固定 URL (ws://<ip>:<port>)
+# に繋ぐので、ポートは機体ごとに確定して vessels.db に永続する (intent K-3)。
+# 1 機体あたり ws_port / capture_port の連続ペアを 1 つ消費する。
+_BASE_WS_PORT = 8765
+
+# list/get 系が共有する SELECT 列順 (= ``_row_to_record`` の row index と
+# 1:1 対応)。token salt/hash は含めない。
+_RECORD_COLUMNS = (
+    "vessel_id, bound_building_id, bound_persona_id, hardware_model, "
+    "firmware_version, paired_at, last_seen_at, ws_port, capture_port, "
+    "capabilities"
+)
 
 
 def _utcnow_iso() -> str:
@@ -62,6 +76,9 @@ class VesselRecord:
     firmware_version: Optional[str]
     paired_at: str
     last_seen_at: Optional[str]
+    ws_port: Optional[int] = None
+    capture_port: Optional[int] = None
+    capabilities: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -122,7 +139,10 @@ class VesselManager:
                     hardware_model TEXT NOT NULL DEFAULT 'unknown',
                     firmware_version TEXT,
                     paired_at TEXT NOT NULL,
-                    last_seen_at TEXT
+                    last_seen_at TEXT,
+                    ws_port INTEGER,
+                    capture_port INTEGER,
+                    capabilities TEXT
                 )
                 """
             )
@@ -148,6 +168,20 @@ class VesselManager:
                     "VesselManager: migrated schema - renamed building_id to "
                     "bound_building_id"
                 )
+            # v0.10 マルチ機体: per-vessel のポート (ペアリング時確定・永続) と
+            # capability (搭載ユニット集合) カラムを追加 (intent K-3 / K-5)。
+            for col, ddl in (
+                ("ws_port", "ALTER TABLE vessels ADD COLUMN ws_port INTEGER"),
+                ("capture_port",
+                 "ALTER TABLE vessels ADD COLUMN capture_port INTEGER"),
+                ("capabilities",
+                 "ALTER TABLE vessels ADD COLUMN capabilities TEXT"),
+            ):
+                if col not in cols:
+                    conn.execute(ddl)
+                    LOGGER.info(
+                        "VesselManager: migrated schema - added %s column", col
+                    )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_vessels_token_hash "
                 "ON vessels(device_token_hash)"
@@ -161,6 +195,7 @@ class VesselManager:
         building_id: str,
         persona_id: Optional[str] = None,
         hardware_model: str = "stackchan_kickstarter_2025",
+        device_token: Optional[str] = None,
     ) -> tuple[str, str]:
         """新規ペアリングを発行する。
 
@@ -185,31 +220,39 @@ class VesselManager:
             ``(vessel_id, device_token)`` のタプル。
         """
         vessel_id = str(uuid.uuid4())
-        device_token = secrets.token_urlsafe(32)
+        # device_token 未指定なら新規生成 (1 台目)。複数機体では呼び出し側が
+        # 既存の共通 master_token を渡し、 全機体で同一トークンを使う
+        # (token 共通・機体区別はポート、 intent K-7)。
+        if device_token is None:
+            device_token = secrets.token_urlsafe(32)
         salt = secrets.token_hex(16)
         token_hash = self._hash_token(salt, device_token)
         paired_at = _utcnow_iso()
 
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            ws_port, capture_port = self._allocate_ports(conn)
             conn.execute(
                 """
                 INSERT INTO vessels (
                     vessel_id, device_token_salt, device_token_hash,
                     bound_building_id, bound_persona_id, hardware_model,
-                    firmware_version, paired_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+                    firmware_version, paired_at, last_seen_at,
+                    ws_port, capture_port, capabilities
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)
                 """,
                 (
                     vessel_id, salt, token_hash, building_id, persona_id,
                     hardware_model, paired_at,
+                    ws_port, capture_port, json.dumps({}),
                 ),
             )
             conn.commit()
 
         LOGGER.info(
             "VesselManager: pairing created vessel_id=%s building_id=%s "
-            "persona_id=%s model=%s",
+            "persona_id=%s model=%s ws_port=%d capture_port=%d",
             vessel_id, building_id, persona_id, hardware_model,
+            ws_port, capture_port,
         )
         return vessel_id, device_token
 
@@ -229,25 +272,19 @@ class VesselManager:
                 """
                 SELECT vessel_id, device_token_salt, device_token_hash,
                        bound_building_id, bound_persona_id, hardware_model,
-                       firmware_version, paired_at, last_seen_at
+                       firmware_version, paired_at, last_seen_at,
+                       ws_port, capture_port, capabilities
                 FROM vessels
                 """
             ).fetchall()
 
         for row in rows:
-            v_id, salt, expected_hash, building_id, persona_id, hw_model, \
-                fw_version, paired_at, last_seen = row
+            salt = row[1]
+            expected_hash = row[2]
             actual_hash = self._hash_token(salt, token)
             if hmac.compare_digest(actual_hash, expected_hash):
-                return VesselRecord(
-                    vessel_id=v_id,
-                    bound_building_id=building_id,
-                    bound_persona_id=persona_id,
-                    hardware_model=hw_model,
-                    firmware_version=fw_version,
-                    paired_at=paired_at,
-                    last_seen_at=last_seen,
-                )
+                # salt/hash (index 1,2) を除いた _RECORD_COLUMNS 順の tuple
+                return self._row_to_record((row[0],) + tuple(row[3:]))
 
         LOGGER.debug("VesselManager: verify_token no match")
         return None
@@ -258,6 +295,41 @@ class VesselManager:
             cur = conn.execute(
                 "UPDATE vessels SET bound_persona_id = ? WHERE vessel_id = ?",
                 (persona_id, vessel_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_capabilities(
+        self, vessel_id: str, capabilities: Dict[str, Any]
+    ) -> bool:
+        """機体の capability (搭載ユニット集合・ハブ構成等) を保存する。
+
+        手動設定が基盤 (機体管理 UI から)。 自動検出 (Phase 8') もここに
+        書き込む。 ペルソナがその機体に降りているとき、 ユニット由来ツールの
+        可視性をこの値から決める (intent K-5、 不変条件 #14)。
+        """
+        payload = json.dumps(capabilities, ensure_ascii=False)
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "UPDATE vessels SET capabilities = ? WHERE vessel_id = ?",
+                (payload, vessel_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_ports(
+        self, vessel_id: str, ws_port: int, capture_port: int
+    ) -> bool:
+        """ws_port / capture_port を明示的に設定する (再ペアリング・手動変更用)。
+
+        通常はペアリング時に ``create_pairing`` が自動割当するので呼ぶ必要は
+        ない。 device 側 NVS の URL と一致させる責務は呼び出し側にある。
+        """
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "UPDATE vessels SET ws_port = ?, capture_port = ? "
+                "WHERE vessel_id = ?",
+                (ws_port, capture_port, vessel_id),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -288,48 +360,36 @@ class VesselManager:
         """登録済み vessel 一覧。token / hash は含めない。"""
         with self._lock, sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(
-                """
-                SELECT vessel_id, bound_building_id, bound_persona_id,
-                       hardware_model, firmware_version, paired_at, last_seen_at
-                FROM vessels ORDER BY paired_at ASC
-                """
+                f"SELECT {_RECORD_COLUMNS} FROM vessels ORDER BY paired_at ASC"
             ).fetchall()
 
-        return [
-            VesselRecord(
-                vessel_id=r[0],
-                bound_building_id=r[1],
-                bound_persona_id=r[2],
-                hardware_model=r[3],
-                firmware_version=r[4],
-                paired_at=r[5],
-                last_seen_at=r[6],
-            )
-            for r in rows
-        ]
+        return [self._row_to_record(r) for r in rows]
 
     def get_vessel(self, vessel_id: str) -> Optional[VesselRecord]:
         """単一 vessel の取得。"""
         with self._lock, sqlite3.connect(self._db_path) as conn:
             row = conn.execute(
-                """
-                SELECT vessel_id, bound_building_id, bound_persona_id,
-                       hardware_model, firmware_version, paired_at, last_seen_at
-                FROM vessels WHERE vessel_id = ?
-                """,
+                f"SELECT {_RECORD_COLUMNS} FROM vessels WHERE vessel_id = ?",
                 (vessel_id,),
             ).fetchone()
         if row is None:
             return None
-        return VesselRecord(
-            vessel_id=row[0],
-            bound_building_id=row[1],
-            bound_persona_id=row[2],
-            hardware_model=row[3],
-            firmware_version=row[4],
-            paired_at=row[5],
-            last_seen_at=row[6],
-        )
+        return self._row_to_record(row)
+
+    def get_vessel_by_building(self, building_id: str) -> Optional[VesselRecord]:
+        """building_id に紐付く vessel を返す (Vessel Building は capacity=1 なので
+        1 機体)。 入退室フック (vessel_gateways) や avatar_loader が、 引数の
+        building_id から機体を引くのに使う (= persona context に依らない)。
+        """
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT {_RECORD_COLUMNS} FROM vessels "
+                "WHERE bound_building_id = ? ORDER BY paired_at ASC LIMIT 1",
+                (building_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_record(row)
 
     def get_vessel_for_persona(
         self, persona_id: str, building_id: str
@@ -352,40 +412,21 @@ class VesselManager:
         with self._lock, sqlite3.connect(self._db_path) as conn:
             # 1. persona 専用バインドを優先
             row = conn.execute(
-                """
-                SELECT vessel_id, bound_building_id, bound_persona_id,
-                       hardware_model, firmware_version, paired_at, last_seen_at
-                FROM vessels
-                WHERE bound_persona_id = ? AND bound_building_id = ?
-                LIMIT 1
-                """,
+                f"SELECT {_RECORD_COLUMNS} FROM vessels "
+                "WHERE bound_persona_id = ? AND bound_building_id = ? LIMIT 1",
                 (persona_id, building_id),
             ).fetchone()
             # 2. persona 未指定 (NULL) でフォールバック
             if row is None:
                 row = conn.execute(
-                    """
-                    SELECT vessel_id, bound_building_id, bound_persona_id,
-                           hardware_model, firmware_version, paired_at,
-                           last_seen_at
-                    FROM vessels
-                    WHERE bound_persona_id IS NULL
-                          AND bound_building_id = ?
-                    LIMIT 1
-                    """,
+                    f"SELECT {_RECORD_COLUMNS} FROM vessels "
+                    "WHERE bound_persona_id IS NULL AND bound_building_id = ? "
+                    "LIMIT 1",
                     (building_id,),
                 ).fetchone()
         if row is None:
             return None
-        return VesselRecord(
-            vessel_id=row[0],
-            bound_building_id=row[1],
-            bound_persona_id=row[2],
-            hardware_model=row[3],
-            firmware_version=row[4],
-            paired_at=row[5],
-            last_seen_at=row[6],
-        )
+        return self._row_to_record(row)
 
     def delete_vessel(self, vessel_id: str) -> bool:
         """ペアリング解除。
@@ -447,6 +488,57 @@ class VesselManager:
             return list(self._sessions.values())
 
     # ----- Helpers -----
+
+    @staticmethod
+    def _row_to_record(row) -> VesselRecord:
+        """``_RECORD_COLUMNS`` 順の row tuple を VesselRecord に変換する。"""
+        caps: Optional[Dict[str, Any]] = None
+        raw_caps = row[9]
+        if raw_caps:
+            try:
+                parsed = json.loads(raw_caps)
+                if isinstance(parsed, dict):
+                    caps = parsed
+            except (json.JSONDecodeError, TypeError):
+                LOGGER.warning(
+                    "VesselManager: capabilities JSON 解釈失敗 vessel_id=%s",
+                    row[0],
+                )
+        return VesselRecord(
+            vessel_id=row[0],
+            bound_building_id=row[1],
+            bound_persona_id=row[2],
+            hardware_model=row[3],
+            firmware_version=row[4],
+            paired_at=row[5],
+            last_seen_at=row[6],
+            ws_port=row[7],
+            capture_port=row[8],
+            capabilities=caps,
+        )
+
+    def _allocate_ports(self, conn: sqlite3.Connection) -> tuple[int, int]:
+        """既存 vessel と衝突しない ws_port / capture_port の連続ペアを返す。
+
+        ``_BASE_WS_PORT`` から 2 ずつ進め、 vessels.db 内で未使用の連続ペアを
+        探す。 OS レベルの空き確認はここではしない (= 起動時に gateway が
+        bind 失敗したら別途対処)。 呼び出し側のトランザクション (conn) 内で
+        使う前提。 device は NVS の固定 URL に繋ぐため、 一度確定した値は
+        その機体に永続する (intent K-3)。
+        """
+        used: set[int] = set()
+        for ws, cap in conn.execute(
+            "SELECT ws_port, capture_port FROM vessels "
+            "WHERE ws_port IS NOT NULL OR capture_port IS NOT NULL"
+        ).fetchall():
+            if ws is not None:
+                used.add(int(ws))
+            if cap is not None:
+                used.add(int(cap))
+        ws_port = _BASE_WS_PORT
+        while ws_port in used or (ws_port + 1) in used:
+            ws_port += 2
+        return ws_port, ws_port + 1
 
     @staticmethod
     def _hash_token(salt: str, token: str) -> str:

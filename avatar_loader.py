@@ -61,12 +61,18 @@ MCP_TOOL_SET_AVATAR = "set_avatar"
 # tool_map 参照、 set_avatar が ``self.display.set_avatar`` に 対応する
 # のと同じパターン)。
 MCP_TOOL_GET_DEVICE_STATUS = "get_device_info"
+# まばたきはペルソナが操作する要素ではなく、 SAIVerse が device に
+# つながっている間は常時 ON にしておきたい (= スペル非公開)。 入室時の
+# 状態リセット直後に明示 enable する。 gateway の bare 名は ``set_blink``。
+MCP_TOOL_SET_BLINK = "set_blink"
 
 # load_avatar_set 全体のタイムアウト (HTTP 転送 + ESP32 PSRAM 書き込みを
 # 含む)。 MCP tool 側のデフォルトは 60 s、 こちらは余裕を見て 90 s。
 _LOAD_TIMEOUT_SEC = 90.0
 # set_avatar(idle/off) は 1 回の WS frame 往復だけなので短めで OK。
 _SET_AVATAR_TIMEOUT_SEC = 10.0
+# set_blink も 1 回の WS frame 往復だけ。
+_SET_BLINK_TIMEOUT_SEC = 10.0
 # get_device_status は 1 回の WS frame 往復だけ、 入室経路に乗せるので
 # レイテンシを抑えたい。
 _GET_STATUS_TIMEOUT_SEC = 5.0
@@ -269,61 +275,77 @@ def _get_active_set_name(persona_id: str) -> str:
     return DEFAULT_SET_NAME
 
 
-async def _get_stackchan_conn():
-    """本体 MCP client から stackchan gateway 接続を引く。"""
-    from tools.mcp_client import get_mcp_manager, _make_instance_key
+async def _get_stackchan_conn(building_id: Optional[str] = None):
+    """機体 gateway 接続を引く (intent 設計 K, Phase C 複数機体対応)。
 
-    manager = get_mcp_manager()
-    if manager is None:
-        raise RuntimeError("MCP manager is not initialized")
-    instance_key = _make_instance_key(MCP_QUALIFIED_SERVER, persona_id=None)
-    conn = manager._connections.get(instance_key)
-    if conn is None:
-        raise RuntimeError(
-            f"MCP server '{MCP_QUALIFIED_SERVER}' is not connected"
-        )
+    ``building_id`` 指定時はその Vessel Building の機体を解決する (背景スレッド
+    = entered/exited フック・reconcile ループ用、 persona context に依らない)。
+    未指定時は現在ペルソナが降りている機体を context から解決する。機体未解決・
+    gateway 未接続なら ``VesselNotAvailable`` を投げ、 avatar 系はそれを WARNING
+    で飲み込む (= 該当機体が居ない時は表情同期をスキップ)。
+    """
+    from vessel_dispatch import (
+        resolve_vessel_connection,
+        resolve_vessel_connection_for_building,
+    )
+
+    if building_id is not None:
+        _vessel, conn = resolve_vessel_connection_for_building(building_id)
+    else:
+        _vessel, conn = resolve_vessel_connection()
     return conn
 
 
-async def _call_load_avatar_set(archive_path: str, mode: str) -> str:
+async def _call_load_avatar_set(
+    archive_path: str, mode: str, building_id: Optional[str] = None
+) -> str:
     """gateway の ``load_avatar_set`` MCP tool を呼ぶ (MCP loop 上で実行)。"""
-    conn = await _get_stackchan_conn()
+    conn = await _get_stackchan_conn(building_id)
     return await conn.call_tool(
         MCP_TOOL_LOAD_SET,
         {"archive_path": archive_path, "mode": mode},
     )
 
 
-async def _call_set_avatar(face: str) -> str:
+async def _call_set_avatar(face: str, building_id: Optional[str] = None) -> str:
     """gateway の ``set_avatar`` MCP tool を呼ぶ (gateway 側 expose 名)。
 
     face: ``idle``/``happy``/``thinking``/``sad``/``surprised``/
     ``embarrassed`` のいずれか、 もしくは ``off`` (= レイヤを隠す)。
     """
-    conn = await _get_stackchan_conn()
+    conn = await _get_stackchan_conn(building_id)
     return await conn.call_tool(MCP_TOOL_SET_AVATAR, {"face": face})
 
 
-async def _call_get_device_status() -> str:
+async def _call_set_blink(
+    enabled: bool, building_id: Optional[str] = None
+) -> str:
+    """gateway の ``set_blink`` MCP tool を呼ぶ。"""
+    conn = await _get_stackchan_conn(building_id)
+    return await conn.call_tool(MCP_TOOL_SET_BLINK, {"enabled": enabled})
+
+
+async def _call_get_device_status(building_id: Optional[str] = None) -> str:
     """gateway の ``get_device_status`` MCP tool を呼ぶ。
 
     新 firmware は JSON に ``boot_session_id`` フィールドを含める。 これを
     SAIVerse 側で記録 / 比較して device reboot を検知する。
     """
-    conn = await _get_stackchan_conn()
+    conn = await _get_stackchan_conn(building_id)
     return await conn.call_tool(MCP_TOOL_GET_DEVICE_STATUS, {})
 
 
-def _fetch_device_session_id() -> Optional[str]:
+def _fetch_device_session_id(building_id: Optional[str] = None) -> Optional[str]:
     """device の現在の ``boot_session_id`` を取得する。 取れなかったら ``None``。
 
-    保守的な失敗扱い: タイムアウト / MCP エラー / 古い firmware (= フィールド
-    なし) / JSON parse 失敗 のいずれも ``None`` 扱い。 呼び出し元は ``None``
-    を受け取った場合は cache を invalidate しない (= 古い firmware との
-    互換維持)。
+    ``building_id`` 指定でその機体の gateway へ問い合わせる (複数機体、 背景
+    スレッド用)。 保守的な失敗扱い: タイムアウト / MCP エラー / 古い firmware
+    (= フィールドなし) / JSON parse 失敗 / 機体未接続 のいずれも ``None`` 扱い。
+    呼び出し元は ``None`` の時 cache を invalidate しない (= 互換維持)。
     """
     result = _run_async_on_mcp_loop(
-        _call_get_device_status(), timeout_sec=_GET_STATUS_TIMEOUT_SEC,
+        _call_get_device_status(building_id),
+        timeout_sec=_GET_STATUS_TIMEOUT_SEC,
     )
     if not result:
         LOGGER.debug("_fetch_device_session_id: result is empty/None")
@@ -396,11 +418,12 @@ def on_persona_entered_building(
     エラーは全部 WARNING にして飲み込む — ペルソナ移動自体は成功して
     いる以上、 avatar の都合で例外を伝播させて移動経路を壊さない。
     """
-    vessel_bid = _vessel_building_id()
-    if not vessel_bid:
-        return
-    if building_id != vessel_bid:
-        return
+    # 複数機体 (intent K, Phase C): この building が Vessel Building か
+    # (= 機体が紐付いているか) で判定。単一 vessel_building_id 固定をやめる。
+    from vessel_manager import get_vessel_manager
+
+    if get_vessel_manager().get_vessel_by_building(building_id) is None:
+        return  # Vessel Building でない / 未ペアリング
 
     # in-vessel 記録 (= ⑤ finalize 時の自動転送判定用、 まはー検証 2026-05-17)。
     loader = get_avatar_loader()
@@ -412,7 +435,7 @@ def on_persona_entered_building(
     # しない) なので、 cache を全クリアして強制再 transfer に倒す。
     # `None` (= 古い firmware で boot_session_id を返さない / 通信エラー)
     # は保守的に無視 (= 既存挙動を維持)。
-    current_session_id = _fetch_device_session_id()
+    current_session_id = _fetch_device_session_id(building_id)
     loader.reconcile_session(current_session_id)
 
     # 1. avatar セットを load (= 配置されてれば)。
@@ -450,7 +473,7 @@ def on_persona_entered_building(
                 persona_id, mode, bin_path, bin_path.stat().st_size,
             )
             result = _run_async_on_mcp_loop(
-                _call_load_avatar_set(str(bin_path), mode),
+                _call_load_avatar_set(str(bin_path), mode, building_id),
                 timeout_sec=_LOAD_TIMEOUT_SEC,
             )
             if result is not None:
@@ -495,7 +518,23 @@ def on_persona_entered_building(
         persona_id,
     )
     _run_async_on_mcp_loop(
-        _call_set_avatar("idle"), timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
+        _call_set_avatar("idle", building_id),
+        timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
+    )
+
+    # 3. まばたき常時 ON: まばたきはペルソナが操作する要素ではなく、
+    # device がつながっている間は常に有効にしておきたい (スペル非公開)。
+    # set_avatar("idle") は off→idle 遷移で blink を「復元」するが、
+    # device の初期状態が blink OFF だと復元対象が無く ON にならないため、
+    # ここで明示的に enable して確実に常時 ON を保証する。 起動時同期 /
+    # device reboot 後の再同期も _reconcile_vessel_state 経由でこの hook を
+    # 通るので、 同じく blink が ON に戻る。
+    LOGGER.info(
+        "avatar_loader: enabling autonomous blink for persona=%s", persona_id,
+    )
+    _run_async_on_mcp_loop(
+        _call_set_blink(True, building_id),
+        timeout_sec=_SET_BLINK_TIMEOUT_SEC,
     )
 
 
@@ -517,13 +556,11 @@ def on_persona_exited_building(
     xiaozhi-esp32 の下層 UI (WiFi 設定や OTA 画面など) が見える状態に
     戻る。
     """
-    vessel_bid = _vessel_building_id()
-    if not vessel_bid:
-        return
-    # building_id (= 退室元) と vessel ID を照合。 dispatcher 側で
-    # from_building_id にも同じ値を入れているがどちらでも OK。
-    if building_id != vessel_bid:
-        return
+    # 複数機体 (intent K, Phase C): 退室元 building が Vessel Building か判定。
+    from vessel_manager import get_vessel_manager
+
+    if get_vessel_manager().get_vessel_by_building(building_id) is None:
+        return  # Vessel Building でない
 
     LOGGER.info(
         "avatar_loader: vessel exit by persona=%s — hiding avatar layer",
@@ -532,7 +569,8 @@ def on_persona_exited_building(
     # in-vessel 記録から削除 (= ⑤ finalize の auto-transfer 対象外に)。
     get_avatar_loader().mark_persona_exited(persona_id)
     _run_async_on_mcp_loop(
-        _call_set_avatar("off"), timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
+        _call_set_avatar("off", building_id),
+        timeout_sec=_SET_AVATAR_TIMEOUT_SEC,
     )
 
 
@@ -625,29 +663,28 @@ def _reconcile_vessel_state(reason: str) -> None:
     相当の avatar transfer 経路に乗せる。 既存 hook を直接呼ぶことでロジック
     重複を避ける (cache check / load / face reset すべて再利用)。
     """
-    vessel_bid = _vessel_building_id()
-    if not vessel_bid:
-        return
-    persona_id = _query_current_vessel_persona(vessel_bid)
-    if persona_id is None:
-        LOGGER.debug(
-            "avatar_loader: %s — no persona currently in vessel, nothing to sync",
-            reason,
+    from vessel_dispatch import list_vessel_building_ids
+
+    # 全 Vessel Building について、 現在居るペルソナの avatar を再同期する
+    # (intent K, Phase C 複数機体対応)。各 building の occupant を
+    # on_persona_entered_building 相当の transfer 経路に乗せる。
+    for vessel_bid in list_vessel_building_ids():
+        persona_id = _query_current_vessel_persona(vessel_bid)
+        if persona_id is None:
+            continue
+        LOGGER.info(
+            "avatar_loader: %s — re-syncing avatar for persona=%s in vessel %s",
+            reason, persona_id, vessel_bid,
         )
-        return
-    LOGGER.info(
-        "avatar_loader: %s — re-syncing avatar for persona=%s in vessel %s",
-        reason, persona_id, vessel_bid,
-    )
-    try:
-        on_persona_entered_building(
-            persona_id=persona_id, building_id=vessel_bid,
-        )
-    except Exception:
-        LOGGER.exception(
-            "avatar_loader: re-sync via on_persona_entered_building failed "
-            "for persona=%s", persona_id,
-        )
+        try:
+            on_persona_entered_building(
+                persona_id=persona_id, building_id=vessel_bid,
+            )
+        except Exception:
+            LOGGER.exception(
+                "avatar_loader: re-sync failed for persona=%s building=%s",
+                persona_id, vessel_bid,
+            )
 
 
 def _on_stackchan_mcp_ready() -> None:
