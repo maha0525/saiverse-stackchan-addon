@@ -116,6 +116,7 @@
             "advanced": true
         }
     ],
+    "action_test_targets": "action_test_targets:list_action_test_targets",
     "server_hooks": [
         {
             "event": "persona_speak",

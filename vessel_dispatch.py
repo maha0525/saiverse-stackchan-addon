@@ -96,7 +96,27 @@ def resolve_vessel_connection() -> Tuple[Any, Any]:
         VesselNotAvailable: vessel が解決できない、 または該当機体の gateway
             インスタンスが接続されていない場合。
     """
-    vessel = resolve_vessel()
+    # 対象機体の明示上書き (addon 管理 UI の複合アクション「テスト実行」用)。
+    # テスト実行は persona 文脈を持たないため、 通常の「現在ペルソナが降りて
+    # いる機体」解決 (:func:`resolve_vessel`) が効かない。 UI で選んだ機体の
+    # vessel_id が core の contextvar 経由で渡ってくるので、 それがあれば
+    # persona 文脈より優先してその機体へ直接向ける。 通常のスペル経路では None
+    # なので、 従来の persona 文脈解決に落ちる。
+    from tools.context import get_tool_target_instance_id
+
+    forced_vessel_id = get_tool_target_instance_id()
+    if forced_vessel_id:
+        from vessel_manager import get_vessel_manager
+
+        vessel = get_vessel_manager().get_vessel(forced_vessel_id)
+        if vessel is None:
+            raise VesselNotAvailable(
+                f"機体 '{forced_vessel_id}' が登録されていません "
+                "(テスト対象の機体が削除された可能性)"
+            )
+    else:
+        vessel = resolve_vessel()
+
     from tools.mcp_client import _make_instance_key, get_mcp_manager
 
     mcp = get_mcp_manager()
