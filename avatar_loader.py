@@ -400,6 +400,43 @@ def _fetch_device_link(building_id: Optional[str] = None) -> DeviceLink:
     )
 
 
+def _touch_vessel_last_seen(building_id: str) -> None:
+    """機体が繋がっていることを vessels.db の ``last_seen_at`` に書き留める。
+
+    intent stackchan_vessel.md が求めているのは「接続の生存」:
+
+    - E-2 (ペアリング後の再接続): Wi-Fi 断や device 再起動のあと機体が自力で
+      戻ってきたとき、「vessel_manager が last_seen_at を更新するだけ」と
+      書かれている。
+    - K-6 (機体管理 UI): paired_at と並べて基本情報に出す。
+
+    ところが実際に ``update_last_seen`` を呼んでいたのは audio_input_relay
+    (= 機体のマイクが音を拾ったとき) だけで、E-2 が名指しする再接続の場面で
+    誰も呼んでいなかった。結果、繋がって元気に動いている機体が「一度も見て
+    いない」ままになる (2026-08-25、二号機が該当)。巡回でそれを埋める。
+
+    ここで欲しいのは「機体が生きているか」なので、``bound_persona_id`` や
+    occupant の有無とは無関係に更新する。誰も降りていない機体も、繋がって
+    いる以上は生きている。
+    """
+    try:
+        from vessel_manager import get_vessel_manager
+
+        manager = get_vessel_manager()
+        vessel = manager.get_vessel_by_building(building_id)
+        if vessel is None:
+            return  # Vessel Building でない / 未ペアリング
+        manager.update_last_seen(vessel.vessel_id)
+    except Exception:
+        # 生存記録は avatar 転送の前提ではないので、ここで失敗しても巡回は
+        # 続ける。DEBUG に留めるのは、30 秒ごとに WARNING を積むと本来の
+        # 転送ログが埋もれるため。
+        LOGGER.debug(
+            "avatar_loader: last_seen update skipped for building=%s",
+            building_id, exc_info=True,
+        )
+
+
 def _run_async_on_mcp_loop(coro, timeout_sec: float) -> Optional[str]:
     """sync 文脈から MCP loop の coro を呼んで結果を取る共通ヘルパ。
 
@@ -736,12 +773,13 @@ def _periodic_reconcile_loop() -> None:
 
     1. ``_device_ready_event`` を ``_READY_EVENT_FALLBACK_SEC`` 上限で wait
        (= いずれかの gateway subprocess の起動完了通知)。
-    2. 以降、 全 Vessel Building を polling し、 各機体について:
-       occupant を DB から引き (居なければスキップ)、 その機体の gateway へ
-       ``_fetch_device_link(building_id)`` で問い合わせ、 device が接続され
-       次第 その occupant の avatar を building 文脈で reconcile する。
-       判定は ``connected`` の立ち上がりと ``session_id`` の変化の二本立て
-       で、 後者が取れない古い gateway でも前者だけで発火する。
+    2. 以降、 全 Vessel Building を polling し、 各機体について
+       ``_fetch_device_link(building_id)`` で gateway に接続状態を訊く。
+       繋がっていれば vessels.db の ``last_seen_at`` を更新し (= occupant の
+       有無とは無関係、 機体の生存記録)、 その上で occupant が居れば
+       avatar を building 文脈で reconcile する。 転送の判定は ``connected``
+       の立ち上がりと ``session_id`` の変化の二本立てで、 後者が取れない
+       古い gateway でも前者だけで発火する。
     3. event 到来直後は ``_INITIAL_BURST_SEC`` 秒間 ``_INITIAL_BURST_INTERVAL_SEC``
        間隔の短周期 (= ESP32 の WS 接続完了を素早く拾う)、 以降は
        ``_POLL_INTERVAL_SEC`` 間隔に落とす。
@@ -787,9 +825,10 @@ def _periodic_reconcile_loop() -> None:
                 building_ids = []
 
             for building_id in building_ids:
-                persona_id = _query_current_vessel_persona(building_id)
-                if persona_id is None:
-                    continue  # 誰も降りていない Vessel はスキップ
+                # occupant の有無より先に接続を見る。 last_seen_at は「機体が
+                # 生きているか」の記録で、 誰かが降りているかとは無関係だから
+                # (詳細は _touch_vessel_last_seen)。 avatar 転送の判定はその
+                # 後ろに置く。
                 link = _fetch_device_link(building_id)
                 if not link.known:
                     continue  # gateway 未起動 / 通信失敗、 次 tick で再試行
@@ -799,6 +838,13 @@ def _periodic_reconcile_loop() -> None:
                     # 転送が走るようにしておく。
                     last_link_by_building.pop(building_id, None)
                     continue
+                # 繋がっている = 生きている。 起動直後の burst 窓 (2 秒間隔)
+                # では同じ機体に何度も書くことになるが、 UPDATE 1 行で、 かつ
+                # burst は 60 秒で終わる。 間引く機構を足すより素直さを取る。
+                _touch_vessel_last_seen(building_id)
+                persona_id = _query_current_vessel_persona(building_id)
+                if persona_id is None:
+                    continue  # 誰も降りていない Vessel は avatar 転送の対象外
                 # session_id を返す gateway では接続の同一性で判定し、
                 # 返さない古い gateway では「未接続 → 接続」の立ち上がり
                 # だけで判定する。
