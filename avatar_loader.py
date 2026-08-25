@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 # addon_loader の spec_from_file_location 経由ロードでは __package__ が
 # 設定されないため相対 import が動かない。 同梱モジュールを絶対 import
@@ -40,7 +40,6 @@ _PACK_DIR = str(Path(__file__).parent)
 if _PACK_DIR not in sys.path:
     sys.path.insert(0, _PACK_DIR)
 
-from saiverse.addon_config import get_params  # noqa: E402
 from saiverse.addon_paths import get_addon_data_dir  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -53,14 +52,20 @@ MCP_TOOL_LOAD_SET = "load_avatar_set"
 # いるが、 gateway は SAIVerse の MCP client に対しては bare 名 ``set_avatar``
 # で再 expose している。 ここで呼ぶのは gateway の expose 名 = 短い方。
 MCP_TOOL_SET_AVATAR = "set_avatar"
-# device の boot session id を含む device status を取る。 SAIVerse 側
-# avatar cache (_device_current_checksum) と device 実状態の不整合を解消
-# するため、 入室時に session_id を確認して reboot を検知する目的で使う。
-# gateway の bare 名は ``get_device_info``、 これが内部で ESP32 の
-# ``self.get_device_status`` に relay される (stdio_server.py:735 の
-# tool_map 参照、 set_avatar が ``self.display.set_avatar`` に 対応する
-# のと同じパターン)。
-MCP_TOOL_GET_DEVICE_STATUS = "get_device_info"
+# gateway から見た device との接続状態を取る。 SAIVerse 側 avatar cache
+# (_device_current_checksum) と device 実状態の不整合を解消するため、
+# 入室時と polling で「今つながっているか」「前と同じ接続か」を確認する。
+# ``get_status`` は gateway 自身が答えるツールで、 ``connected`` と、
+# 接続中なら ``session_id`` (WS 接続ごとに変わる UUID) を返す
+# (upstream stackchan-mcp #357)。
+#
+# ⚠️ ``get_device_info`` と混同しないこと。 あちらは ESP32 の
+# ``self.get_device_status`` へ relay され、 バッテリー / 音量 / 輝度 /
+# ネットワークという device のハード状態を返す。 接続の状態はそこに入ら
+# ないので、 session をいくら探しても見つからない。 2026-08-25 に実害:
+# 入室時に空振りした avatar が device 接続後も再転送されず、 顔が出な
+# かった。
+MCP_TOOL_GET_GATEWAY_STATUS = "get_status"
 # まばたきはペルソナが操作する要素ではなく、 SAIVerse が device に
 # つながっている間は常時 ON にしておきたい (= スペル非公開)。 入室時の
 # 状態リセット直後に明示 enable する。 gateway の bare 名は ``set_blink``。
@@ -95,12 +100,13 @@ class AvatarSetLoader:
         # ⑤ finalize 時に自動転送するか判定するため、 in-memory で記録)。
         # 入室 / 退室 hook で更新、 SAIVerse 再起動でリセット。
         self._currently_vessel_persona: Optional[str] = None
-        # device の最後に観測した boot_session_id。 device 側で boot ごとに
-        # esp_random で生成される UUID。 入室時に都度 get_device_status で
-        # 取得し、 前回と違ったら device が reboot した = PSRAM クリア =
-        # cache を invalidate する必要がある、と判定する。
-        # 古い firmware (boot_session_id を返さない) には対応せず保守的に
-        # cache 維持する (= None のまま動作、 invalidate しない)。
+        # 最後に観測した session_id。 gateway が WS 接続ごとに振る UUID で、
+        # device が reboot しても、 単に切れて繋ぎ直しても新しい値になる。
+        # 入室時に都度 get_status で取得し、 前回と違ったら device の中身
+        # (PSRAM) はもう空だと判断して cache を invalidate する。
+        # session_id を返さない古い gateway では ``None`` のままになるが、
+        # その場合も polling 側が「未接続 → 接続」の立ち上がりで再転送を
+        # 発火するので、 顔が出ないままにはならない。
         self._last_seen_session_id: Optional[str] = None
 
     def mark_persona_entered(self, persona_id: str) -> None:
@@ -193,15 +199,15 @@ class AvatarSetLoader:
         current_session_id: Optional[str],
         on_invalidate: Optional[Callable[[], None]] = None,
     ) -> None:
-        """device の boot_session_id を比較して、 reboot を検知した場合に
-        cache を invalidate する。 ``on_invalidate`` が指定されていれば、
-        実際に invalidate が発生した時に lock 解放後に呼び出す (= polling
-        loop が再 transfer を発火する用途、 callback 内で再帰的に lock
-        を取らないため)。
+        """session_id を比較して、 別の接続になっていたら cache を
+        invalidate する。 ``on_invalidate`` が指定されていれば、 実際に
+        invalidate が発生した時に lock 解放後に呼び出す (= polling loop が
+        再 transfer を発火する用途、 callback 内で再帰的に lock を取らない
+        ため)。
 
-        ``current_session_id`` が ``None`` の場合 (= device 不在、 古い
-        firmware で session_id を返さない、 通信エラー等) は保守的に何も
-        しない (= cache 維持)。 これにより古い firmware との互換も保つ。
+        ``current_session_id`` が ``None`` の場合 (= device 不在、 session_id
+        を返さない古い gateway、 通信エラー等) は保守的に何もしない
+        (= cache 維持)。 接続の立ち上がり検知は polling 側が持つ。
         """
         if current_session_id is None:
             return
@@ -241,13 +247,6 @@ def get_avatar_loader() -> AvatarSetLoader:
 
 
 # ----- Hook handler -----
-
-
-def _vessel_building_id() -> Optional[str]:
-    """AddonConfig から Vessel Building ID を取得する。"""
-    params = get_params(ADDON_NAME, persona_id=None) or {}
-    vbid = params.get("vessel_building_id")
-    return vbid if isinstance(vbid, str) and vbid else None
 
 
 def _get_active_set_name(persona_id: str) -> str:
@@ -325,54 +324,80 @@ async def _call_set_blink(
     return await conn.call_tool(MCP_TOOL_SET_BLINK, {"enabled": enabled})
 
 
-async def _call_get_device_status(building_id: Optional[str] = None) -> str:
-    """gateway の ``get_device_status`` MCP tool を呼ぶ。
+async def _call_get_gateway_status(building_id: Optional[str] = None) -> str:
+    """gateway の ``get_status`` MCP tool を呼ぶ。
 
-    新 firmware は JSON に ``boot_session_id`` フィールドを含める。 これを
-    SAIVerse 側で記録 / 比較して device reboot を検知する。
+    答えるのは gateway 自身なので、 device が落ちていても応答は返る
+    (``connected`` が false になる)。 接続中は ``session_id`` が付く。
     """
     conn = await _get_stackchan_conn(building_id)
-    return await conn.call_tool(MCP_TOOL_GET_DEVICE_STATUS, {})
+    return await conn.call_tool(MCP_TOOL_GET_GATEWAY_STATUS, {})
 
 
-def _fetch_device_session_id(building_id: Optional[str] = None) -> Optional[str]:
-    """device の現在の ``boot_session_id`` を取得する。 取れなかったら ``None``。
+class DeviceLink(NamedTuple):
+    """gateway から見た device との接続状態。
+
+    ``known`` は「問い合わせ自体が成立したか」を表す。 タイムアウトや MCP
+    エラーは ``known=False`` で、 gateway が「つながっていない」と答えた
+    ``connected=False`` とは別物として扱う。 この二つを一つの値に潰すと、
+    通信が一瞬こけただけで device 消失と誤判定してしまう。
+    """
+
+    known: bool
+    connected: bool
+    session_id: Optional[str]
+
+
+_UNKNOWN_LINK = DeviceLink(known=False, connected=False, session_id=None)
+
+
+def _fetch_device_link(building_id: Optional[str] = None) -> DeviceLink:
+    """gateway に device との接続状態を問い合わせる。
 
     ``building_id`` 指定でその機体の gateway へ問い合わせる (複数機体、 背景
-    スレッド用)。 保守的な失敗扱い: タイムアウト / MCP エラー / 古い firmware
-    (= フィールドなし) / JSON parse 失敗 / 機体未接続 のいずれも ``None`` 扱い。
-    呼び出し元は ``None`` の時 cache を invalidate しない (= 互換維持)。
+    スレッド用)。 タイムアウト / MCP エラー / JSON parse 失敗 / 想定外の
+    応答形は ``_UNKNOWN_LINK`` を返し、 呼び出し元は次の tick に回す。
+
+    ``session_id`` は接続中でも ``None`` になりうる (= それを返さない古い
+    gateway)。 その場合も ``connected`` の立ち上がりで再転送は発火するので、
+    顔が出ないままにはならない。
     """
     result = _run_async_on_mcp_loop(
-        _call_get_device_status(building_id),
+        _call_get_gateway_status(building_id),
         timeout_sec=_GET_STATUS_TIMEOUT_SEC,
     )
     if not result:
-        LOGGER.debug("_fetch_device_session_id: result is empty/None")
-        return None
+        LOGGER.debug("_fetch_device_link: result is empty/None")
+        return _UNKNOWN_LINK
     try:
         parsed = json.loads(result) if isinstance(result, str) else result
     except (json.JSONDecodeError, TypeError) as exc:
         LOGGER.warning(
-            "_fetch_device_session_id: JSON parse failed: %s, raw=%r",
+            "_fetch_device_link: JSON parse failed: %s, raw=%r",
             exc, str(result)[:300],
         )
-        return None
+        return _UNKNOWN_LINK
     if not isinstance(parsed, dict):
         LOGGER.warning(
-            "_fetch_device_session_id: parsed not dict, type=%s raw=%r",
+            "_fetch_device_link: parsed not dict, type=%s raw=%r",
             type(parsed).__name__, str(result)[:300],
         )
-        return None
-    sid = parsed.get("boot_session_id")
-    if not isinstance(sid, str) or not sid:
+        return _UNKNOWN_LINK
+    if "connected" not in parsed:
+        # get_status なら必ず入っているフィールド。 無いなら別のツールを
+        # 呼んでいる (= gateway 側の tool_map が変わった) 疑いがあるので、
+        # 黙って「未接続」に倒さず、 不明として警告に残す。
         LOGGER.warning(
-            "_fetch_device_session_id: no boot_session_id field "
-            "(keys=%s, raw=%r)",
+            "_fetch_device_link: no connected field (keys=%s, raw=%r)",
             list(parsed.keys()), str(result)[:300],
         )
-        return None
-    return sid
+        return _UNKNOWN_LINK
+    sid = parsed.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        sid = None
+    return DeviceLink(
+        known=True, connected=bool(parsed.get("connected")), session_id=sid
+    )
 
 
 def _run_async_on_mcp_loop(coro, timeout_sec: float) -> Optional[str]:
@@ -429,14 +454,14 @@ def on_persona_entered_building(
     loader = get_avatar_loader()
     loader.mark_persona_entered(persona_id)
 
-    # device の boot_session_id を取得して、 前回観測と比較する。 異なれば
-    # device が reboot した = PSRAM がクリアされた = `_last_loaded` cache
-    # は無効 (= "load 済み" と思ってる avatar は実際には device に存在
-    # しない) なので、 cache を全クリアして強制再 transfer に倒す。
-    # `None` (= 古い firmware で boot_session_id を返さない / 通信エラー)
-    # は保守的に無視 (= 既存挙動を維持)。
-    current_session_id = _fetch_device_session_id(building_id)
-    loader.reconcile_session(current_session_id)
+    # gateway に接続状態を訊いて、 session_id を前回観測と比較する。
+    # 異なれば別の接続になった = device の PSRAM はクリアされている =
+    # `_last_loaded` cache は無効 (= "load 済み" と思ってる avatar は実際
+    # には device に存在しない) なので、 cache を全クリアして強制再
+    # transfer に倒す。 `None` (= session_id を返さない古い gateway /
+    # 通信エラー) は保守的に無視 (= 既存挙動を維持)。
+    link = _fetch_device_link(building_id)
+    loader.reconcile_session(link.session_id)
 
     # 1. avatar セットを load (= 配置されてれば)。
     # アクティブセット名を avatar_pipeline から引く (Phase 4.5-d-5)。
@@ -527,8 +552,9 @@ def on_persona_entered_building(
     # set_avatar("idle") は off→idle 遷移で blink を「復元」するが、
     # device の初期状態が blink OFF だと復元対象が無く ON にならないため、
     # ここで明示的に enable して確実に常時 ON を保証する。 起動時同期 /
-    # device reboot 後の再同期も _reconcile_vessel_state 経由でこの hook を
-    # 通るので、 同じく blink が ON に戻る。
+    # device reboot 後の再同期も _periodic_reconcile_loop が本 hook
+    # (on_persona_entered_building) を building 文脈で呼ぶので、 同じく blink が
+    # ON に戻る。
     LOGGER.info(
         "avatar_loader: enabling autonomous blink for persona=%s", persona_id,
     )
@@ -658,35 +684,6 @@ def _query_current_vessel_persona(vessel_bid: str) -> Optional[str]:
         db.close()
 
 
-def _reconcile_vessel_state(reason: str) -> None:
-    """vessel に現在居るペルソナを取得して、 ``on_persona_entered_building``
-    相当の avatar transfer 経路に乗せる。 既存 hook を直接呼ぶことでロジック
-    重複を避ける (cache check / load / face reset すべて再利用)。
-    """
-    from vessel_dispatch import list_vessel_building_ids
-
-    # 全 Vessel Building について、 現在居るペルソナの avatar を再同期する
-    # (intent K, Phase C 複数機体対応)。各 building の occupant を
-    # on_persona_entered_building 相当の transfer 経路に乗せる。
-    for vessel_bid in list_vessel_building_ids():
-        persona_id = _query_current_vessel_persona(vessel_bid)
-        if persona_id is None:
-            continue
-        LOGGER.info(
-            "avatar_loader: %s — re-syncing avatar for persona=%s in vessel %s",
-            reason, persona_id, vessel_bid,
-        )
-        try:
-            on_persona_entered_building(
-                persona_id=persona_id, building_id=vessel_bid,
-            )
-        except Exception:
-            LOGGER.exception(
-                "avatar_loader: re-sync failed for persona=%s building=%s",
-                persona_id, vessel_bid,
-            )
-
-
 def _on_stackchan_mcp_ready() -> None:
     """本体 MCP client の ``on_server_ready`` 経由で呼ばれる。 gateway
     subprocess が起動 + 接続完了したタイミングで fire。
@@ -735,21 +732,22 @@ def _register_mcp_ready_hook() -> None:
 
 
 def _periodic_reconcile_loop() -> None:
-    """daemon thread main。 設計:
+    """daemon thread main (複数機体対応)。 設計:
 
     1. ``_device_ready_event`` を ``_READY_EVENT_FALLBACK_SEC`` 上限で wait
-       (= MCP gateway subprocess の起動完了通知)。
-    2. event 起きたら burst window 開始: ``_INITIAL_BURST_SEC`` 秒間、
-       ``_INITIAL_BURST_INTERVAL_SEC`` 間隔で ``_fetch_device_session_id``
-       を retry (= ESP32 の WS 接続完了を素早く検知)。
-    3. session_id が取れたら initial reconcile を 1 回実行。
-    4. 以降は ``_POLL_INTERVAL_SEC`` 間隔で session_id 監視 (= シナリオ A
-       対応の device reboot 検知)。 burst window 経過後に session_id が
-       取れない場合も同じ長間隔に落とす (= ESP32 未接続時の負荷削減)。
+       (= いずれかの gateway subprocess の起動完了通知)。
+    2. 以降、 全 Vessel Building を polling し、 各機体について:
+       occupant を DB から引き (居なければスキップ)、 その機体の gateway へ
+       ``_fetch_device_link(building_id)`` で問い合わせ、 device が接続され
+       次第 その occupant の avatar を building 文脈で reconcile する。
+       判定は ``connected`` の立ち上がりと ``session_id`` の変化の二本立て
+       で、 後者が取れない古い gateway でも前者だけで発火する。
+    3. event 到来直後は ``_INITIAL_BURST_SEC`` 秒間 ``_INITIAL_BURST_INTERVAL_SEC``
+       間隔の短周期 (= ESP32 の WS 接続完了を素早く拾う)、 以降は
+       ``_POLL_INTERVAL_SEC`` 間隔に落とす。
 
-    event が timeout までに来なかった場合は burst をスキップして直接長間隔
-    polling に入る (= hook 機構が壊れた / 古い本体で hook 非対応 / gateway
-    起動失敗 等の最終保険)。
+    event が timeout までに来なかった場合も polling-only で同じループに入る
+    (= hook 機構が壊れた / gateway 起動失敗 等の最終保険)。
     """
     try:
         got_event = _device_ready_event.wait(timeout=_READY_EVENT_FALLBACK_SEC)
@@ -768,41 +766,69 @@ def _periodic_reconcile_loop() -> None:
                 _INITIAL_BURST_SEC, _INITIAL_BURST_INTERVAL_SEC,
             )
 
-        initial_done = False
+        # per-vessel の最後に観測した接続の目印 (session_id、 取れなければ
+        # 文字列 "connected")。 各機体について初回接続で avatar をロードし、
+        # 目印が変わったら再ロードする (intent K 複数機体対応)。
+        #
+        # ここが空回りして顔が出ない事故を二度起こしている:
+        # (1) 旧実装は単一 device 前提で building_id 無し(context 経路)で
+        #     問い合わせ、 背景スレッドに persona 文脈が無く機体を特定でき
+        #     なかった。 building_id を明示して per-vessel に回して解消。
+        # (2) 2026-08-25。 問い合わせ先が get_device_info (device のハード
+        #     状態) だったため、 そこに無い session を待ち続けて永久に
+        #     `continue` していた。 gateway の get_status に変えて解消。
+        #     詳細は MCP_TOOL_GET_GATEWAY_STATUS のコメント。
+        last_link_by_building: dict = {}
         while True:
-            current_sid = _fetch_device_session_id()
-            if current_sid is None:
-                # device 未接続 / 古い firmware / 通信エラー。 burst window
-                # 内なら短間隔で連続 retry、 外なら長間隔に落とす。
-                in_burst = time.monotonic() < burst_deadline
-                time.sleep(
-                    _INITIAL_BURST_INTERVAL_SEC if in_burst
-                    else _POLL_INTERVAL_SEC
-                )
-                continue
+            try:
+                from vessel_dispatch import list_vessel_building_ids
+                building_ids = list_vessel_building_ids()
+            except Exception:
+                building_ids = []
 
-            if not initial_done:
-                # device が初めて ready になった瞬間 — シナリオ B 対応の
-                # initial reconcile を実行。 session_id を記録した後で
-                # vessel state を sync する。
+            for building_id in building_ids:
+                persona_id = _query_current_vessel_persona(building_id)
+                if persona_id is None:
+                    continue  # 誰も降りていない Vessel はスキップ
+                link = _fetch_device_link(building_id)
+                if not link.known:
+                    continue  # gateway 未起動 / 通信失敗、 次 tick で再試行
+                if not link.connected:
+                    # device が落ちている。 次に上がってくる接続は必ず
+                    # 「新しい接続」なので、 記録を消して立ち上がりで
+                    # 転送が走るようにしておく。
+                    last_link_by_building.pop(building_id, None)
+                    continue
+                # session_id を返す gateway では接続の同一性で判定し、
+                # 返さない古い gateway では「未接続 → 接続」の立ち上がり
+                # だけで判定する。
+                marker = link.session_id or "connected"
+                if last_link_by_building.get(building_id) == marker:
+                    continue  # 同じ接続のまま、 reconcile 済み
+                # 初回接続 or reboot 検知 → その機体の occupant の avatar を
+                # building 文脈でロード (on_persona_entered_building は
+                # building_id を使って機体を解決するので、 文脈非依存で動く)。
                 LOGGER.info(
-                    "avatar_loader: device ready (session=%s), "
-                    "performing initial reconcile",
-                    current_sid,
+                    "avatar_loader: reconciling vessel building=%s persona=%s "
+                    "(session=%s, prev=%s)",
+                    building_id, persona_id, marker,
+                    last_link_by_building.get(building_id),
                 )
-                get_avatar_loader().reconcile_session(current_sid)
-                _reconcile_vessel_state("initial reconcile (startup)")
-                initial_done = True
-            else:
-                # 以降は session_id 変化検知のみ。 変化があれば cache
-                # invalidate + vessel state 再 sync。
-                get_avatar_loader().reconcile_session(
-                    current_sid,
-                    on_invalidate=lambda: _reconcile_vessel_state(
-                        "device reboot detected via polling"
-                    ),
-                )
-            time.sleep(_POLL_INTERVAL_SEC)
+                try:
+                    on_persona_entered_building(
+                        persona_id=persona_id, building_id=building_id,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "avatar_loader: vessel reconcile failed "
+                        "(building=%s persona=%s)", building_id, persona_id,
+                    )
+                last_link_by_building[building_id] = marker
+
+            in_burst = time.monotonic() < burst_deadline
+            time.sleep(
+                _INITIAL_BURST_INTERVAL_SEC if in_burst else _POLL_INTERVAL_SEC
+            )
     except Exception:
         LOGGER.exception(
             "avatar_loader: periodic reconcile loop crashed, "
