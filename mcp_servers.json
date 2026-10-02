@@ -28,7 +28,6 @@
             "timeout": 30,
             "_comment_building_ids": "building_ids (Building 単位 visibility, 本体 A-3-c) は native wrapper 側で vessels.db の全 Vessel Building から動的に組み立てる (vessel_dispatch.list_vessel_building_ids)。旧・単一機体時代の静的プレースホルダ (addon.<addon_name>.vessel_building_id を building_ids に埋める形) は撤去済み (複数機体では機体ごとに building が違うため単一グローバル値では表せない)。注: 本コメントに実プレースホルダ構文を書くと本体 MCP client の解決器が走査して未解決エラーになるため、構文記号は使わない。",
             "spell_tools": [
-                {"name": "read_imu_context", "display_name": "身体の向きと加速度", "visible": false, "_comment_visible": "Native spell tools/read_imu_context.py wraps read_imu + get_head_angles."},
                 {"name": "move_head",          "display_name": "首を動かす",         "visible": false, "_comment_visible": "move_head.py (native tool) でラップしてサーボ静定待ちを挟むので生 MCP は隠す。see ↔ take_photo と同じ構図。詳細: tools/move_head.py"},
                 {"name": "take_photo",         "display_name": "写真を撮る",         "visible": false, "_comment_visible": "see (native tool) でラップして attachment 経路に乗せるので生 MCP は隠す。詳細: tools/see.py"},
                 {"name": "set_avatar",         "display_name": "表情を変える",       "visible": false, "_comment_visible": "device_controls.py (native wrapper) でラップし、resolve_vessel_connection で現在機体の instance へ振り分けるので生 MCP は隠す。move_head/take_photo と同じ構図 (K-4)。"},
@@ -43,9 +42,6 @@
                 {"name": "set_volume",         "display_name": "音量設定",           "visible": false, "_comment_visible": "device_controls.py (native wrapper) でラップし、resolve_vessel_connection で現在機体の instance へ振り分けるので生 MCP は隠す。move_head/take_photo と同じ構図 (K-4)。"},
                 {"name": "get_touch_state",    "display_name": "タッチ状態取得",     "visible": false, "_comment_visible": "body_status.py (native tool) で get_device_info / get_head_angles と一括取得するので生 MCP は隠す。"},
                 {"name": "get_head_angles",    "display_name": "首の角度取得",       "visible": false, "_comment_visible": "body_status.py で一括取得。"},
-                {"name": "read_imu",           "display_name": "9軸IMUを読む",        "visible": false, "_comment_visible": "tools/read_imu.py が現在の機体へ振り分けるため、生MCPツールは隠す。"},
-                {"name": "read_environment",   "display_name": "環境光と近接を読む",  "visible": false, "_comment_visible": "tools/read_environment.py が現在の機体へ振り分けるため、生MCPツールは隠す。"},
-                {"name": "scan_nfc",           "display_name": "NFCタグを探す",       "visible": false, "_comment_visible": "tools/scan_nfc.py が現在の機体へ振り分ける。単発UIDスキャンのみで、tag memory の読書き・認証・emulation は行わない。"},
                 {"name": "get_device_info",    "display_name": "デバイス情報取得",   "visible": false, "_comment_visible": "body_status.py で一括取得。"},
                 {"name": "get_status",         "visible": false},
                 {"name": "say",                "visible": false},

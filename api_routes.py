@@ -939,19 +939,6 @@ def get_device_status(vessel_id: str) -> dict:
     return _parse_mcp_text_as_dict(raw)
 
 
-@router.get("/device/imu")
-def read_device_imu(vessel_id: str) -> dict:
-    """指定 StackChan のIMUスナップショットを1回取得する。
-
-    加速度は g、ジャイロは deg/s、磁力計は µT。値の連続配信や姿勢推定は
-    別のストリーム機能とし、この endpoint は診断・単発観測専用に保つ。
-    """
-    raw = _call_device_mcp_tool("read_imu", {}, vessel_id=vessel_id)
-    parsed = _parse_mcp_text_as_dict(raw)
-    LOGGER.info("device: read_imu (vessel=%s)", vessel_id)
-    return parsed
-
-
 @router.post("/device/volume")
 def set_device_volume(req: SetDeviceVolumeRequest) -> dict:
     """ｽﾀｯｸﾁｬﾝ内部スピーカー音量を設定 (0-100)。"""
