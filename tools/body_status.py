@@ -31,11 +31,26 @@ _ADDON_ROOT = str(Path(__file__).resolve().parent.parent)
 if _ADDON_ROOT not in sys.path:
     sys.path.insert(0, _ADDON_ROOT)
 from vessel_dispatch import (  # noqa: E402
+    VesselNotAvailable,
+    building_gate_or_hidden,
+    effective_units,
     list_vessel_building_ids,
+    resolve_vessel,
     resolve_vessel_connection,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# ユニット type → ペルソナ向け表示名。 搭載ユニットセクション (body_status に
+# 配置を見せる、 docs/intent/stackchan_unit_placement.md §6.1) で使う。 ペルソナ
+# は channel 等の物理配線でなく「何が付いていて、 どのラベルで呼べるか」を知り
+# たいので、 表示名 + ラベルだけを見せる。
+_UNIT_DISPLAY = {
+    "env3": "環境センサー (ENV III、 温湿度・気圧)",
+    "servo8": "8Servos サーボユニット",
+    "sonic": "超音波距離センサー",
+    "tof": "ToF 距離センサー (レーザー測距)",
+}
 
 ADDON_NAME = "saiverse-stackchan-addon"
 MCP_QUALIFIED_SERVER = f"{ADDON_NAME}__stackchan"
@@ -59,19 +74,6 @@ _TOUCH_DISABLED_MESSAGE = (
     "タッチセンサーは現在 OFF に設定されています（ユーザー設定）。"
     "頭をなでても検出・反応しません。"
 )
-
-
-def _vessel_building_id() -> Optional[str]:
-    """AddonConfig から Vessel Building ID を取得する。"""
-    try:
-        from saiverse.addon_config import get_params
-
-        params = get_params(ADDON_NAME)
-        vbid = params.get("vessel_building_id") if params else None
-        return str(vbid) if vbid else None
-    except Exception:
-        LOGGER.exception("body_status: failed to resolve vessel_building_id")
-        return None
 
 
 async def _call_all() -> dict[str, str]:
@@ -122,6 +124,9 @@ def _run_on_mcp_loop(coro, timeout_sec: float = _DEFAULT_TIMEOUT_SEC):
 
     loop = _mcp._loop
     if loop is None:
+        # 未スケジュールの coroutine を閉じて "never awaited" 警告を防ぐ。この分岐は
+        # MCP 未起動時のみ通る (schedule 後は loop 所有なので coro には触らない)。
+        coro.close()
         raise RuntimeError("MCP event loop is not initialized")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=timeout_sec)
@@ -159,11 +164,52 @@ def _render_section(rendered: str) -> str:
     return _format_value(parsed)
 
 
+def _render_units_section() -> str:
+    """現在 vessel の搭載ユニット (配置) をペルソナ向けテキストにする。
+
+    unit type ごとにまとめ、 ラベルがあれば併記する (channel 等の物理配線の
+    詳細は出さない。 ペルソナはラベルで呼ぶ)。 これによりペルソナは自分の身体
+    に何が付いていて、 ``get_tof_distance(target=...)`` 等でどのラベルを指定
+    できるかを知る (docs/intent/stackchan_unit_placement.md §6.1)。 身体に降り
+    ていない / 機体未解決なら空文字 (セクション省略)。
+    """
+    try:
+        vessel = resolve_vessel()
+    except VesselNotAvailable:
+        return ""
+    units = effective_units(vessel)
+    if not units:
+        return "  (搭載ユニットなし)"
+
+    by_type: dict[str, list[str]] = {}
+    order: list[str] = []
+    for u in units:
+        t = u["type"]
+        if t not in by_type:
+            by_type[t] = []
+            order.append(t)
+        by_type[t].append(u["label"])  # 空ラベルも個数カウント用に入れる
+
+    lines: list[str] = []
+    for t in order:
+        name = _UNIT_DISPLAY.get(t, t)
+        labels = [lb for lb in by_type[t] if lb]
+        count = len(by_type[t])
+        if labels:
+            lines.append(f"  {name}: {' / '.join(labels)}")
+        elif count > 1:
+            lines.append(f"  {name} ×{count}")
+        else:
+            lines.append(f"  {name}")
+    return "\n".join(lines)
+
+
 def body_status() -> str:
-    """Stack-chan の身体状態 (デバイス情報・首角度・タッチ状態) を一括取得する。
+    """Stack-chan の身体状態 (デバイス情報・首角度・タッチ状態・搭載ユニット) を
+    一括取得する。
 
     Returns:
-        3 セクションを見出し付きで連結した客観テキスト。
+        各セクションを見出し付きで連結した客観テキスト。
     """
     try:
         results = _run_on_mcp_loop(_call_all())
@@ -176,17 +222,26 @@ def body_status() -> str:
         rendered = results.get(tool_name, "(取得なし)")
         lines.append(f"【{heading}】")
         lines.append(_render_section(rendered))
-    LOGGER.info("body_status: collected %d sections", len(_SECTIONS))
+
+    # 搭載ユニット (配置) は vessels.db から (MCP 不要)。 ペルソナがラベルを
+    # 知るための発見面 (§6.1)。
+    units_text = _render_units_section()
+    if units_text:
+        lines.append("【搭載ユニット】")
+        lines.append(units_text)
+
+    LOGGER.info("body_status: collected sections + units")
     return "\n".join(lines)
 
 
 def schema() -> ToolSchema:
     # 共通身体ツールは全 Vessel Building で visible (intent 不変条件 #14
-    # 共通ツール側)。機体未登録なら None = 非表示。
-    building_ids = list_vessel_building_ids() or None
-    if not building_ids:
+    # 共通ツール側)。機体未登録なら building_gate_or_hidden がセンチネル +
+    # spell_visible=False に倒す。
+    building_ids, visible = building_gate_or_hidden(list_vessel_building_ids())
+    if not visible:
         LOGGER.info(
-            "body_status: no vessel registered yet; tool hidden until pairing."
+            "body_status: no vessel registered yet; tool hidden everywhere until pairing."
         )
     return ToolSchema(
         name="body_status",
@@ -203,6 +258,6 @@ def schema() -> ToolSchema:
         result_type="string",
         spell=True,
         spell_display_name="身体の状態を確認",
-        spell_visible=True,
+        spell_visible=visible,
         building_ids=building_ids,
     )

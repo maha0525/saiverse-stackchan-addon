@@ -86,7 +86,13 @@ def _get_mcp_connection():
 
 def _run_on_mcp_loop(coro, timeout_sec: float = 10.0) -> Any:
     import tools.mcp_client as _mcp
-    return asyncio.run_coroutine_threadsafe(coro, _mcp._loop).result(timeout=timeout_sec)
+    loop = _mcp._loop
+    if loop is None:
+        # 未スケジュールの coroutine を閉じて "never awaited" 警告を防ぐ。この分岐は
+        # MCP 未起動時のみ通る (schedule 後は loop 所有なので coro には触らない)。
+        coro.close()
+        raise RuntimeError("MCP event loop is not initialized")
+    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout_sec)
 
 
 def _parse_i2c_payload(rendered: str) -> Optional[Dict[str, Any]]:
@@ -154,10 +160,15 @@ def get_my_unit_value() -> str:
 def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
     # この Unit の capability を持つ機体の Vessel Building でだけ visible に
     # する (intent 不変条件 #14 ユニット側)。 capability は per-vessel
-    # (vessels.db、 機体管理 UI で手動設定)。
-    from vessel_dispatch import list_building_ids_with_capability
+    # (vessels.db、 機体管理 UI で手動設定)。 該当機体ゼロなら
+    # building_gate_or_hidden がセンチネル + spell_visible=False に倒し、全
+    # Building で非表示・実行不可にする (``or None`` は「制限なし=全 Building
+    # 露出」を意味してしまい逆効果なので使わない)。
+    from vessel_dispatch import building_gate_or_hidden, list_building_ids_with_capability
 
-    building_ids = list_building_ids_with_capability(MY_UNIT_CAP_KEY) or None
+    building_ids, visible = building_gate_or_hidden(
+        list_building_ids_with_capability(MY_UNIT_CAP_KEY)
+    )
     return ToolSchema(
         name=name,
         description=description,
@@ -165,7 +176,7 @@ def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
         result_type="string",
         spell=True,
         spell_display_name=display_name,
-        spell_visible=bool(building_ids),
+        spell_visible=visible,
         building_ids=building_ids,
     )
 
@@ -213,9 +224,14 @@ curl -s -X POST http://localhost:8000/api/mcp/tool-call \
 2. backend.log で `Registered tool from .../<unit>.py (addon=saiverse-stackchan-addon)` が出ているか確認
 3. 機体管理 UI (AddonManager の Stack-chan Vessel パネル) で、 対象機体の「搭載ユニット」 で `<表示名>` を ON
    - `POST /vessels/{id}/capabilities` で per-vessel capability が `vessels.db` に保存される
-   - native tool の `schemas()` は spell surface 構築のたびに呼ばれるので、 capability 変更後の reconnect で即時に spell visibility が反映される (= subprocess restart 不要)
+   - **spell visibility / building ゲートは再起動なしで反映される**: `set_vessel_capabilities` が保存後に `vessel_dispatch.reregister_unit_tools()` を呼び、 全 native unit tool の `schemas()` を現在の vessels.db に対して再評価して `spell_visible` / `building_ids` を貼り直す。 `schemas()` は起動時のツール登録で 1 回だけ呼ばれる仕様なので、 この明示的な再登録が無いと capability 変更は再起動まで反映されない (対象は「`MY_UNIT_CAP_KEY` を持つモジュール」= 本手順で必ず定義する定数が識別マーカーになる)。 詳細: `docs/issues/stackchan_unit_capability_requires_restart.md`
 4. その機体の Vessel Building にペルソナを配置、 spell の description に該当する話題を振る (= 「温度教えて」 等)
 5. spell 発動 → 想定値が返答に出るか確認。 失敗時は backend.log の `[sea][spell] Executed get_<unit>_<m> →` 行で実際の戻り値を確認
+
+> 実装前の直叩き検証 (Step 3) や複合アクションの「テスト実行」は capability の
+> spell visibility を経由せず `TOOL_REGISTRY` を直接叩くため、 上記の再登録とは
+> 独立に動きます (テスト実行は persona 文脈を持たないので、 機体を明示指定する
+> と `vessel_dispatch.resolve_vessel` がその機体で capability 判定します)。
 
 ## Pitfalls (既知の落とし穴)
 
@@ -311,6 +327,7 @@ QMP6988 の calibration coefficients のように **device 再起動まで変化
 - **`sonic.py`** — M5Stack 超音波測距ユニット I2C (RCWL-9620、 0x57)。 「write (測距トリガ) → 120 ms wait → 3 byte read → 24-bit raw を /1000 で mm 換算」 だけの**最小サンプル** (CRC も calibration も無し)。 新規 Unit がこの単純パターンに収まるなら sonic.py を雛形にすると速い
 - **`env3.py`** — M5Stack ENV III (温湿度: SHT30 0x44 + 気圧: QMP6988 0x70)。 1 file で「clock stretching enable cmd + 単純 measurement」 (SHT30) と「OTP calibration register 読み出し + cache + Q-format compensation」 (QMP6988) の両パターンを実装。 包括的なサンプル
 - **`servo8.py`** — M5Stack 8Servos Unit (U165、 0x25)。 read を伴わない **write-only 制御系** + 「MODE → 値の 2 段書き込み」 + 引数付き spell (channel / angle / speed) のサンプル
+- **`tof.py`** — M5Stack ToF 測距センサユニット (VL53L1X、 0x29)。 **16-bit レジスタ番地** + **約 40 レジスタの重い初期化** + **機体ごとの init キャッシュ + 測定失敗時の lazy 再初期化** を要する複雑ユニットのサンプル。 sonic (1 コマンド撃って読むだけ) では収まらないデバイスの雛形。 移植元は Pololu VL53L1X Arduino ライブラリ (ST 公式 API STSW-IMG007 準拠)
 
 ## 関連 doc
 

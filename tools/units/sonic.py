@@ -54,7 +54,6 @@ _ADDON_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if _ADDON_ROOT not in sys.path:
     sys.path.insert(0, _ADDON_ROOT)
 
-from hubs.pahub import PaHub, get_pahub_from_params  # noqa: E402
 from vessel_dispatch import resolve_vessel_connection  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -63,6 +62,11 @@ ADDON_NAME = "saiverse-stackchan-addon"
 MCP_QUALIFIED_SERVER = f"{ADDON_NAME}__stackchan"
 MCP_TOOL_WRITE = "i2c_write"
 MCP_TOOL_READ = "i2c_read"
+
+# このユニットの capability キー (vessels.db の per-vessel capabilities で使う名前)。
+# ``vessel_dispatch.reregister_unit_tools`` は「``MY_UNIT_CAP_KEY`` を持つ = 再登録
+# 対象のユニット tool」の識別マーカーとしてこれを見る (README tools/units/ 規約)。
+MY_UNIT_CAP_KEY = "sonic"
 
 # --- M5Stack Ultrasonic Distance Unit I2C (RCWL-9620) ---
 SONIC_ADDR = 0x57
@@ -99,14 +103,18 @@ def _unit_present() -> bool:
     (= 安全側、 搭載なし扱い)。 スキーマ可視性 (``_build_schema``) と同じ
     capability を参照する。
     """
-    from vessel_dispatch import VesselNotAvailable, resolve_vessel
+    from vessel_dispatch import (
+        VesselNotAvailable,
+        resolve_vessel,
+        units_of_type,
+    )
 
     try:
         vessel = resolve_vessel()
     except VesselNotAvailable:
         return False
-    caps = vessel.capabilities or {}
-    return bool(caps.get("sonic"))
+    # 配置 (unit_config) があればそれ、 無ければ legacy capabilities に基づく
+    return bool(units_of_type(vessel, MY_UNIT_CAP_KEY))
 
 
 def _get_mcp_connection():
@@ -148,19 +156,22 @@ def _run_on_mcp_loop(coro, timeout_sec: float = _DEFAULT_TIMEOUT_SEC) -> Any:
 
     loop = _mcp._loop
     if loop is None:
+        # 未スケジュールの coroutine を閉じて "never awaited" 警告を防ぐ。この分岐は
+        # MCP 未起動時のみ通る (schedule 後は loop 所有なので coro には触らない)。
+        coro.close()
         raise RuntimeError("MCP event loop is not initialized")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=timeout_sec)
 
 
 # ============================================================
-# Hub lazy recovery (env3.py / servo8.py と同じ方針)
+# Hub channel select + lazy recovery (env3.py / servo8.py と同じ方針)
 # ============================================================
-# Port A に PaHUB を挟む構成では、 ハブの全 channel が closed 状態
-# (= power-on default / Stack-chan 再起動後 / ハブ付け替え直後) で I2C が失敗
-# する。 各操作で 1 回目試行 → ESP_ERR_* なら hub.open_all_channels() →
-# 2 回目試行、 の lazy recovery に乗せる。 直結 (hub_type=none) なら機構自体
-# スキップして既存挙動と等価。
+# 各 i2c 操作の前に対象ユニットの channel をバスに出す。 共通実装 (channel 解決 +
+# select + i2c-level error 時の再ルーティング再試行) は
+# ``hubs.pahub.execute_with_hub_recovery`` に集約。 本ファイルは i2c-level failure
+# 判定の述語だけを持ち、 薄いラッパで共通実装に渡す。 直結 (hub_type=none) なら
+# 機構自体スキップして既存挙動と等価。
 
 def _payload_has_esp_err(payload: Any) -> bool:
     if not isinstance(payload, dict):
@@ -182,26 +193,16 @@ async def _execute_with_hub_recovery(
     operation: Callable[[], Awaitable[Any]],
     is_i2c_failure: Callable[[Any], bool],
 ) -> Any:
-    hub: Optional[PaHub] = get_pahub_from_params()
-    result = await operation()
+    """このユニット (sonic) の i2c 操作を channel select + lazy recovery 付きで実行。
 
-    if hub is None or not is_i2c_failure(result):
-        return result
+    共通実装は ``pahub.execute_with_hub_recovery``。channel は現在 vessel の sonic
+    配置から解決される (docs/intent/stackchan_unit_placement.md §4)。
+    """
+    from hubs.pahub import execute_with_hub_recovery
 
-    LOGGER.info(
-        "sonic: I2C failure on hub-routed access, "
-        "attempting PaHub recovery (open all channels)"
+    return await execute_with_hub_recovery(
+        operation, is_i2c_failure, MY_UNIT_CAP_KEY
     )
-    recovered = await hub.open_all_channels()
-    if not recovered:
-        LOGGER.warning(
-            "sonic: PaHub recovery (open_all_channels) failed; "
-            "returning original i2c error to caller"
-        )
-        return result
-
-    LOGGER.info("sonic: PaHub recovery succeeded, retrying operation once")
-    return await operation()
 
 
 # ============================================================
@@ -320,10 +321,11 @@ def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
     # 複数機体 (intent 不変条件 #14 ユニット側): 超音波測距ユニットを積んだ機体の
     # Vessel Building でだけ visible。capability は vessels.db の per-vessel 値
     # (機体管理 UI で手動設定)。単一 unit_sonic_enabled toggle をやめる。
-    from vessel_dispatch import list_building_ids_with_capability
+    from vessel_dispatch import building_gate_or_hidden, list_building_ids_with_capability
 
-    building_ids = list_building_ids_with_capability("sonic") or None
-    visible = bool(building_ids)
+    building_ids, visible = building_gate_or_hidden(
+        list_building_ids_with_capability(MY_UNIT_CAP_KEY)
+    )
     return ToolSchema(
         name=name,
         description=description,
@@ -347,7 +349,7 @@ def schemas() -> List[ToolSchema]:
     """
     from vessel_dispatch import list_building_ids_with_capability
 
-    if not list_building_ids_with_capability("sonic"):
+    if not list_building_ids_with_capability(MY_UNIT_CAP_KEY):
         LOGGER.debug(
             "sonic: no vessel declares sonic capability; spells hidden until "
             "set in 機体管理 UI"

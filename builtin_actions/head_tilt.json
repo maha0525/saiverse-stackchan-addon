@@ -1,0 +1,10 @@
+{
+  "id": "head_tilt",
+  "display_name": "首かしげ",
+  "description": "首を横に傾けて考え込むジェスチャー",
+  "steps": [
+    {"type": "parallel", "calls": [{"tool": "move_head", "args": {"yaw": -20, "pitch": 50}}]},
+    {"type": "wait", "duration_ms": 1000},
+    {"type": "parallel", "calls": [{"tool": "move_head", "args": {"yaw": 0, "pitch": 45}}]}
+  ]
+}

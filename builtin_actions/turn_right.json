@@ -1,0 +1,31 @@
+{
+  "id": "turn_right",
+  "display_name": "右回転",
+  "description": "その場で右に回転する（両輪を同じ向きに回す）。duration_ms で回る時間を指定（省略時 600ms）。指定時間が経つと自動で停止する。向きを変えたいときに少しずつ使う。",
+  "parameters": {
+    "duration_ms": {
+      "type": "integer",
+      "default": 600,
+      "min": 100,
+      "max": 3000,
+      "description": "回転する時間（ミリ秒。1000で1秒）"
+    }
+  },
+  "steps": [
+    {
+      "type": "parallel",
+      "calls": [
+        {"tool": "servo8_set_speed", "args": {"channel": 2, "speed": 50}},
+        {"tool": "servo8_set_speed", "args": {"channel": 3, "speed": 50}}
+      ]
+    },
+    {"type": "wait", "duration_ms": "${duration_ms}"},
+    {
+      "type": "parallel",
+      "calls": [
+        {"tool": "servo8_set_speed", "args": {"channel": 2, "speed": 0}},
+        {"tool": "servo8_set_speed", "args": {"channel": 3, "speed": 0}}
+      ]
+    }
+  ]
+}

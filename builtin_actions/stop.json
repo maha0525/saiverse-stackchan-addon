@@ -1,0 +1,14 @@
+{
+  "id": "stop",
+  "display_name": "停止",
+  "description": "両輪（CH2/CH3）をその場で停止する。動いている最中に止めたいときに使う。",
+  "steps": [
+    {
+      "type": "parallel",
+      "calls": [
+        {"tool": "servo8_set_speed", "args": {"channel": 2, "speed": 0}},
+        {"tool": "servo8_set_speed", "args": {"channel": 3, "speed": 0}}
+      ]
+    }
+  ]
+}

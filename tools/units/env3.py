@@ -45,7 +45,6 @@ _ADDON_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if _ADDON_ROOT not in sys.path:
     sys.path.insert(0, _ADDON_ROOT)
 
-from hubs.pahub import PaHub, get_pahub_from_params  # noqa: E402
 from vessel_dispatch import resolve_vessel_connection  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -54,6 +53,11 @@ ADDON_NAME = "saiverse-stackchan-addon"
 MCP_QUALIFIED_SERVER = f"{ADDON_NAME}__stackchan"
 MCP_TOOL_WRITE = "i2c_write"
 MCP_TOOL_READ = "i2c_read"
+
+# このユニットの capability キー (vessels.db の per-vessel capabilities で使う名前)。
+# ``vessel_dispatch.reregister_unit_tools`` は「``MY_UNIT_CAP_KEY`` を持つ = 再登録
+# 対象のユニット tool」の識別マーカーとしてこれを見る (README tools/units/ 規約)。
+MY_UNIT_CAP_KEY = "env3"
 
 # --- SHT30 (温湿度、 0x44) ---
 SHT30_ADDR = 0x44
@@ -118,14 +122,18 @@ def _unit_present() -> bool:
     搭載なし扱い)。 スキーマ可視性 (``_build_schema``) と同じ capability を
     参照するので、 可視な機体では True、 非搭載機体では False に揃う。
     """
-    from vessel_dispatch import VesselNotAvailable, resolve_vessel
+    from vessel_dispatch import (
+        VesselNotAvailable,
+        resolve_vessel,
+        units_of_type,
+    )
 
     try:
         vessel = resolve_vessel()
     except VesselNotAvailable:
         return False
-    caps = vessel.capabilities or {}
-    return bool(caps.get("env3"))
+    # 配置 (unit_config) があればそれ、 無ければ legacy capabilities に基づく
+    return bool(units_of_type(vessel, MY_UNIT_CAP_KEY))
 
 
 def _get_mcp_connection():
@@ -168,23 +176,23 @@ def _run_on_mcp_loop(coro, timeout_sec: float = _DEFAULT_TIMEOUT_SEC) -> Any:
 
     loop = _mcp._loop
     if loop is None:
+        # 未スケジュールの coroutine を閉じて "never awaited" 警告を防ぐ。この分岐は
+        # MCP 未起動時のみ通る (schedule 後は loop 所有なので coro には触らない)。
+        coro.close()
         raise RuntimeError("MCP event loop is not initialized")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=timeout_sec)
 
 
 # ============================================================
-# Hub lazy recovery
+# Hub channel select + lazy recovery
 # ============================================================
-# Stack-chan の Port A に PaHUB を挟む構成では、 ハブの全 channel が closed
-# 状態 (= power-on default、 Stack-chan 再起動後、 ハブ付け替え直後等) で
-# I2C 操作が失敗する。 「起動時に 1 回 init」 では Stack-chan 側の再起動
-# タイミングを SAIVerse 側から検知しきれないので、 各 i2c 操作で:
-#   1 回目試行 → i2c-level error (ESP_ERR_*) が返ったら hub.open_all_channels()
-#   → 2 回目試行 → そのまま結果を返す
-# の lazy recovery 経路に乗せる。 通常運用 (hub が open 状態を維持してる) では
-# 1 回目で成功して余分な往復ゼロ。 直結 (hub_type=none) のときはリカバリ
-# 機構自体スキップして既存挙動と等価。
+# Stack-chan の Port A に PaHUB を挟む構成では、 各 i2c 操作の前に対象ユニットの
+# channel をバスに出す必要がある。 共通実装 (channel 解決 + select + i2c-level
+# error 時の再ルーティング再試行) は ``hubs.pahub.execute_with_hub_recovery`` に
+# 集約されている。 本ファイルは「どの結果が i2c-level failure か」 を判定する
+# 述語だけを持ち、 薄いラッパ ``_execute_with_hub_recovery`` で共通実装に渡す。
+# 直結 (hub_type=none) のときはリカバリ機構自体スキップして既存挙動と等価。
 
 def _payload_has_esp_err(payload: Any) -> bool:
     """i2c_* tool レスポンスに ``ESP_ERR_*`` で始まる error 文字列があるか。
@@ -219,46 +227,17 @@ async def _execute_with_hub_recovery(
     operation: Callable[[], Awaitable[Any]],
     is_i2c_failure: Callable[[Any], bool],
 ) -> Any:
-    """Hub 経由の i2c 操作を lazy recovery 付きで実行。
+    """このユニット (env3) の i2c 操作を channel select + lazy recovery 付きで実行。
 
-    ハブ無し (hub_type=none) なら ``operation`` を 1 回呼んでそのまま返す。
-    ハブ有りで 1 回目が i2c-level failure を返した時のみ
-    ``PaHub.open_all_channels()`` を試みて、 成功したら ``operation`` を
-    もう 1 回呼ぶ。 リカバリ後の結果はそのまま返す (= 2 度目もダメなら user-
-    facing エラーになる、 リトライは 1 回限り)。
-
-    Args:
-        operation: 引数なし async コール (各測定 sequence)。
-        is_i2c_failure: 操作結果から「ハブ起因リカバリ対象か」 を判定する callable。
+    共通実装は ``pahub.execute_with_hub_recovery``。現在 vessel の env3 配置から
+    channel を解決し、ハブ経由なら対象 channel を isolate してから実行する
+    (同アドレスユニット衝突対策。docs/intent/stackchan_unit_placement.md §4)。
     """
-    hub: Optional[PaHub] = get_pahub_from_params()
-    result = await operation()
+    from hubs.pahub import execute_with_hub_recovery
 
-    if hub is None:
-        # 直結構成: リカバリ機構自体スキップして既存挙動と等価
-        return result
-
-    if not is_i2c_failure(result):
-        return result
-
-    LOGGER.info(
-        "env3: I2C failure on hub-routed access (addr=0x%02X), "
-        "attempting PaHub recovery (open all channels)",
-        hub.address,
+    return await execute_with_hub_recovery(
+        operation, is_i2c_failure, MY_UNIT_CAP_KEY
     )
-    recovered = await hub.open_all_channels()
-    if not recovered:
-        # hub への write 自体が通らない → 結線 / アドレス本物の問題なので
-        # オリジナルのエラーをそのまま呼び元に返す (= ユーザーに「ハブ設定 / 配線
-        # を確認してください」 系のメッセージが表示される)
-        LOGGER.warning(
-            "env3: PaHub recovery (open_all_channels) failed; "
-            "returning original i2c error to caller"
-        )
-        return result
-
-    LOGGER.info("env3: PaHub recovery succeeded, retrying operation once")
-    return await operation()
 
 
 # ============================================================
@@ -676,10 +655,11 @@ def _build_schema(name: str, description: str, display_name: str) -> ToolSchema:
     # 複数機体 (intent 不変条件 #14 ユニット側): env3 を積んだ機体の Vessel
     # Building でだけ visible にする。capability は vessels.db の per-vessel 値
     # (機体管理 UI で手動設定)。単一 unit_env3_enabled toggle をやめる。
-    from vessel_dispatch import list_building_ids_with_capability
+    from vessel_dispatch import building_gate_or_hidden, list_building_ids_with_capability
 
-    building_ids = list_building_ids_with_capability("env3") or None
-    visible = bool(building_ids)
+    building_ids, visible = building_gate_or_hidden(
+        list_building_ids_with_capability(MY_UNIT_CAP_KEY)
+    )
     return ToolSchema(
         name=name,
         description=description,
@@ -707,7 +687,7 @@ def schemas() -> List[ToolSchema]:
     """
     from vessel_dispatch import list_building_ids_with_capability
 
-    if not list_building_ids_with_capability("env3"):
+    if not list_building_ids_with_capability(MY_UNIT_CAP_KEY):
         LOGGER.debug(
             "env3: no vessel declares env3 capability; spells hidden until set "
             "in 機体管理 UI"

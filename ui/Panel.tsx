@@ -68,6 +68,14 @@ export default function StackchanVesselPanel({
     personas, addonApiBase, onConfigChanged,
 }: AddonPanelProps) {
     const [debugMode, setDebugMode] = useState(false);
+    // vessel 一覧が変わった (ペアリング追加 / 解除) ことを子セクション間で伝える
+    // カウンタ。 VesselPairingSection が bump し、 DeviceSection がこれを依存に
+    // 入れて再取得する (= 同一パネル内でペアリングした機体が「デバイス操作」の
+    // 機体セレクタに即反映される)。
+    const [vesselsRefreshKey, setVesselsRefreshKey] = useState(0);
+    const bumpVessels = useCallback(
+        () => setVesselsRefreshKey((k) => k + 1), [],
+    );
 
     // localStorage から初期値復元。
     useEffect(() => {
@@ -105,6 +113,7 @@ export default function StackchanVesselPanel({
             <VesselPairingSection
                 addonApiBase={addonApiBase}
                 onConfigChanged={onConfigChanged}
+                onVesselsChanged={bumpVessels}
             />
             <FirmwareFlashSection addonApiBase={addonApiBase} />
             <AvatarSection
@@ -112,7 +121,10 @@ export default function StackchanVesselPanel({
                 addonApiBase={addonApiBase}
                 debugMode={debugMode}
             />
-            <DeviceSection addonApiBase={addonApiBase} />
+            <DeviceSection
+                addonApiBase={addonApiBase}
+                refreshKey={vesselsRefreshKey}
+            />
         </div>
     );
 }
@@ -128,6 +140,23 @@ export default function StackchanVesselPanel({
 // ペアリング済みの Building は select から除外する。 機体ごとに per-vessel の
 // ポート・接続先 URL を表示し、 搭載ユニットを capability トグルで設定する。
 
+// ユニット配置 (docs/intent/stackchan_unit_placement.md)。同アドレスユニットを
+// 別 channel に挿す構成 (ToF ×2 等) を表現する上位モデル。
+interface UnitPlacement {
+    type: string;
+    channel: number | null; // ハブ経由なら 0-7、 直結なら null
+    label: string;
+}
+interface HubConfig {
+    type: "none" | "pahub";
+    addr?: string; // "0x71" 形式 (pahub のみ)
+}
+interface UnitConfig {
+    version?: number;
+    hub: HubConfig;
+    units: UnitPlacement[];
+}
+
 interface VesselSummary {
     vessel_id: string;
     bound_building_id: string;
@@ -141,6 +170,8 @@ interface VesselSummary {
     ws_port: number | null;
     capture_port: number | null;
     capabilities: Record<string, boolean>;
+    // ユニット配置 (v0.11)。未設定なら null (= capabilities から初期表示を導出)。
+    unit_config: UnitConfig | null;
     gateway_ws_url: string;
 }
 
@@ -151,7 +182,241 @@ const CAPABILITY_OPTIONS: { key: string; label: string }[] = [
     { key: "env3", label: "環境センサー (ENV III: 温湿度・気圧)" },
     { key: "servo8", label: "8 サーボユニット (首・腕などの追加サーボ)" },
     { key: "sonic", label: "超音波距離センサー (RCWL-9620)" },
+    { key: "tof", label: "ToF 距離センサー (VL53L1X: レーザー測距)" },
 ];
+
+// ハブアドレス "0x71" → number。 不正なら null。
+function parseHexAddr(s?: string): number | null {
+    if (!s) return null;
+    const n = /^0x/i.test(s) ? parseInt(s, 16) : parseInt(s, 10);
+    return Number.isNaN(n) ? null : n;
+}
+
+// 編集初期状態: unit_config があればそれ、 無ければ capabilities から導出
+// (docs/intent/stackchan_unit_placement.md §9 の fallback)。
+function deriveInitialPlacement(vessel: VesselSummary): {
+    hubType: "none" | "pahub";
+    a0: boolean;
+    a1: boolean;
+    a2: boolean;
+    units: UnitPlacement[];
+} {
+    const uc = vessel.unit_config;
+    if (uc && Array.isArray(uc.units)) {
+        const addr = uc.hub?.type === "pahub" ? parseHexAddr(uc.hub.addr) : null;
+        return {
+            hubType: uc.hub?.type === "pahub" ? "pahub" : "none",
+            a0: addr != null ? (addr & 1) !== 0 : false,
+            a1: addr != null ? (addr & 2) !== 0 : false,
+            a2: addr != null ? (addr & 4) !== 0 : false,
+            units: uc.units.map((u) => ({
+                type: u.type,
+                channel: typeof u.channel === "number" ? u.channel : null,
+                label: u.label ?? "",
+            })),
+        };
+    }
+    const units = Object.entries(vessel.capabilities ?? {})
+        .filter(([, on]) => on)
+        .map(([type]) => ({ type, channel: null as number | null, label: "" }));
+    return { hubType: "none", a0: false, a1: false, a2: false, units };
+}
+
+// 機体ごとのユニット配置エディタ (ハブ + channel + label)。 従来の capability
+// トグルを置換。 保存で POST /vessels/{id}/unit-config → backend が検証 + 再登録。
+function UnitPlacementEditor(props: {
+    vessel: VesselSummary;
+    addonApiBase: string;
+    busy: boolean;
+    setBusy: (b: boolean) => void;
+    setError: (e: string | null) => void;
+    onSaved: () => Promise<void> | void;
+}): React.JSX.Element {
+    const { vessel, addonApiBase, busy, setBusy, setError, onSaved } = props;
+    const [ed, setEd] = useState(() => deriveInitialPlacement(vessel));
+    const [saving, setSaving] = useState(false);
+
+    const patch = (p: Partial<typeof ed>) => setEd((s) => ({ ...s, ...p }));
+    const addUnit = () =>
+        patch({
+            units: [
+                ...ed.units,
+                { type: "tof", channel: ed.hubType === "pahub" ? 0 : null, label: "" },
+            ],
+        });
+    const removeUnit = (i: number) =>
+        patch({ units: ed.units.filter((_, idx) => idx !== i) });
+    const updateUnit = (i: number, u: Partial<UnitPlacement>) =>
+        patch({ units: ed.units.map((x, idx) => (idx === i ? { ...x, ...u } : x)) });
+
+    const save = async () => {
+        setBusy(true);
+        setSaving(true);
+        setError(null);
+        try {
+            const addr = 0x70 | ((ed.a2 ? 4 : 0) | (ed.a1 ? 2 : 0) | (ed.a0 ? 1 : 0));
+            const unit_config = {
+                version: 1,
+                hub:
+                    ed.hubType === "pahub"
+                        ? { type: "pahub", addr: `0x${addr.toString(16)}` }
+                        : { type: "none" },
+                units: ed.units.map((u) => ({
+                    type: u.type,
+                    channel: ed.hubType === "pahub" ? u.channel ?? 0 : null,
+                    label: u.label.trim(),
+                })),
+            };
+            const res = await fetch(
+                `${addonApiBase}/vessels/${encodeURIComponent(vessel.vessel_id)}/unit-config`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ unit_config }),
+                },
+            );
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail ?? `HTTP ${res.status}`);
+            }
+            await onSaved();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(false);
+            setSaving(false);
+        }
+    };
+
+    return (
+        <div style={panelStyles.capabilityBlock}>
+            <div style={panelStyles.subtle}>搭載ユニット配置:</div>
+
+            {/* ハブ設定 */}
+            <div style={panelStyles.placementHubRow}>
+                <label style={panelStyles.capabilityLabel}>
+                    ハブ:{" "}
+                    <select
+                        value={ed.hubType}
+                        disabled={busy}
+                        onChange={(e) =>
+                            patch({ hubType: e.target.value as "none" | "pahub" })}
+                    >
+                        <option value="none">なし (直結)</option>
+                        <option value="pahub">PaHUB (I2C ハブ)</option>
+                    </select>
+                </label>
+                {ed.hubType === "pahub" && (
+                    <span style={panelStyles.placementAddr}>
+                        アドレスパッド:
+                        <label style={panelStyles.placementAddrPad}>
+                            <input
+                                type="checkbox"
+                                checked={ed.a0}
+                                disabled={busy}
+                                onChange={(e) => patch({ a0: e.target.checked })}
+                            />
+                            A0
+                        </label>
+                        <label style={panelStyles.placementAddrPad}>
+                            <input
+                                type="checkbox"
+                                checked={ed.a1}
+                                disabled={busy}
+                                onChange={(e) => patch({ a1: e.target.checked })}
+                            />
+                            A1
+                        </label>
+                        <label style={panelStyles.placementAddrPad}>
+                            <input
+                                type="checkbox"
+                                checked={ed.a2}
+                                disabled={busy}
+                                onChange={(e) => patch({ a2: e.target.checked })}
+                            />
+                            A2
+                        </label>
+                    </span>
+                )}
+            </div>
+
+            {/* ユニット行 */}
+            {ed.units.length === 0 && (
+                <div style={panelStyles.subtle}>(ユニット未登録)</div>
+            )}
+            {ed.units.map((u, i) => (
+                <div key={i} style={panelStyles.placementUnitRow}>
+                    <select
+                        value={u.type}
+                        disabled={busy}
+                        onChange={(e) => updateUnit(i, { type: e.target.value })}
+                    >
+                        {CAPABILITY_OPTIONS.map((c) => (
+                            <option key={c.key} value={c.key}>
+                                {c.label}
+                            </option>
+                        ))}
+                    </select>
+                    {ed.hubType === "pahub" && (
+                        <label style={panelStyles.placementCh}>
+                            ch
+                            <input
+                                type="number"
+                                min={0}
+                                max={7}
+                                disabled={busy}
+                                value={u.channel ?? 0}
+                                onChange={(e) =>
+                                    updateUnit(i, { channel: Number(e.target.value) })}
+                                style={panelStyles.placementChInput}
+                            />
+                        </label>
+                    )}
+                    <input
+                        type="text"
+                        placeholder="ラベル (例: 前方左)"
+                        disabled={busy}
+                        value={u.label}
+                        onChange={(e) => updateUnit(i, { label: e.target.value })}
+                        style={panelStyles.placementLabelInput}
+                    />
+                    <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => removeUnit(i)}
+                        style={panelStyles.placementRemoveBtn}
+                        title="このユニットを外す"
+                    >
+                        ×
+                    </button>
+                </div>
+            ))}
+
+            <div style={panelStyles.placementActions}>
+                <button
+                    type="button"
+                    disabled={busy}
+                    onClick={addUnit}
+                    style={panelStyles.placementAddBtn}
+                >
+                    + ユニット追加
+                </button>
+                <button
+                    type="button"
+                    disabled={busy || saving}
+                    onClick={save}
+                    style={panelStyles.saveBtn}
+                >
+                    {saving ? "保存中…" : "配置を保存"}
+                </button>
+            </div>
+            <div style={panelStyles.subtle}>
+                同じ種類を複数挿す場合はラベル必須・一意 (例: 前方左 / 前方右)。
+                ラベルはペルソナが body_status で確認して呼び出しに使う。
+            </div>
+        </div>
+    );
+}
 
 interface PairResponse {
     vessel_id: string;
@@ -166,10 +431,13 @@ interface BuildingSummary {
 }
 
 function VesselPairingSection({
-    addonApiBase, onConfigChanged,
+    addonApiBase, onConfigChanged, onVesselsChanged,
 }: {
     addonApiBase: string;
     onConfigChanged?: () => void | Promise<void>;
+    // ペアリング追加 / 解除で vessel 一覧が変わったことを親に通知する
+    // (= 「デバイス操作」セクションの機体セレクタを即更新するため)。
+    onVesselsChanged?: () => void;
 }) {
     const [vessels, setVessels] = useState<VesselSummary[] | null>(null);
     const [buildings, setBuildings] = useState<BuildingSummary[]>([]);
@@ -237,6 +505,7 @@ function VesselPairingSection({
             setNewPairing(data);
             setSelectedBuildingId("");
             await fetchVessels();
+            onVesselsChanged?.();
             // AddonConfig.master_token / vessel_building_id を内部更新したので、
             // 親 (AddonManagerModal) に通知して ParamsSection を最新値で再描画。
             try {
@@ -270,6 +539,7 @@ function VesselPairingSection({
             }
             setNewPairing(null);
             await fetchVessels();
+            onVesselsChanged?.();
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -286,37 +556,6 @@ function VesselPairingSection({
         } catch {
             // clipboard 不可な環境 (= 非 secure context 等) は何もしない、
             // ユーザーは textarea から手動で選択コピーできる
-        }
-    };
-
-    // capability トグル: 現在の capabilities をベースに該当 key だけ差し替えて
-    // 全体を POST する (= backend の set_capabilities は dict 全体上書き)。
-    // 成功時のみ fetchVessels で一覧を更新する (= 楽観更新しない、 失敗時に
-    // トグルが実機状態とズレないように)。
-    const commitCapability = async (
-        vessel: VesselSummary, capKey: string, enabled: boolean,
-    ) => {
-        setBusy(true);
-        setError(null);
-        try {
-            const next = { ...(vessel.capabilities ?? {}), [capKey]: enabled };
-            const res = await fetch(
-                `${addonApiBase}/vessels/${encodeURIComponent(vessel.vessel_id)}/capabilities`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ capabilities: next }),
-                },
-            );
-            if (!res.ok) {
-                const body = await res.json().catch(() => null);
-                throw new Error(body?.detail ?? `HTTP ${res.status}`);
-            }
-            await fetchVessels();
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setBusy(false);
         }
     };
 
@@ -401,43 +640,19 @@ function VesselPairingSection({
                                 </button>
                             </div>
 
-                            {/* 搭載ユニット (capability) の手動設定。 ここで ON に
-                                した機体に降りたペルソナにだけ、 対応するユニット
-                                ツール (env3 / servo8 / sonic) が見える。 */}
-                            <div style={panelStyles.capabilityBlock}>
-                                <div style={panelStyles.subtle}>
-                                    搭載ユニット:
-                                </div>
-                                <div style={panelStyles.capabilityRow}>
-                                    {CAPABILITY_OPTIONS.map((cap) => (
-                                        <label
-                                            key={cap.key}
-                                            style={{
-                                                ...panelStyles.capabilityLabel,
-                                                cursor: busy
-                                                    ? "not-allowed"
-                                                    : "pointer",
-                                            }}
-                                            title={cap.label}
-                                        >
-                                            <input
-                                                type="checkbox"
-                                                checked={
-                                                    v.capabilities?.[cap.key]
-                                                    === true
-                                                }
-                                                onChange={(e) =>
-                                                    commitCapability(
-                                                        v, cap.key,
-                                                        e.target.checked,
-                                                    )}
-                                                disabled={busy}
-                                            />
-                                            {cap.label}
-                                        </label>
-                                    ))}
-                                </div>
-                            </div>
+                            {/* 搭載ユニット配置 (ハブ + channel + label)。 ここで
+                                登録した機体に降りたペルソナにだけ対応ユニット
+                                ツールが見える。 同アドレスユニットを別 channel に
+                                挿す構成 (ToF ×2 等) も表現できる
+                                (docs/intent/stackchan_unit_placement.md)。 */}
+                            <UnitPlacementEditor
+                                vessel={v}
+                                addonApiBase={addonApiBase}
+                                busy={busy}
+                                setBusy={setBusy}
+                                setError={setError}
+                                onSaved={fetchVessels}
+                            />
                         </div>
                     ))}
                 </div>
@@ -838,7 +1053,13 @@ function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
 
 // ----- Device section (Phase 4.5-f) -----
 
-function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
+function DeviceSection(
+    { addonApiBase, refreshKey }: { addonApiBase: string; refreshKey: number },
+) {
+    // 対象機体 (複数機体対応、 intent K-7): デバイス操作は機体ごとに別 gateway
+    // なので、 どの機体を操作するか選ぶ。 1 機体なら自動選択、 0 機体なら操作不可。
+    const [vessels, setVessels] = useState<VesselSummary[] | null>(null);
+    const [selectedVesselId, setSelectedVesselId] = useState<string>("");
     // 音量: null = 初期 fetch 未完 / 失敗時は 50 fallback。 fetch 後はユーザー
     // 操作で更新し、 リリース時 (= onMouseUp / onTouchEnd) に POST する。
     const [volume, setVolume] = useState<number | null>(null);
@@ -850,14 +1071,43 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
     // 両方をスキップ)。
     const [touchEnabled, setTouchEnabled] = useState<boolean | null>(null);
 
-    // マウント時 1 回だけ device 状態を fetch。 polling はしない (= 他経路で
-    // 音量変わった場合は AddonManager を開き直すまで Panel の値はズレる、
-    // が実害は次回操作で上書きされるだけ)。
+    // 機体一覧を取得して選択肢にする。 1 機体なら自動選択、 既選択が消えたら
+    // 先頭に付け替える。
     useEffect(() => {
         let cancelled = false;
         (async () => {
             try {
-                const res = await fetch(`${addonApiBase}/device/status`);
+                const res = await fetch(`${addonApiBase}/vessels`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                if (cancelled) return;
+                const vs: VesselSummary[] = data.vessels ?? [];
+                setVessels(vs);
+                if (vs.length > 0) {
+                    setSelectedVesselId((prev) =>
+                        prev && vs.some((v) => v.vessel_id === prev)
+                            ? prev : vs[0].vessel_id);
+                } else {
+                    setSelectedVesselId("");
+                }
+            } catch {
+                if (!cancelled) setVessels([]);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [addonApiBase, refreshKey]);
+
+    // 選択機体の device 状態 (音量) を fetch。 機体未選択ならスキップ。 polling は
+    // しない (= 他経路で音量変わった場合は開き直すまでズレるが、 実害は次回操作で
+    // 上書きされるだけ)。 機体を切り替えたら再 fetch。
+    useEffect(() => {
+        if (!selectedVesselId) { setVolume(null); return; }
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch(
+                    `${addonApiBase}/device/status?vessel_id=${encodeURIComponent(selectedVesselId)}`,
+                );
                 if (!res.ok) {
                     const body = await res.json().catch(() => null);
                     throw new Error(body?.detail ?? `HTTP ${res.status}`);
@@ -883,16 +1133,19 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
             }
         })();
         return () => { cancelled = true; };
-    }, [addonApiBase]);
+    }, [addonApiBase, selectedVesselId]);
 
-    // 頭タッチセンサーの有効状態をマウント時 1 回 fetch。 音量と同様 polling
-    // はしない。 取得失敗時は touchEnabled を null のままにしてトグルを
-    // 無効化する (= 不定値で誤操作させない、 詳細は errorBox に出る)。
+    // 選択機体の頭タッチセンサー有効状態を fetch。 機体未選択ならスキップ。
+    // 音量と同様 polling はしない。 取得失敗時は touchEnabled を null のままに
+    // してトグルを無効化する (= 不定値で誤操作させない、 詳細は errorBox に出る)。
     useEffect(() => {
+        if (!selectedVesselId) { setTouchEnabled(null); return; }
         let cancelled = false;
         (async () => {
             try {
-                const res = await fetch(`${addonApiBase}/device/touch-sensor`);
+                const res = await fetch(
+                    `${addonApiBase}/device/touch-sensor?vessel_id=${encodeURIComponent(selectedVesselId)}`,
+                );
                 if (!res.ok) {
                     const body = await res.json().catch(() => null);
                     throw new Error(body?.detail ?? `HTTP ${res.status}`);
@@ -901,6 +1154,8 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                 if (cancelled) return;
                 if (typeof data?.enabled === "boolean") {
                     setTouchEnabled(data.enabled);
+                } else {
+                    setTouchEnabled(null);
                 }
             } catch (e) {
                 if (!cancelled) {
@@ -909,16 +1164,17 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
             }
         })();
         return () => { cancelled = true; };
-    }, [addonApiBase]);
+    }, [addonApiBase, selectedVesselId]);
 
     const commitVolume = async (v: number) => {
+        if (!selectedVesselId) return;
         setBusy(true);
         setError(null);
         try {
             const res = await fetch(`${addonApiBase}/device/volume`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ volume: v }),
+                body: JSON.stringify({ volume: v, vessel_id: selectedVesselId }),
             });
             if (!res.ok) {
                 const body = await res.json().catch(() => null);
@@ -932,12 +1188,14 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
     };
 
     const clearLeds = async () => {
+        if (!selectedVesselId) return;
         setBusy(true);
         setError(null);
         try {
-            const res = await fetch(`${addonApiBase}/device/leds/clear`, {
-                method: "POST",
-            });
+            const res = await fetch(
+                `${addonApiBase}/device/leds/clear?vessel_id=${encodeURIComponent(selectedVesselId)}`,
+                { method: "POST" },
+            );
             if (!res.ok) {
                 const body = await res.json().catch(() => null);
                 throw new Error(body?.detail ?? `HTTP ${res.status}`);
@@ -950,13 +1208,14 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
     };
 
     const commitTouch = async (enabled: boolean) => {
+        if (!selectedVesselId) return;
         setBusy(true);
         setError(null);
         try {
             const res = await fetch(`${addonApiBase}/device/touch-sensor`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ enabled }),
+                body: JSON.stringify({ enabled, vessel_id: selectedVesselId }),
             });
             if (!res.ok) {
                 const body = await res.json().catch(() => null);
@@ -976,6 +1235,35 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
         <div style={panelStyles.section}>
             <div style={panelStyles.sectionLabel}>デバイス操作</div>
 
+            {/* 機体セレクタ (複数機体対応、 intent K-7)。 操作は選択中の機体に
+                振り分けられる。 0 機体なら操作不可、 1 機体なら表示のみ。 */}
+            {vessels !== null && vessels.length === 0 ? (
+                <div style={panelStyles.muted}>
+                    ペアリング済みの Stack-chan がありません。
+                </div>
+            ) : vessels && vessels.length > 1 ? (
+                <div style={panelStyles.row}>
+                    <label style={panelStyles.label}>機体:</label>
+                    <select
+                        value={selectedVesselId}
+                        onChange={(e) => setSelectedVesselId(e.target.value)}
+                        disabled={busy}
+                        style={panelStyles.select}
+                    >
+                        {vessels.map((v) => (
+                            <option key={v.vessel_id} value={v.vessel_id}>
+                                {v.bound_building_id} ({v.vessel_id.slice(0, 8)}…)
+                                {v.connected ? " 🟢" : " ⚪"}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+            ) : vessels && vessels.length === 1 ? (
+                <div style={panelStyles.subtle}>
+                    機体: {vessels[0].bound_building_id}
+                </div>
+            ) : null}
+
             <div style={panelStyles.row}>
                 <label style={panelStyles.label}>音量:</label>
                 <input
@@ -988,7 +1276,7 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                         commitVolume(Number((e.target as HTMLInputElement).value))}
                     onTouchEnd={(e) =>
                         commitVolume(Number((e.target as HTMLInputElement).value))}
-                    disabled={volume === null || busy}
+                    disabled={volume === null || busy || !selectedVesselId}
                     style={panelStyles.slider}
                 />
                 <span style={panelStyles.volumeValue}>
@@ -1003,7 +1291,7 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                         display: "flex",
                         alignItems: "center",
                         gap: "6px",
-                        cursor: (touchEnabled === null || busy)
+                        cursor: (touchEnabled === null || busy || !selectedVesselId)
                             ? "not-allowed" : "pointer",
                     }}
                 >
@@ -1011,7 +1299,7 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
                         type="checkbox"
                         checked={touchEnabled === true}
                         onChange={(e) => commitTouch(e.target.checked)}
-                        disabled={touchEnabled === null || busy}
+                        disabled={touchEnabled === null || busy || !selectedVesselId}
                     />
                     頭タッチセンサー
                     <span style={panelStyles.subtle}>
@@ -1029,9 +1317,9 @@ function DeviceSection({ addonApiBase }: { addonApiBase: string }) {
             <div style={panelStyles.row}>
                 <button
                     onClick={clearLeds}
-                    disabled={busy}
+                    disabled={busy || !selectedVesselId}
                     style={
-                        busy
+                        busy || !selectedVesselId
                             ? panelStyles.buttonDisabled
                             : panelStyles.buttonSubtle
                     }
@@ -1577,6 +1865,85 @@ const panelStyles: Record<string, React.CSSProperties> = {
         gap: "6px",
         fontSize: "11px",
         color: "var(--text-secondary)",
+    },
+    placementHubRow: {
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: "10px",
+        marginTop: "4px",
+        fontSize: "11px",
+        color: "var(--text-secondary)",
+    },
+    placementAddr: {
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        fontSize: "11px",
+        color: "var(--text-secondary)",
+    },
+    placementAddrPad: {
+        display: "flex",
+        alignItems: "center",
+        gap: "3px",
+    },
+    placementUnitRow: {
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        marginTop: "4px",
+    },
+    placementCh: {
+        display: "flex",
+        alignItems: "center",
+        gap: "3px",
+        fontSize: "11px",
+        color: "var(--text-secondary)",
+    },
+    placementChInput: {
+        width: "44px",
+        fontSize: "11px",
+        padding: "2px 4px",
+    },
+    placementLabelInput: {
+        flex: 1,
+        minWidth: "80px",
+        fontSize: "11px",
+        padding: "2px 6px",
+    },
+    placementRemoveBtn: {
+        padding: "2px 8px",
+        fontSize: "12px",
+        lineHeight: 1,
+        background: "var(--stackchan-danger-strong-bg)",
+        color: "var(--stackchan-danger-soft-fg)",
+        border: "1px solid var(--stackchan-danger-border)",
+        borderRadius: "3px",
+        cursor: "pointer",
+    },
+    placementActions: {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        marginTop: "8px",
+    },
+    placementAddBtn: {
+        padding: "4px 10px",
+        fontSize: "11px",
+        background: "var(--stackchan-panel-bg, transparent)",
+        color: "var(--text-secondary)",
+        border: "1px dashed var(--border-color)",
+        borderRadius: "3px",
+        cursor: "pointer",
+    },
+    saveBtn: {
+        padding: "4px 12px",
+        fontSize: "11px",
+        background: "var(--stackchan-success-strong-bg, var(--accent-color))",
+        color: "var(--stackchan-success-soft-fg, #fff)",
+        border: "1px solid var(--stackchan-success-border, var(--accent-color))",
+        borderRadius: "3px",
+        cursor: "pointer",
     },
     pairingResult: {
         marginTop: "8px",

@@ -1,0 +1,31 @@
+{
+  "id": "move_backward",
+  "display_name": "後退",
+  "description": "車輪（CH2/CH3）を逆に回して後ろに下がる。duration_ms で下がる時間を指定（省略時 1000ms = 1秒）。指定時間が経つと自動で停止する。",
+  "parameters": {
+    "duration_ms": {
+      "type": "integer",
+      "default": 1000,
+      "min": 100,
+      "max": 3000,
+      "description": "下がる時間（ミリ秒。1000で1秒）"
+    }
+  },
+  "steps": [
+    {
+      "type": "parallel",
+      "calls": [
+        {"tool": "servo8_set_speed", "args": {"channel": 2, "speed": 50}},
+        {"tool": "servo8_set_speed", "args": {"channel": 3, "speed": -50}}
+      ]
+    },
+    {"type": "wait", "duration_ms": "${duration_ms}"},
+    {
+      "type": "parallel",
+      "calls": [
+        {"tool": "servo8_set_speed", "args": {"channel": 2, "speed": 0}},
+        {"tool": "servo8_set_speed", "args": {"channel": 3, "speed": 0}}
+      ]
+    }
+  ]
+}

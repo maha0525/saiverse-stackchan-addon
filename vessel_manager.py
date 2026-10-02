@@ -54,7 +54,7 @@ _BASE_WS_PORT = 8765
 _RECORD_COLUMNS = (
     "vessel_id, bound_building_id, bound_persona_id, hardware_model, "
     "firmware_version, paired_at, last_seen_at, ws_port, capture_port, "
-    "capabilities"
+    "capabilities, unit_config"
 )
 
 
@@ -79,6 +79,9 @@ class VesselRecord:
     ws_port: Optional[int] = None
     capture_port: Optional[int] = None
     capabilities: Optional[Dict[str, Any]] = None
+    # per-vessel「ハブ + チャンネル配置」({version, hub, units})。NULL の間は
+    # capabilities にフォールバックする (vessel_dispatch.effective_units 参照)。
+    unit_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -170,12 +173,18 @@ class VesselManager:
                 )
             # v0.10 マルチ機体: per-vessel のポート (ペアリング時確定・永続) と
             # capability (搭載ユニット集合) カラムを追加 (intent K-3 / K-5)。
+            # unit_config (v0.11): per-vessel の「ハブ + チャンネル配置」JSON
+            # ({version, hub, units})。従来の capabilities (bool 辞書) を包含する
+            # 上位モデル。NULL の間は capabilities + グローバル hub にフォール
+            # バックする (additive・非破壊)。設計: docs/intent/stackchan_unit_placement.md
             for col, ddl in (
                 ("ws_port", "ALTER TABLE vessels ADD COLUMN ws_port INTEGER"),
                 ("capture_port",
                  "ALTER TABLE vessels ADD COLUMN capture_port INTEGER"),
                 ("capabilities",
                  "ALTER TABLE vessels ADD COLUMN capabilities TEXT"),
+                ("unit_config",
+                 "ALTER TABLE vessels ADD COLUMN unit_config TEXT"),
             ):
                 if col not in cols:
                     conn.execute(ddl)
@@ -269,22 +278,17 @@ class VesselManager:
         """
         with self._lock, sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(
-                """
-                SELECT vessel_id, device_token_salt, device_token_hash,
-                       bound_building_id, bound_persona_id, hardware_model,
-                       firmware_version, paired_at, last_seen_at,
-                       ws_port, capture_port, capabilities
-                FROM vessels
-                """
+                "SELECT device_token_salt, device_token_hash, "
+                f"{_RECORD_COLUMNS} FROM vessels"
             ).fetchall()
 
         for row in rows:
-            salt = row[1]
-            expected_hash = row[2]
+            salt = row[0]
+            expected_hash = row[1]
             actual_hash = self._hash_token(salt, token)
             if hmac.compare_digest(actual_hash, expected_hash):
-                # salt/hash (index 1,2) を除いた _RECORD_COLUMNS 順の tuple
-                return self._row_to_record((row[0],) + tuple(row[3:]))
+                # 先頭の salt/hash を除けば _RECORD_COLUMNS 順の tuple
+                return self._row_to_record(tuple(row[2:]))
 
         LOGGER.debug("VesselManager: verify_token no match")
         return None
@@ -312,6 +316,26 @@ class VesselManager:
         with self._lock, sqlite3.connect(self._db_path) as conn:
             cur = conn.execute(
                 "UPDATE vessels SET capabilities = ? WHERE vessel_id = ?",
+                (payload, vessel_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_unit_config(
+        self, vessel_id: str, unit_config: Dict[str, Any]
+    ) -> bool:
+        """機体のユニット配置 ({version, hub, units}) を保存する。
+
+        機体管理 UI の配置エディタから設定する上位モデル。従来の
+        ``set_capabilities`` (bool 辞書) を包含する。ユニット可視性・i2c の
+        チャンネル解決の source になる (docs/intent/stackchan_unit_placement.md)。
+        NULL のうちは ``capabilities`` にフォールバックする
+        (``vessel_dispatch.effective_units``)。
+        """
+        payload = json.dumps(unit_config, ensure_ascii=False)
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "UPDATE vessels SET unit_config = ? WHERE vessel_id = ?",
                 (payload, vessel_id),
             )
             conn.commit()
@@ -490,20 +514,24 @@ class VesselManager:
     # ----- Helpers -----
 
     @staticmethod
+    def _parse_json_dict(raw: Any, field: str, vessel_id: str) -> Optional[Dict[str, Any]]:
+        """TEXT カラムの JSON dict を parse する。壊れていれば None + WARNING。"""
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            LOGGER.warning(
+                "VesselManager: %s JSON 解釈失敗 vessel_id=%s", field, vessel_id
+            )
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
     def _row_to_record(row) -> VesselRecord:
         """``_RECORD_COLUMNS`` 順の row tuple を VesselRecord に変換する。"""
-        caps: Optional[Dict[str, Any]] = None
-        raw_caps = row[9]
-        if raw_caps:
-            try:
-                parsed = json.loads(raw_caps)
-                if isinstance(parsed, dict):
-                    caps = parsed
-            except (json.JSONDecodeError, TypeError):
-                LOGGER.warning(
-                    "VesselManager: capabilities JSON 解釈失敗 vessel_id=%s",
-                    row[0],
-                )
+        caps = VesselManager._parse_json_dict(row[9], "capabilities", row[0])
+        unit_cfg = VesselManager._parse_json_dict(row[10], "unit_config", row[0])
         return VesselRecord(
             vessel_id=row[0],
             bound_building_id=row[1],
@@ -515,6 +543,7 @@ class VesselManager:
             ws_port=row[7],
             capture_port=row[8],
             capabilities=caps,
+            unit_config=unit_cfg,
         )
 
     def _allocate_ports(self, conn: sqlite3.Connection) -> tuple[int, int]:

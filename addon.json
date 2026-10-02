@@ -1,7 +1,13 @@
 {
     "name": "saiverse-stackchan-addon",
-    "display_name": "Stack-chan Vessel",
-    "description": "ペルソナを Stack-chan (M5Stack 製 AI Desktop Robot) の物理身体に降ろす Vessel 統合アドオン。Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作します。詳細設計: docs/intent/stackchan_vessel.md",
+    "display_name": {
+        "ja": "Stack-chan Vessel",
+        "en": "Stack-chan Vessel"
+    },
+    "description": {
+        "ja": "ペルソナを Stack-chan (M5Stack 製 AI Desktop Robot) の物理身体に降ろす Vessel 統合アドオン。Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作します。詳細設計: docs/intent/stackchan_vessel.md",
+        "en": "Vessel integration addon bringing personas into physical bodies of Stack-chan (M5Stack AI Desktop Robot). While inside a Vessel Building, the physical microphone, speaker, servos, camera, and touchscreen serve as the persona's sensory organs. Design: docs/intent/stackchan_vessel.md"
+    },
     "version": "0.4.0",
     "manifest_version": 2,
     "setup_version": 1,
@@ -50,13 +56,6 @@
             "type": "text",
             "default": "8766",
             "advanced": true
-        },
-        {
-            "key": "vessel_building_id",
-            "label": "Vessel Building ID",
-            "description": "Stack-chan に紐付ける Vessel Building の ID。物理身体ツール (move_head / take_photo 等) はこの Building 内に居るペルソナにのみ visible になる (SAIVerse 本体 A-3-c の Building 単位 visibility)。SAIVerse の Building 編集 UI で対象 Vessel Building の BUILDINGID を確認して入力。**未設定の場合、物理身体ツールはどの Building でも visible にならない** ので設定必須。",
-            "type": "text",
-            "placeholder": "b_vessel_stackchan"
         },
         {
             "key": "saiverse_api_host",
@@ -133,10 +132,6 @@
         {
             "event": "persona_exited_building",
             "handler": "avatar_loader:on_persona_exited_building"
-        },
-        {
-            "event": "persona_exited_building",
-            "handler": "vessel_gateways:on_persona_exited_building"
         }
     ]
 }

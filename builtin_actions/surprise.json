@@ -1,0 +1,17 @@
+{
+  "id": "surprise",
+  "display_name": "驚き",
+  "description": "驚いた表情で首を左右に振る",
+  "steps": [
+    {"type": "parallel", "calls": [
+      {"tool": "set_avatar", "args": {"face": "surprised"}},
+      {"tool": "move_head", "args": {"yaw": -15, "pitch": 50}}
+    ]},
+    {"type": "wait", "duration_ms": 200},
+    {"type": "parallel", "calls": [{"tool": "move_head", "args": {"yaw": 15, "pitch": 50}}]},
+    {"type": "wait", "duration_ms": 200},
+    {"type": "parallel", "calls": [{"tool": "move_head", "args": {"yaw": 0, "pitch": 45}}]},
+    {"type": "wait", "duration_ms": 500},
+    {"type": "parallel", "calls": [{"tool": "set_avatar", "args": {"face": "idle"}}]}
+  ]
+}

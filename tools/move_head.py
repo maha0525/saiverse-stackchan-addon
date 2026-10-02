@@ -33,6 +33,7 @@ _ADDON_ROOT = str(Path(__file__).resolve().parent.parent)
 if _ADDON_ROOT not in sys.path:
     sys.path.insert(0, _ADDON_ROOT)
 from vessel_dispatch import (  # noqa: E402
+    building_gate_or_hidden,
     list_vessel_building_ids,
     resolve_vessel_connection,
 )
@@ -67,19 +68,6 @@ def _settle_sec() -> float:
         return _DEFAULT_SETTLE_SEC
 
 
-def _vessel_building_id() -> Optional[str]:
-    """AddonConfig から Vessel Building ID を取得する。"""
-    try:
-        from saiverse.addon_config import get_params
-
-        params = get_params(ADDON_NAME)
-        vbid = params.get("vessel_building_id") if params else None
-        return str(vbid) if vbid else None
-    except Exception:
-        LOGGER.exception("move_head: failed to resolve vessel_building_id")
-        return None
-
-
 async def _call_move_head(yaw: int, pitch: int) -> str:
     """Call the raw ``move_head`` MCP tool, then wait for the head to settle."""
     _vessel, conn = resolve_vessel_connection()
@@ -100,6 +88,9 @@ def _run_on_mcp_loop(coro, timeout_sec: float = _DEFAULT_TIMEOUT_SEC) -> str:
 
     loop = _mcp._loop
     if loop is None:
+        # 未スケジュールの coroutine を閉じて "never awaited" 警告を防ぐ。この分岐は
+        # MCP 未起動時のみ通る (schedule 後は loop 所有なので coro には触らない)。
+        coro.close()
         raise RuntimeError("MCP event loop is not initialized")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=timeout_sec)
@@ -138,11 +129,12 @@ def move_head(yaw: int = 0, pitch: int = 45) -> str:
 
 def schema() -> ToolSchema:
     # 共通身体ツールは全 Vessel Building で visible (どの機体に降りても首は
-    # 振れる、 intent 不変条件 #14 共通ツール側)。機体未登録なら None = 非表示。
-    building_ids = list_vessel_building_ids() or None
-    if not building_ids:
+    # 振れる、 intent 不変条件 #14 共通ツール側)。機体未登録なら
+    # building_gate_or_hidden がセンチネル + spell_visible=False に倒す。
+    building_ids, visible = building_gate_or_hidden(list_vessel_building_ids())
+    if not visible:
         LOGGER.info(
-            "move_head: no vessel registered yet; tool hidden until pairing."
+            "move_head: no vessel registered yet; tool hidden everywhere until pairing."
         )
     return ToolSchema(
         name="move_head",
@@ -173,6 +165,6 @@ def schema() -> ToolSchema:
         result_type="string",
         spell=True,
         spell_display_name="首を動かす",
-        spell_visible=True,
+        spell_visible=visible,
         building_ids=building_ids,
     )

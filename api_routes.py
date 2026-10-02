@@ -826,11 +826,14 @@ from avatar_loader import MCP_QUALIFIED_SERVER  # noqa: E402
 _DEVICE_CALL_TIMEOUT_SEC = 5.0
 
 
-def _call_device_mcp_tool(tool_name: str, args: dict) -> str:
-    """stackchan MCP tool を 1 回呼んで text 結果を返す (sync helper)。
+def _call_device_mcp_tool(tool_name: str, args: dict, *, vessel_id: str) -> str:
+    """指定機体の stackchan MCP tool を 1 回呼んで text 結果を返す (sync helper)。
 
     FastAPI の sync endpoint から呼ばれる。 内部で MCP event loop に coro
-    を投げる。
+    を投げる。 複数機体では機体ごとに別 gateway インスタンス
+    (``{server}:instance:{vessel_id}``) なので、 ``vessel_id`` でその機体の
+    gateway を解決する (旧 ``:global`` 固定は instance_template scope で存在
+    しないため機体に届かなかった、 intent K-7)。
     """
     from tools.mcp_client import (  # type: ignore
         _make_instance_key, get_mcp_manager,
@@ -843,14 +846,17 @@ def _call_device_mcp_tool(tool_name: str, args: dict) -> str:
             status_code=503,
             detail="MCP manager not initialized",
         )
-    instance_key = _make_instance_key(MCP_QUALIFIED_SERVER, persona_id=None)
+    instance_key = _make_instance_key(
+        MCP_QUALIFIED_SERVER, instance_id=vessel_id
+    )
     conn = manager._connections.get(instance_key)
     if conn is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"MCP server '{MCP_QUALIFIED_SERVER}' not connected "
-                "(Vessel addon gateway 未起動か device 未ペアリング)"
+                f"機体 '{vessel_id}' の gateway が未接続です "
+                "(Vessel 未起動か、 ペルソナがまだ Vessel Building に "
+                "降りていない可能性)。"
             ),
         )
     loop = _mcp._loop
@@ -919,17 +925,31 @@ def _parse_mcp_text_as_dict(raw: Any) -> dict:
 class SetDeviceVolumeRequest(BaseModel):
     """音量 (0-100)。 stackchan-mcp の `set_volume` schema と一致。"""
     volume: int
+    vessel_id: str  # 対象機体 (複数機体対応、 intent K-7)
 
 
 @router.get("/device/status")
-def get_device_status() -> dict:
+def get_device_status(vessel_id: str) -> dict:
     """ｽﾀｯｸﾁｬﾝ device の現在状態 (volume / battery / WiFi 等) を取得。
 
-    Panel.tsx のマウント時に 1 回呼び出して音量スライダの初期値に使う。
-    継続的な polling は想定していない。
+    Panel.tsx のマウント時 (機体選択時) に 1 回呼び出して音量スライダの初期値に
+    使う。 継続的な polling は想定していない。 ``vessel_id`` で対象機体を指定。
     """
-    raw = _call_device_mcp_tool("get_device_info", {})
+    raw = _call_device_mcp_tool("get_device_info", {}, vessel_id=vessel_id)
     return _parse_mcp_text_as_dict(raw)
+
+
+@router.get("/device/imu")
+def read_device_imu(vessel_id: str) -> dict:
+    """指定 StackChan のIMUスナップショットを1回取得する。
+
+    加速度は g、ジャイロは deg/s、磁力計は µT。値の連続配信や姿勢推定は
+    別のストリーム機能とし、この endpoint は診断・単発観測専用に保つ。
+    """
+    raw = _call_device_mcp_tool("read_imu", {}, vessel_id=vessel_id)
+    parsed = _parse_mcp_text_as_dict(raw)
+    LOGGER.info("device: read_imu (vessel=%s)", vessel_id)
+    return parsed
 
 
 @router.post("/device/volume")
@@ -940,16 +960,18 @@ def set_device_volume(req: SetDeviceVolumeRequest) -> dict:
             status_code=400,
             detail=f"volume must be 0..100, got {req.volume}",
         )
-    _call_device_mcp_tool("set_volume", {"volume": req.volume})
-    LOGGER.info("device: set_volume %d", req.volume)
+    _call_device_mcp_tool(
+        "set_volume", {"volume": req.volume}, vessel_id=req.vessel_id
+    )
+    LOGGER.info("device: set_volume %d (vessel=%s)", req.volume, req.vessel_id)
     return {"ok": True, "volume": req.volume}
 
 
 @router.post("/device/leds/clear")
-def clear_device_leds() -> dict:
-    """ｽﾀｯｸﾁｬﾝ base RGB LED (12 個) を全消灯。"""
-    _call_device_mcp_tool("clear_leds", {})
-    LOGGER.info("device: clear_leds")
+def clear_device_leds(vessel_id: str) -> dict:
+    """ｽﾀｯｸﾁｬﾝ base RGB LED (12 個) を全消灯。 ``vessel_id`` で対象機体を指定。"""
+    _call_device_mcp_tool("clear_leds", {}, vessel_id=vessel_id)
+    LOGGER.info("device: clear_leds (vessel=%s)", vessel_id)
     return {"ok": True}
 
 
@@ -960,18 +982,22 @@ class SetTouchSensorRequest(BaseModel):
     と一致 (= firmware #314 / stackchan.cc)。
     """
     enabled: bool
+    vessel_id: str  # 対象機体 (複数機体対応、 intent K-7)
 
 
 @router.get("/device/touch-sensor")
-def get_device_touch_sensor() -> dict:
+def get_device_touch_sensor(vessel_id: str) -> dict:
     """ｽﾀｯｸﾁｬﾝ head-touch センサーの有効状態 (NVS 永続) を取得。
 
-    Panel.tsx のマウント時に 1 回呼んでトグルの初期値に使う。 firmware は
-    `{"enabled": bool}` を返す (= stackchan.cc get_touch_sensor_enabled)。
-    非 JSON 等で `enabled` が読めない場合は null + raw を載せて返し、 UI 側で
-    取得失敗を表示できるようにする (= get_device_status と同方針)。
+    Panel.tsx のマウント時 (機体選択時) に 1 回呼んでトグルの初期値に使う。
+    firmware は `{"enabled": bool}` を返す (= stackchan.cc
+    get_touch_sensor_enabled)。 非 JSON 等で `enabled` が読めない場合は null +
+    raw を載せて返し、 UI 側で取得失敗を表示できるようにする (= get_device_status
+    と同方針)。 ``vessel_id`` で対象機体を指定。
     """
-    raw = _call_device_mcp_tool("get_touch_sensor_enabled", {})
+    raw = _call_device_mcp_tool(
+        "get_touch_sensor_enabled", {}, vessel_id=vessel_id
+    )
     parsed = _parse_mcp_text_as_dict(raw)
     return {
         "enabled": bool(parsed.get("enabled")) if "enabled" in parsed else None,
@@ -990,6 +1016,7 @@ def set_device_touch_sensor(req: SetTouchSensorRequest) -> dict:
     """
     raw = _call_device_mcp_tool(
         "set_touch_sensor_enabled", {"enabled": req.enabled},
+        vessel_id=req.vessel_id,
     )
     parsed = _parse_mcp_text_as_dict(raw)
     LOGGER.info("device: set_touch_sensor_enabled %s", req.enabled)
@@ -1007,10 +1034,10 @@ _bootstrap_executors()
 # 自動更新を追加)。
 #
 # 設計判断:
-#   - Phase 1' の single vessel 前提に従い、既にペアリング済み vessel があれば
-#     POST /pair は 409 を返す。ユーザーは DELETE で先に解除する
-#   - AddonConfig.master_token / vessel_building_id はペアリング時に自動更新
-#     (intent doc §Phase 2' 引き継ぎ事項、二重管理の自動同期)
+#   - v0.10 で複数機体対応。同じ Building に既に vessel が居れば POST /pair は
+#     409 を返す (= 二重ペアリング防止)。別 Building へは追加ペアリング可能
+#   - AddonConfig.master_token はペアリング時に自動更新 (gateway env が参照する
+#     共有トークンの同期)。Building ↔ vessel は vessels.db が真実の source
 #   - 解除時に AddonConfig はクリアしない (= 再ペアリング時に上書きされる、
 #     UX で入力欄が空になると不便)
 #   - WebSocket /vessel と firmware 配信は廃止 (gateway は stackchan-mcp、
@@ -1040,16 +1067,24 @@ class PairResponse(BaseModel):
 def _build_gateway_ws_url(ws_port: Optional[int] = None) -> str:
     """device の AP モード設定 UI で入力する Gateway URL を組み立てる。
 
-    AddonConfig から ``vision_host`` (= LAN IP) を読み、 port は引数の
-    ``ws_port`` (= その機体に割り当てた per-vessel ポート、 intent K-3) を
-    優先する。 未指定なら単一 ``gateway_ws_port`` にフォールバック。 複数機体
-    では各 device が自分の機体のポートに繋ぐので、 ペアリングした vessel の
-    ws_port を渡すこと。
+    host は **gateway が実際に bind / advertise する IP と一致させる**ため、
+    ``saiverse.lan_ip.get_local_ip()`` (= gateway env の ``${runtime.lan_ip}``
+    と同一の socket probe) を第一に使う。 auto 検出が失敗したときのみ
+    AddonConfig の手動 ``vision_host`` にフォールバックする。 かつては
+    vision_host を第一に使っていたが、 gateway は runtime.lan_ip で動くため、
+    手動値が古いと URL 表示と実 IP がズレて device が繋がらない (Wi-Fi の IP
+    変動で顕在化した)。 port は per-vessel ``ws_port`` を優先、 未指定なら単一
+    ``gateway_ws_port`` にフォールバック (intent K-3)。
     """
     from saiverse.addon_config import get_params
+    from saiverse.lan_ip import get_local_ip
 
     params = get_params(_ADDON_NAME_FOR_CONFIG)
-    host = (params.get("vision_host") or "").strip() or "<vision_host 未設定>"
+    host = (
+        get_local_ip()
+        or (params.get("vision_host") or "").strip()
+        or "<LAN IP 未検出>"
+    )
     if ws_port is not None:
         port = str(ws_port)
     else:
@@ -1073,6 +1108,9 @@ class VesselSummary(BaseModel):
     ws_port: Optional[int]
     capture_port: Optional[int]
     capabilities: dict
+    # ユニット配置 (ハブ + channel + label)。未設定なら None (= UI は
+    # capabilities から初期表示を組み立てる)。docs/intent/stackchan_unit_placement.md
+    unit_config: Optional[dict]
     gateway_ws_url: str
 
 
@@ -1102,13 +1140,14 @@ def _update_addon_config_after_pair(
     db,
     *,
     master_token: str,
-    vessel_building_id: str,
 ) -> None:
-    """AddonConfig.params_json の master_token / vessel_building_id を更新。
+    """AddonConfig.params_json の master_token を更新。
 
-    intent doc §Phase 2' 引き継ぎ事項に従い、ペアリング操作時に AddonConfig
-    の値も自動で同期する (= mcp_servers.json placeholder の解決経路と
-    vessel_manager の vessels.db の二重管理を解消)。
+    ペアリング操作時に、 gateway env が参照する共有 master_token
+    (mcp_servers.json の ``${addon.saiverse-stackchan-addon.master_token}``)
+    を最新の発行値に同期する。 Building ↔ vessel の紐付けは vessels.db
+    (`bound_building_id`) が真実の source なので、 ここでは扱わない
+    (旧 single-vessel 時代の `vessel_building_id` param は撤去済み)。
 
     既存パターン (api/routes/addon.py:440-445) と同じく AddonConfig 行を
     直接 update する。本体側に汎用 set_param() は追加しない (= addon 個別
@@ -1139,7 +1178,6 @@ def _update_addon_config_after_pair(
             existing = {}
 
     existing["master_token"] = master_token
-    existing["vessel_building_id"] = vessel_building_id
     row.params_json = json.dumps(existing, ensure_ascii=False)
 
 
@@ -1155,7 +1193,7 @@ def pair_vessel(
     2. vessel_manager.create_pairing で vessel_id + device_token 発行
        (token は全機体共通・既存 master_token を再利用、 機体区別はポート)
     3. Building.PHYSICAL_VESSEL_ID + CAPACITY=1 (不変条件 2) 強制
-    4. AddonConfig.master_token / vessel_building_id 自動更新
+    4. AddonConfig.master_token 自動更新
 
     device_token は平文で 1 回だけレスポンスに含まれる。DB には sha256 ハッシュ
     のみが保存されるため、紛失時は再ペアリングが必要。
@@ -1203,29 +1241,36 @@ def pair_vessel(
         _update_addon_config_after_pair(
             db,
             master_token=device_token,
-            vessel_building_id=req.building_id,
         )
 
         db.commit()
         LOGGER.info(
             "pair_vessel: vessel_id=%s building_id=%s persona_id=%s "
-            "(AddonConfig master_token / vessel_building_id auto-updated)",
+            "(AddonConfig master_token auto-updated)",
             vessel_id, req.building_id, req.persona_id,
         )
     finally:
         db.close()
 
-    # AddonConfig 更新が DB に commit された後、 stackchan-mcp gateway
-    # subprocess を新 env で再起動する。 OS プロセスの env は起動時に固定
-    # されるため、 master_token 変更を実 gateway に反映するには subprocess
-    # 再起動が必須 (= さもなければ device は新 token で接続するが gateway
-    # は古い token で 401 reject の連発になる)。
-    #
-    # instance_template では global gateway を起動しない。各機体の gateway は
-    # ペルソナの Vessel Building 入室時に vessel_gateways フックが
-    # register_instance で起動する (intent K-2)。よってペアリング直後の
-    # global reconnect は不要 (= 旧 single-gateway 時代の経路)。
+    # 常時接続モデル (intent K-2): ペアリングした瞬間からこの機体の gateway を
+    # 立てておく。 ペルソナ入室を待たずに、 機体設定 (音量など gateway_config)
+    # や device 接続がすぐ使えるようにするため。 gateway は per-vessel の名前付き
+    # インスタンスなので、 他機体の gateway には影響しない (global reconnect は
+    # 単一 gateway 時代の経路で、 マルチ機体では不要)。 起動失敗は握り潰す
+    # (= ペアリング自体は commit 済みで成功、 gateway は起動時 reconcile や入室
+    # 保険で後追い起動しうる)。
     paired_vessel = vm.get_vessel(vessel_id)
+    if paired_vessel is not None:
+        try:
+            from vessel_gateways import start_vessel_gateway
+
+            start_vessel_gateway(paired_vessel)
+        except Exception:
+            LOGGER.exception(
+                "pair_vessel: failed to start gateway for vessel=%s "
+                "(will be retried by startup reconcile / entry hook)",
+                vessel_id,
+            )
     return PairResponse(
         vessel_id=vessel_id,
         device_token=device_token,
@@ -1325,6 +1370,7 @@ def list_vessels() -> dict:
                 ws_port=r.ws_port,
                 capture_port=r.capture_port,
                 capabilities=r.capabilities or {},
+                unit_config=r.unit_config,
                 # 各 device は自分の機体の per-vessel ポートに繋ぐので、
                 # 機体ごとに ws_port を反映した URL を組み立てる (intent K-3)。
                 gateway_ws_url=_build_gateway_ws_url(ws_port=r.ws_port),
@@ -1340,8 +1386,8 @@ def delete_vessel(
 ) -> dict:
     """ペアリング解除。Building.PHYSICAL_VESSEL_ID を NULL に戻す。
 
-    AddonConfig.master_token / vessel_building_id はクリアしない (= 再ペア
-    リング時に上書きされる、 UX で入力欄が空になると不便)。
+    AddonConfig.master_token はクリアしない (= 再ペアリング時に上書きされる、
+    UX で入力欄が空になると不便)。
     """
     from database.models import Building
 
@@ -1365,6 +1411,18 @@ def delete_vessel(
     finally:
         db.close()
 
+    # 常時接続モデル: gateway を止めるのはペアリング解除のここだけ (退室では
+    # 止めない)。 vessels.db から消す前に停止して、 孤児 subprocess が port を
+    # 掴んだまま残らないようにする。 失敗は握り潰す (= 削除自体は続行)。
+    try:
+        from vessel_gateways import stop_vessel_gateway
+
+        stop_vessel_gateway(vessel_id)
+    except Exception:
+        LOGGER.exception(
+            "delete_vessel: failed to stop gateway for vessel=%s", vessel_id
+        )
+
     deleted = vm.delete_vessel(vessel_id)
     LOGGER.info(
         "delete_vessel: vessel_id=%s building_id=%s deleted=%s",
@@ -1375,9 +1433,9 @@ def delete_vessel(
 
 # 機体管理 UI が手動設定する capability の既知キー (= 搭載ユニット集合)。
 # vessel_dispatch.list_building_ids_with_capability がこのキーで機体を絞り、
-# 対応するユニット由来ツール (env3 / servo8 / sonic) の可視性を決める
+# 対応するユニット由来ツール (env3 / servo8 / sonic / tof) の可視性を決める
 # (intent K-5、 不変条件 #14)。Phase 8' の自動検出もこのキー集合に書く。
-_KNOWN_CAPABILITIES = ("env3", "servo8", "sonic")
+_KNOWN_CAPABILITIES = ("env3", "servo8", "sonic", "tof")
 
 
 class SetCapabilitiesRequest(BaseModel):
@@ -1428,7 +1486,178 @@ def set_vessel_capabilities(
         "set_vessel_capabilities: vessel_id=%s capabilities=%s",
         vessel_id, normalized,
     )
+
+    # capability を変えたら native unit tool を再登録し、spell_visible /
+    # building_ids を現在の vessels.db 値へ更新する (再起動不要化。起動後に ON に
+    # したユニットが再起動までペルソナのスペル一覧に出ない問題の解消。
+    # docs/issues/stackchan_unit_capability_requires_restart.md バグ②)。失敗しても
+    # capability 保存自体は成功しているので 200 を返す (次回起動で反映される)。
+    try:
+        from vessel_dispatch import reregister_unit_tools
+
+        reregister_unit_tools()
+    except Exception:
+        LOGGER.exception(
+            "set_vessel_capabilities: unit tool re-registration failed "
+            "(capability saved; will reflect on next restart)"
+        )
+
     return {"vessel_id": vessel_id, "capabilities": normalized}
+
+
+# ============================================================================
+# Unit 配置 (unit_config): ハブ + チャンネル + ラベル
+# ============================================================================
+# docs/intent/stackchan_unit_placement.md。capabilities (bool 辞書) を包含する
+# 上位モデルで、 同アドレスユニットを別 channel に挿す構成 (ToF ×2 等) を扱う。
+
+
+def _uc_parse_hub_addr(val: Any) -> Optional[int]:
+    """hub addr を int に正規化する ("0x71" / 113 の両方を受ける)。"""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        try:
+            return int(val, 16) if val.lower().startswith("0x") else int(val)
+        except ValueError:
+            return None
+    return None
+
+
+def _validate_unit_config(cfg: Any) -> dict:
+    """UI から来た unit_config を検証して正規化する (docs §11 の a/c ルール)。
+
+    不正なら HTTPException(400)。正常なら ``{version, hub, units}`` を返す。
+    """
+    if not isinstance(cfg, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="unit_config must be an object")
+
+    # --- hub ---
+    hub = cfg.get("hub") or {"type": "none"}
+    if not isinstance(hub, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="hub must be an object")
+    htype = str(hub.get("type") or "none").lower()
+    if htype not in ("none", "pahub"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"unknown hub type: {htype!r} (allowed: none/pahub)")
+    hub_out: dict = {"type": htype}
+    if htype == "pahub":
+        addr = _uc_parse_hub_addr(hub.get("addr"))
+        if addr is None or not 0x70 <= addr <= 0x77:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="hub addr must be in 0x70..0x77")
+        hub_out["addr"] = f"0x{addr:02x}"
+
+    # --- units ---
+    raw_units = cfg.get("units") or []
+    if not isinstance(raw_units, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="units must be a list")
+    units_out: list = []
+    per_type_labels: dict = {}
+    per_type_channels: dict = {}
+    for i, u in enumerate(raw_units):
+        if not isinstance(u, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"units[{i}] must be an object")
+        t = u.get("type")
+        if t not in _KNOWN_CAPABILITIES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"units[{i}]: unknown type {t!r} "
+                                       f"(allowed: {list(_KNOWN_CAPABILITIES)})")
+        label = str(u.get("label") or "").strip()
+        ch = u.get("channel")
+        if htype == "pahub":
+            # 混在禁止 (c): ハブありなら全ユニット channel 必須
+            if not isinstance(ch, int) or isinstance(ch, bool) or not 0 <= ch <= 7:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"units[{i}] ({t}): ハブ使用時は channel (0-7) が必須です",
+                )
+        else:
+            ch = None  # 直結: channel は無視
+        units_out.append({"type": t, "channel": ch, "label": label})
+        per_type_labels.setdefault(t, []).append(label)
+        per_type_channels.setdefault(t, []).append(ch)
+
+    # a: 同 type が 2 件以上なら label 必須 + vessel 内一意
+    for t, labels in per_type_labels.items():
+        if len(labels) >= 2:
+            if any(not lb for lb in labels):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{t} が複数あります。 各ユニットに一意のラベルを付けて"
+                           "ください (例: 前方左 / 前方右)",
+                )
+            if len(set(labels)) != len(labels):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{t} のラベルが重複しています。 一意にしてください",
+                )
+    # 同アドレス衝突防止 (§5): 同 type は別 channel
+    for t, channels in per_type_channels.items():
+        real = [c for c in channels if c is not None]
+        if len(real) >= 2 and len(set(real)) != len(real):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{t} が同じ channel に複数あります。 別 channel に挿して"
+                       "ください (同一アドレスの混線防止)",
+            )
+
+    return {"version": 1, "hub": hub_out, "units": units_out}
+
+
+class SetUnitConfigRequest(BaseModel):
+    """機体のユニット配置 (``{version?, hub, units}``) 一括設定。"""
+    unit_config: dict
+
+
+@router.post("/vessels/{vessel_id}/unit-config")
+def set_vessel_unit_config(
+    vessel_id: str, req: SetUnitConfigRequest,
+) -> dict:
+    """機体のユニット配置 (ハブ + チャンネル + ラベル) を手動設定する。
+
+    capability の bool 辞書を包含する上位モデル。同アドレスユニットを別 channel
+    に挿す構成 (ToF ×2 等) を表現できる (docs/intent/stackchan_unit_placement.md)。
+    保存後に unit tool を再登録して可視性・ゲートを再起動なしで反映する。
+    """
+    vm = get_vessel_manager()
+    if vm.get_vessel(vessel_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Vessel '{vessel_id}' not found",
+        )
+
+    normalized = _validate_unit_config(req.unit_config)
+    ok = vm.set_unit_config(vessel_id, normalized)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Vessel '{vessel_id}' not found (update failed)",
+        )
+    LOGGER.info(
+        "set_vessel_unit_config: vessel_id=%s unit_config=%s",
+        vessel_id, normalized,
+    )
+
+    # 配置を変えたら unit tool を再登録して spell_visible / building_ids を
+    # 再起動なしで反映 (set_vessel_capabilities と同じ理由)。
+    try:
+        from vessel_dispatch import reregister_unit_tools
+
+        reregister_unit_tools()
+    except Exception:
+        LOGGER.exception(
+            "set_vessel_unit_config: unit tool re-registration failed "
+            "(config saved; will reflect on next restart)"
+        )
+
+    return {"vessel_id": vessel_id, "unit_config": normalized}
 
 
 # ============================================================================

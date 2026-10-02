@@ -1,0 +1,10 @@
+{
+  "id": "nod",
+  "display_name": "うなずき",
+  "description": "首を上下に動かしてうなずく",
+  "steps": [
+    {"type": "parallel", "calls": [{"tool": "move_head", "args": {"yaw": 0, "pitch": 60}}]},
+    {"type": "wait", "duration_ms": 300},
+    {"type": "parallel", "calls": [{"tool": "move_head", "args": {"yaw": 0, "pitch": 45}}]}
+  ]
+}
