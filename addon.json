@@ -75,10 +75,10 @@
         },
         {
             "key": "firmware_path",
-            "label": "Firmware merged-binary.bin の path (UI 書き込み用)",
-            "description": "AddonManager UI の「ファームウェア書き込み」ボタンが使う merged-binary.bin の絶対 path。 空欄なら自動検出: (1) <SAIVerse repo>/temp/stackchan-mcp/firmware/build/merged-binary.bin (= ローカル開発者の ESP-IDF build 成果物) → (2) ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/merged-binary.bin (= GitHub Releases から DL した一般ユーザー向け配置場所) の順で fallback。 GPL-3.0 firmware を addon に含めない方針 (intent doc §8)、 一般ユーザーは stackchan-mcp の Releases から DL してください。",
+            "label": "ファームウェアのファイルの場所",
+            "description": "「ファームウェア書き込み」ボタンが使う merged-binary.bin の場所 (絶対 path)。 通常は空欄のままでよい。 空欄なら、 既定の置き場所 (~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/merged-binary.bin) にあるファイルを使う。 自分でビルドしたファームウェアを使いたいときだけ、 そのファイルの場所をここに書く。 ファームウェアは GPL-3.0 のためアドオンには同梱しておらず、 本家 (kisaragi-mochi/stackchan-mcp) の配布ページで、 名前が firmware- で始まるリリースに付いているものを使う。",
             "type": "text",
-            "placeholder": "(空欄 = 自動検出)",
+            "placeholder": "(空欄 = 既定の置き場所を使う)",
             "advanced": true
         },
         {

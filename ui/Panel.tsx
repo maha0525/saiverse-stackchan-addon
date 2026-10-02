@@ -757,11 +757,22 @@ function formatBytes(n: number): string {
     return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+// ファームウェアの入手先 = 本家 (kisaragi-mochi/stackchan-mcp) の配布ページ。
+// merged-binary.bin が付いているのは、 名前が "firmware-" で始まるリリース
+// だけ (ページの一番上に出る「最新」のリリースには付いていないことがある)。
+// backend 側 (api_routes.py の _FIRMWARE_RELEASES_URL) にも同じ URL がある。
+const FIRMWARE_RELEASES_URL =
+    "https://github.com/kisaragi-mochi/stackchan-mcp/releases";
+
+// ファームウェアの既定の置き場所 (= アドオンの永続データの中。 backend の
+// _firmware_default_path() が返す場所)。
+const FIRMWARE_DEFAULT_DIR =
+    "~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/";
+
 function fwInfoSourceLabel(source: FirmwareInfo["source"]): string {
     switch (source) {
-        case "addon_config": return "AddonConfig 設定値";
-        case "local_build": return "ローカルビルド (temp/stackchan-mcp/firmware/build)";
-        case "user_default": return "ユーザー配置 (~/.saiverse/addons/...)";
+        case "addon_config": return "アドオンの詳細設定で指定したファイル";
+        case "user_default": return `既定の置き場所 (${FIRMWARE_DEFAULT_DIR})`;
         case "not_found": return "未検出";
     }
 }
@@ -790,7 +801,7 @@ interface FirmwareInfo {
     exists: boolean;
     size: number | null;
     mtime_iso: string | null;
-    source: "addon_config" | "local_build" | "user_default" | "not_found";
+    source: "addon_config" | "user_default" | "not_found";
 }
 
 function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
@@ -956,7 +967,12 @@ function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
                     ))}
                 </select>
                 <button
-                    onClick={fetchPorts}
+                    onClick={() => {
+                        // ファームウェアを手で置いたあとに警告を消せるよう、
+                        // COM port と一緒にファームウェアの有無も調べ直す。
+                        fetchPorts();
+                        fetchFwInfo();
+                    }}
                     disabled={busy}
                     style={busy ? panelStyles.buttonDisabled : panelStyles.buttonSubtle}
                 >
@@ -968,14 +984,35 @@ function FirmwareFlashSection({ addonApiBase }: { addonApiBase: string }) {
                 <div style={panelStyles.fwInfo}>
                     {fwInfo.source === "not_found" ? (
                         <div style={panelStyles.fwInfoMissing}>
-                            ⚠ merged-binary.bin が見つかりません。
-                            「ファームウェア書き込み」 は利用不可。<br />
-                            <span style={panelStyles.subtle}>
-                                配置 path 候補: (1) AddonConfig.firmware_path で
-                                絶対 path 指定、 (2) &lt;SAIVerse repo&gt;
-                                /temp/stackchan-mcp/firmware/build/、 (3)
-                                ~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/
-                            </span>
+                            ⚠ ファームウェア (merged-binary.bin) が見つかりません。
+                            「ファームウェア書き込み」 は使えません。
+                            <div style={panelStyles.subtle}>
+                                通常は、 アドオンの導入時に自動でダウンロードされます。
+                            </div>
+                            <div style={panelStyles.subtle}>
+                                手で置く場合は、{" "}
+                                <a
+                                    href={FIRMWARE_RELEASES_URL}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    style={panelStyles.fwInfoLink}
+                                >
+                                    {FIRMWARE_RELEASES_URL}
+                                </a>
+                                {" "}のページで、
+                                名前が「firmware-」で始まるリリースに付いている
+                                merged-binary.bin をダウンロードして、
+                                次の場所に置いてください:{" "}
+                                <code style={panelStyles.fwInfoPath}>
+                                    {FIRMWARE_DEFAULT_DIR}merged-binary.bin
+                                </code>
+                            </div>
+                            <div style={panelStyles.subtle}>
+                                自分でビルドしたファームウェアを使う場合は、
+                                アドオンの詳細設定の「ファームウェアのファイルの場所」で、
+                                そのファイルを指定できます。
+                                置いたあとは「再検出」を押すと、 この表示が更新されます。
+                            </div>
                         </div>
                     ) : (
                         <>
@@ -2032,5 +2069,9 @@ const panelStyles: Record<string, React.CSSProperties> = {
     },
     fwInfoMissing: {
         color: "var(--stackchan-warning-fg)",
+    },
+    fwInfoLink: {
+        color: "var(--stackchan-info-soft-fg)",
+        wordBreak: "break-all",
     },
 };

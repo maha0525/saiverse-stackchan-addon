@@ -1666,8 +1666,14 @@ def set_vessel_unit_config(
 #   - 進捗は SSE (text/event-stream)。 EventSource API で frontend は
 #     simple に購読可
 #   - cancel は SSE 切断 = subprocess kill (= asyncio.shield しない)
-#   - firmware path は `~/.saiverse/user_data/addon_data/saiverse-stackchan-
-#     addon/firmware/merged-binary.bin` を default。 自動 DL は Phase 後半で
+#   - 書き込むファームウェア (merged-binary.bin) は GPL-3.0 のためアドオンに
+#     同梱しない。 本家 (kisaragi-mochi/stackchan-mcp) が配っているものを、
+#     アドオンの永続データの中 (`~/.saiverse/user_data/addon_data/saiverse-
+#     stackchan-addon/firmware/merged-binary.bin`) に置いて使う。 探し方は
+#     開発者の PC でもユーザーの PC でも同じで、 `_firmware_resolve_path()`
+#     の 2 段階だけ (設定の firmware_path → 上の既定の置き場所)。 開発者の
+#     PC にだけある場所は探さない (探すと、 配布物が無いという欠陥が開発者
+#     には見えなくなる)
 
 import os
 import shutil
@@ -1676,6 +1682,15 @@ import subprocess
 # NVS partition: stackchan-mcp の partitions/v2/16m.csv 準拠
 _NVS_OFFSET = "0x9000"
 _NVS_SIZE = "0x4000"
+
+# ファームウェアの入手先 = 本家 (kisaragi-mochi/stackchan-mcp) の配布ページ。
+# merged-binary.bin が付いているのは、 名前が "firmware-" で始まるリリース
+# だけである。 ページの一番上に出る「最新」のリリースには付いていないことが
+# あるので、 案内文では必ず「firmware- で始まるリリース」と書く。
+# 画面側 (ui/Panel.tsx の FIRMWARE_RELEASES_URL) にも同じ URL がある。
+_FIRMWARE_RELEASES_URL = (
+    "https://github.com/kisaragi-mochi/stackchan-mcp/releases"
+)
 
 
 def _resolve_esptool_command() -> list[str]:
@@ -1706,24 +1721,36 @@ def _resolve_esptool_command() -> list[str]:
     )
 
 
+def _firmware_default_path() -> Path:
+    """ファームウェアの既定の置き場所を返す (ファイルが在るかは見ない)。
+
+    アドオンの永続データの中の ``firmware/merged-binary.bin``
+    (= ``~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/
+    firmware/merged-binary.bin``)。 アドオンの導入時の自動ダウンロードも、
+    手で置く場合も、 ここに置く。
+    """
+    from saiverse.addon_paths import get_addon_data_dir
+
+    return (
+        get_addon_data_dir(_ADDON_NAME_FOR_CONFIG)
+        / "firmware" / "merged-binary.bin"
+    )
+
+
 def _firmware_resolve_path() -> Optional[Path]:
     """書き込みに使う merged-binary.bin の path を決定する。
 
     優先順位:
-      1. AddonConfig.firmware_path (UI で path 指定) — 設定済みで存在
-         するならそれを返す
-      2. ``<SAIVerse repo>/temp/stackchan-mcp/firmware/build/
-         merged-binary.bin`` (= ローカル開発者の ESP-IDF build 成果物、
-         まはー の手元 fork repo の build dir そのまま参照する。 GPL-3.0
-         firmware を addon に複製しないため、 intent doc §8 と整合)
-      3. ``~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/
-         firmware/merged-binary.bin`` (= 一般ユーザー向け、 GitHub
-         Releases から DL して配置する想定の path、 v2 規約に統一)
+      1. AddonConfig.firmware_path (アドオンの設定で場所を指定) — 設定済み
+         で、 そのファイルが存在するならそれを返す。 自分でビルドした
+         ファームウェアを使いたいとき (開発者を含む) はこれで明示する
+      2. 既定の置き場所 (``_firmware_default_path()``)。 本家の配布ページ
+         から取ってきた merged-binary.bin がここに置かれる
 
-    どれも見つからなければ None を返す (= 呼び出し側で 404 を返す)。
+    開発者の PC でもユーザーの PC でも、 探すのはこの 2 つだけ。 どちらにも
+    無ければ None を返す (= 呼び出し側で 404 を返す)。
     """
     from saiverse.addon_config import get_params
-    from saiverse.addon_paths import get_addon_data_dir
 
     # (1) AddonConfig.firmware_path
     params = get_params(_ADDON_NAME_FOR_CONFIG)
@@ -1733,28 +1760,30 @@ def _firmware_resolve_path() -> Optional[Path]:
         if user_path.exists():
             return user_path
 
-    # (2) repo 配下のローカル build dir
-    # __file__ は ~/.saiverse/... ではなく expansion_data/saiverse-stackchan
-    # -addon/api_routes.py を指す (= addon_loader が spec_from_file_location
-    # で読むため). そこから親 5 階層上 (api_routes.py → addon → expansion
-    # _data → SAIVerse repo root) で repo root を取る。
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    repo_build = (
-        repo_root / "temp" / "stackchan-mcp" / "firmware" / "build"
-        / "merged-binary.bin"
-    )
-    if repo_build.exists():
-        return repo_build
-
-    # (3) 一般ユーザー向け配置場所
-    user_default = (
-        get_addon_data_dir(_ADDON_NAME_FOR_CONFIG)
-        / "firmware" / "merged-binary.bin"
-    )
+    # (2) 既定の置き場所
+    user_default = _firmware_default_path()
     if user_default.exists():
         return user_default
 
     return None
+
+
+def _firmware_not_found_message() -> str:
+    """ファームウェアが見つからないときの案内文を返す (404 の detail 用)。
+
+    画面側の警告 (ui/Panel.tsx の FirmwareFlashSection) と同じ内容を伝える。
+    """
+    return (
+        "ファームウェア (merged-binary.bin) が見つかりません。\n\n"
+        "通常は、 アドオンの導入時に自動でダウンロードされます。\n\n"
+        "手で置く場合は、 下の入手先のページで、 名前が「firmware-」で始まる"
+        "リリースに付いている merged-binary.bin をダウンロードして、 "
+        "下の置き場所に置いてください。\n"
+        f"入手先: {_FIRMWARE_RELEASES_URL}\n"
+        f"置き場所: {_firmware_default_path()}\n\n"
+        "自分でビルドしたファームウェアを使う場合は、 アドオンの詳細設定の"
+        "「ファームウェアのファイルの場所」で、 そのファイルを指定できます。"
+    )
 
 
 class FlashPort(BaseModel):
@@ -1769,16 +1798,17 @@ class FirmwareInfo(BaseModel):
     exists: bool = False
     size: Optional[int] = None
     mtime_iso: Optional[str] = None
-    source: str  # "addon_config" / "local_build" / "user_default" / "not_found"
+    source: str  # "addon_config" / "user_default" / "not_found"
 
 
 @router.get("/flash/firmware-info", response_model=FirmwareInfo)
 def flash_firmware_info() -> FirmwareInfo:
     """書き込みに使われる firmware の情報を返す (UI 表示用)。
 
-    `_firmware_resolve_path()` の解決結果 + どの経路で見つかったかを返す。
-    UI 側で「ローカル build dir を使ってる」 「user_default を使ってる」
-    「未検出」 等を表示できるようにする。
+    `_firmware_resolve_path()` の解決結果 + どこで見つかったかを返す。
+    ``source`` は ``"addon_config"`` (設定の firmware_path で指定された
+    ファイル) / ``"user_default"`` (既定の置き場所) / ``"not_found"``
+    (どちらにも無い) の 3 つ。
     """
     from datetime import datetime, timezone
     from saiverse.addon_config import get_params
@@ -1787,13 +1817,13 @@ def flash_firmware_info() -> FirmwareInfo:
     if fw_path is None:
         return FirmwareInfo(source="not_found")
 
-    # どの経路で見つかったかを fw_path から逆引きで判定
+    # どこで見つかったかを fw_path から逆引きで判定
     params = get_params(_ADDON_NAME_FOR_CONFIG)
     user_path_str = (params.get("firmware_path") or "").strip()
-    if user_path_str and str(fw_path) == user_path_str:
+    # 文字列ではなく Path で比べる。 Windows で設定に "C:/x/y.bin" と書くと
+    # str(Path) は "C:\\x\\y.bin" になり、 文字列の比較では一致しない。
+    if user_path_str and fw_path == Path(user_path_str):
         source = "addon_config"
-    elif "temp" in fw_path.parts and "stackchan-mcp" in fw_path.parts:
-        source = "local_build"
     else:
         source = "user_default"
 
@@ -1995,9 +2025,9 @@ def flash_firmware(
     される。 完了後 device は AP モードで起動するので、 captive portal
     で新規 Wi-Fi + Token 設定が必要。
 
-    firmware_path 指定なしなら ``_firmware_resolve_path()`` で 3 段階の
-    fallback (AddonConfig → ローカル build dir → 一般ユーザー DL 配置)
-    を走らせて使う path を決定する。
+    firmware_path 指定なしなら ``_firmware_resolve_path()`` の 2 段階
+    (アドオンの設定の firmware_path → 既定の置き場所) で使う path を
+    決定する。
     """
     port = _validate_com_port(port)
     if firmware_path:
@@ -2007,16 +2037,7 @@ def flash_firmware(
     if fw_path is None or not fw_path.exists():
         raise HTTPException(
             status_code=404,
-            detail=(
-                "merged-binary.bin が見つかりません。\n\n"
-                "(1) ローカルでビルドするなら "
-                "<SAIVerse repo>/temp/stackchan-mcp/firmware/build/ に "
-                "merged-binary.bin を生成 (`esptool merge-bin` 等)、 "
-                "(2) GitHub Releases から DL する場合は "
-                "~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/ に "
-                "配置してください。 もしくは AddonConfig.firmware_path で "
-                "絶対 path を指定してください。"
-            ),
+            detail=_firmware_not_found_message(),
         )
     # path traversal 簡易チェック (= 任意の path を許す代わりに最低限の
     # validation、 query で渡された場合のみ)
