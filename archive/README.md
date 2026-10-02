@@ -29,10 +29,29 @@ active な開発はしない。将来「stackchan-mcp が満たさない vessel 
 | `firmware/` | M5Stack CoreS3 用の自前ファーム (Arduino + M5Unified + WebSocketsClient)。PCM 直送 + ring buffer 32 KB + rotation buffer 4×32KB + identity-aware unregister 等の Phase 2-D で確立した実装。`dist/` 配下にビルド済み .bin (bootloader / partitions / firmware) あり |
 | `setup_ui/` | Web Serial フラッシュ用の静的 HTML (esptool-js ベース、ブラウザから .bin を書き込み)。v0.5 では SAIVerse CLI が esptool を直接呼ぶ方式に置き換え |
 
-`firmware/` は本ディレクトリには移動できなかった (PlatformIO Home の VS Code
-session が掴んでいる Windows のファイルロック問題)。元の場所 `../firmware/`
-に残っている。後で PlatformIO Home を一旦停止してから archive/ へ移動する
-予定 (移動が間に合わなくても addon の動作には影響しない)。
+### `firmware/` について — 現行のアドオンは使わない
+
+`firmware/` は、stackchan-mcp を採用する前 (2026-05) に自前で書いていた
+ファームウェアである。ライセンスは Apache-2.0。`firmware/dist/` にある
+`bootloader.bin` / `partitions.bin` / `firmware.bin` の 3 つは、そのときの
+ビルド済みファイルで、`setup_ui/` の Web Serial の画面から 3 つのアドレスに
+分けて書き込む形式だった。
+
+**現行のアドオンは、このファームウェアも、この 3 つのファイルも使わない。**
+現行の「ファームウェア書き込み」が使うのは、本家
+(kisaragi-mochi/stackchan-mcp) が配っている `merged-binary.bin` という 1 つの
+ファイルである。こちらは GPL-3.0 のためアドオンには同梱しておらず、アドオン
+の外 (`~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/`)
+に置いて使う (入手のしかたは addon ルートの `../README.md` を参照)。
+
+したがって、`firmware/dist/` の 3 つのファイルを 1 つにまとめても、現行の
+アドオンで使える `merged-binary.bin` にはならない。中身が別のファームウェア
+だからである。
+
+このフォルダは 2026-10 まで addon ルートの `firmware/` に置かれていた
+(2026-05 にこの archive/ を作ったときは、Windows のファイルロックのために
+移動できなかった)。「現行のファームウェアの材料」に見えて紛らわしいので、
+アドオンのバージョン 0.5.0 の準備のときにここへ移した。
 
 ## v0.5 の正規パス
 

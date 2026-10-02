@@ -15,7 +15,8 @@ Thumbs.db
 .venv/
 venv/
 
-# Firmware build artifacts (Phase 5+)
-firmware/.pio/
-firmware/.vscode/
-firmware/build/
+# 旧ファームウェア (archive/firmware/、 現行のアドオンは使わない) を
+# PlatformIO でビルドしたときの中間成果物
+archive/firmware/.pio/
+archive/firmware/.vscode/
+archive/firmware/build/

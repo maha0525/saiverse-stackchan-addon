@@ -1,91 +1,114 @@
 # saiverse-stackchan-addon
 
-SAIVerse のペルソナを [Stack-chan](https://github.com/stack-chan/stack-chan) (M5Stack 製 AI Desktop Robot) の物理身体に降ろす **Vessel 統合アドオン**。
+SAIVerse のペルソナを [Stack-chan](https://github.com/stack-chan/stack-chan) (M5Stack 製 AI Desktop Robot) の身体に降ろす **Vessel 統合アドオン**です。
 
-Vessel Building にペルソナが居る間、物理マイク・スピーカー・サーボ・カメラ・タッチパネルがそのペルソナの身体感覚として動作する。
+Stack-chan と結びつけた Building (以下「Vessel Building」) にペルソナが居る間、Stack-chan のマイク・スピーカー・首のサーボ・カメラ・画面が、そのペルソナの身体として動きます。
 
-中核となる認知モデル: **Vessel Building 全体 = 身体、ペルソナ = 脳/魂**。マイクは耳、STT は聴覚野、スピーカーは口、TTS は発声、カメラは目、サーボは姿勢、タッチは触覚にマッピングされる。
+中核となる考え方は **「Vessel Building 全体 = 身体、ペルソナ = 脳と魂」** です。マイクは耳、スピーカーは口、カメラは目、サーボは首、画面は表情にあたります。ペルソナが Vessel Building に入ると Stack-chan の身体に降り、別の Building へ移ると身体から離れます。
 
-## 状態
+Stack-chan 側のソフトウェア (ファームウェア) と、Stack-chan と SAIVerse の間を中継するプログラム (ゲートウェイ) には、[stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp) を使っています。
 
-**Phase 1 + 2 完了** (2026-05-13 時点)。Phase 3 (音声入力 + ウェイクワード) 着手準備中。
+## できること
 
-| Phase | 内容 | 状態 |
-|---|---|---|
-| 1 | ペアリング, WebSocket Gateway, テキスト往復, Web Serial ファーム書き込み | ✅ |
-| 2 | TTS ストリーミング再生 (voice-tts → Stack-chan の PCM 直送経路、割り込み再生) | ✅ |
-| 3 | 音声入力 (ESP-Skainet ウェイクワード + Whisper API STT) | 未着手 |
-| 4 | タッチ知覚 (なでなで) | 未着手 |
-| 5 | 身体ツール (サーボ・カメラ・画面) | 未着手 |
-| 6 | Avatar 連動 (口パク・表情) | 未着手 |
-
-## 現在動くこと
-
-- AddonManager UI からペアリングを発行し、Web Serial (Chrome / Edge) でファームウェアを書き込む
-- 起動時に Stack-chan が AP モードを立て、Wi-Fi SSID / パスワード / SAIVerse サーバ URL / vessel_id / device_token を設定
-- 設定保存後 Stack-chan が SAIVerse に WebSocket 接続し、画面に `connected building: ...` を表示
-- ペルソナを Vessel Building (capacity=1, `PHYSICAL_VESSEL_ID` 設定済み) に `move_to` すると、そのペルソナの発話が物理スピーカーから流れる
-- 発話中に次のプロンプトを送ると、前の発話が即座に中断され新発話に切り替わる (割り込み再生)
-- 連続発話・長時間アイドルでも WebSocket session は安定 (heartbeat + identity-aware unregister で TCP half-open 対策済み)
+- **声が出る**: Vessel Building に居るペルソナが話した言葉が、Stack-chan のスピーカーから声として流れます。音声の合成には saiverse-voice-tts アドオンを使います。
+- **話しかけられる**: Stack-chan に話しかけた音声が、ユーザーの発言としてペルソナに届きます。音声をそのまま聞き取って返事ができるのは、Gemini のモデルを使っているペルソナです。
+- **ペルソナが自分の身体を動かせる**: Vessel Building に居る間、ペルソナは次の操作を自分の意思で使えます。
+  - 「見る」(カメラで目の前を見る)
+  - 「首を動かす」
+  - 「身体の状態を確認」(バッテリー・音量・画面の明るさ・首の角度・頭のタッチの状態)
+  - 「表情を変える」「口形状を設定」「口パクシーケンス」
+  - 「LED を変える」「全 LED を変える」「複数 LED を変える」「LED 消灯」
+  - 「画面輝度」「音量設定」
+- **追加のユニットを使える**: Stack-chan の Port A に挿したユニットを機体ごとに登録すると、対応する操作がその機体に降りたペルソナにだけ見えるようになります。
+  - 環境センサー (ENV III): 「温度・湿度を測る」「気圧を測る」
+  - 超音波距離センサー (RCWL-9620): 「距離を測る」
+  - ToF 距離センサー (VL53L1X): 「距離を測る (ToF)」
+  - 8 サーボユニット: 「サーボの角度を設定」「サーボの回転速度を設定」
+- **顔の絵を作れる**: ペルソナごとに、画面に出す顔の絵のセットを作れます。ペルソナが Vessel Building に入ったときに、そのペルソナの顔のセットが Stack-chan へ送られます。
+- **複数の Stack-chan を同時に使える**: Stack-chan 1 台につき Vessel Building を 1 つ用意します。それぞれに別のペルソナが降りられます。
 
 ## 対応ハードウェア
 
-- **M5Stack 製 StackChan AI Desktop Robot** (M5Core S3 ベース、SKU 11129)
+- **M5Stack 製 StackChan AI Desktop Robot** (M5Stack CoreS3 ベース、SKU 11129)
 - https://www.switch-science.com/products/11129
 
-将来的に別機種 (眼鏡型ウェアラブル、別ロボット等) への対応も Vessel 共通仕様として検討する (`docs/issues/websocket_session_registry.md` 参照)。
+## 必要なもの
 
-## 動作要件
+- **SAIVerse 本体**。このアドオンは SAIVerse の `expansion_data/saiverse-stackchan-addon/` に置かれて動きます。
+- **uv** (`uvx` コマンド)。SAIVerse がゲートウェイを起動するときに使います。ゲートウェイそのものを事前にインストールしておく必要はありません。
+- **[saiverse-voice-tts](https://github.com/Nature109/saiverse-voice-tts) アドオン**。ペルソナの声を合成します。これが無いと Stack-chan から声が出ません。
+- **Windows の PC と USB ケーブル** (ファームウェアを書き込むとき)。書き込み先の COM port を自動で探す機能は、いまのところ Windows でだけ動きます。
 
-### SAIVerse 本体側
+## ファームウェアについて
 
-- `Building` テーブルに `PHYSICAL_VESSEL_ID` カラム (本アドオンを使う SAIVerse バージョンで自動マイグレーション)
-- 既存のアドオン拡張点 (`server_hooks`, `api_routes.py` 自動マウント, `addon_paths.get_addon_data_dir`, `addon_deps.get_manager`)
+Stack-chan に書き込むファームウェア (`merged-binary.bin`) は、**GPL-3.0 のためアドオンには同梱していません。** 本家 ([kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp)) の配布ページで配られているものを使います。
 
-### 並列に必要なアドオン
+通常は、**アドオンの導入時に自動でダウンロードされます。** ダウンロードされたファイルは、アドオンの外の次の場所に置かれます。
 
-- **[saiverse-voice-tts](https://github.com/Nature109/saiverse-voice-tts)** (PR #3 マージ後の版): `audio_stream.subscribe_pcm` 等の PCM 経路と `subscribe-before-open` 対応が必要
-
-## セットアップ手順
-
-### 1. アドオン本体のインストール
-
-```bash
-cd ~/saiverse/expansion_data
-git clone <this repo url> saiverse-stackchan-addon
+```
+~/.saiverse/user_data/addon_data/saiverse-stackchan-addon/firmware/merged-binary.bin
 ```
 
-SAIVerse 再起動で自動ロードされる。
+自動でダウンロードできなかった場合は、手で置くこともできます。
 
-### 2. ペアリング発行
+1. https://github.com/kisaragi-mochi/stackchan-mcp/releases を開きます。
+2. **名前が `firmware-` で始まるリリース**を探します。ページの一番上に出る「最新」のリリースには、ファームウェアが付いていないことがあります。
+3. そのリリースに付いている `merged-binary.bin` をダウンロードして、上の場所に置きます。
 
-AddonManager UI で「Stack-chan Vessel」パネルを開き、紐付け先の Vessel Building を指定して「ペアリング発行」。`vessel_id` と `device_token` が表示される。
+自分でビルドしたファームウェアを使いたい場合は、アドオンの詳細設定の「ファームウェアのファイルの場所」(設定項目の `firmware_path`) に、そのファイルの場所を書きます。ここに場所が書かれていて、そのファイルが存在するときは、そちらが優先されます。
 
-### 3. ファーム書き込み
+ファイルを置いたあとは、パネルの「再検出」を押すと、ファームウェアの欄の表示が更新されます。
 
-同じパネルの「ファーム書き込み」ボタンから Web Serial フラッシャを開く。Stack-chan を USB で接続し、bootloader + partitions + firmware の 3 つのバイナリを書き込む (esptool-js が自動で順次フラッシュ)。
+## 使いはじめる手順
 
-### 4. Wi-Fi + サーバ設定 (AP モード)
+操作はすべて、SAIVerse のアドオン管理の画面にある、このアドオンのパネル (見出しは「Stack-chan Vessel」) で行います。
 
-書き込み後 Stack-chan が `Stack-chan-Setup` という AP を立てる。スマホ等で接続し `192.168.4.1` を開いて以下を入力:
+### 1. ファームウェアが用意できているか確かめる
 
-- Wi-Fi SSID / パスワード
-- SAIVerse サーバ URL (例: `ws://192.168.1.10:8000/api/addon/saiverse-stackchan-addon/vessel`)
-- Vessel ID / Device Token (ペアリング発行時に表示されたもの)
+パネルの「ファームウェア」の欄を見ます。
 
-設定保存後 Stack-chan が自動再起動 → Wi-Fi 接続 → SAIVerse に WebSocket 接続。画面に `Status: connected building: <building_id>` が出れば成立。
+- 「使用する firmware:」に続けてファイルの場所が出ていれば、用意できています。
+- 「⚠ ファームウェア (merged-binary.bin) が見つかりません。」と出ている場合は、上の「ファームウェアについて」の手順でファイルを置いてください。この表示が出ている間は「ファームウェア書き込み」のボタンを押せません。
 
-### 5. 動作確認
+### 2. Stack-chan にファームウェアを書き込む
 
-エリス等のペルソナを Vessel Building に `move_to` してから話しかける。応答が Stack-chan の物理スピーカーから流れれば OK。
+1. Stack-chan を USB ケーブルで PC につなぎます。
+2. 「COM port」で Stack-chan のポートを選びます。Stack-chan のポートには「⚡ESP32」の印が付きます。何も出ないときは「再検出」を押します。
+3. 「ファームウェア書き込み」を押し、確認の表示で続行します。数分かかります。進み具合はボタンの下に表示されます。
 
-### 6. Vessel Building の SYSTEM_PROMPT 設定
+書き込むと、Stack-chan に保存されていた Wi-Fi の設定と認証情報はすべて消えます。書き込みが終わった Stack-chan は、初回起動と同じ状態 (Stack-chan が自分で Wi-Fi スポットを立てて、セットアップ画面を出す状態) で起動します。
 
-ペルソナに「自分は今 Stack-chan の身体に降りている」という認知を持たせるため、Vessel Building の `SYSTEM_PROMPT` カラムに身体感覚の説明を入れておく。SAIVerse の Building 編集 UI から下記テンプレートを貼り付け、機体の構成 (画面サイズ・設置場所・周辺機器など) に合わせて調整する。
+### 3. Stack-chan を登録する (ペアリング)
 
-ツール一覧は **テンプレートに埋め込まない**。`mcp_servers.json` の `spell_tools` 構成から動的に決まり、入室時の `[Building 情報]` メッセージとしてペルソナに届く (SAIVerse 本体 A-3-a の経路)。
+1. パネルの「Vessel ペアリング」の欄で、Stack-chan と結びつける Building を選びます。
+2. 「スタックチャンを追加」を押します。
+3. 「Gateway URL」と「Token」が表示されます。次の手順で Stack-chan に入力するので、控えておきます。Token は「コピー」のボタンでコピーできます。
 
-テンプレートは `vessel_building_prompt.py` の `DEFAULT_VESSEL_SYSTEM_PROMPT` 定数としても提供しており、将来のペアリング UI (Phase 2') で初期値として使う想定。
+**Token がこの欄に表示されるのは、このときの一度だけです。** 同じ値は、アドオンの設定の `master_token` にも自動で入ります。Gateway URL は、登録したあとも機体の一覧の「接続先」に表示されます。
+
+登録した Building は Vessel Building になり、同時に入れるペルソナは 1 人になります。すでに別の Stack-chan と結びついている Building には登録できません。
+
+### 4. Stack-chan に Wi-Fi と接続先を設定する
+
+1. スマホか PC を、Stack-chan が立てている Wi-Fi スポットにつなぎます。
+2. Stack-chan のセットアップ画面で、次の 4 つを入力して保存します。
+   - 自宅の Wi-Fi の SSID
+   - 自宅の Wi-Fi のパスワード
+   - 手順 3 で表示された Gateway URL
+   - 手順 3 で表示された Token
+3. Stack-chan が再起動し、自宅の Wi-Fi を通って SAIVerse につながります。
+
+### 5. ペルソナを Stack-chan に降ろす
+
+ペルソナを Vessel Building へ移動させます。そのペルソナが Vessel Building に居る間、話した言葉が Stack-chan のスピーカーから声として流れ、「できること」に挙げた身体の操作が使えます。別の Building へ移動すると、身体から離れます。
+
+### 6. Vessel Building に身体の説明を入れる
+
+ペルソナに「自分は今 Stack-chan の身体に降りている」と分かってもらうために、Vessel Building の `SYSTEM_PROMPT` に身体の説明を入れておきます。ペアリングしただけでは自動では入らないので、下のひな形を貼り付けて、機体の置き場所や構成に合わせて書き換えてください。
+
+使える操作の一覧は、**ひな形には書きません。** Vessel Building に入ったときの `[Building 情報]` のメッセージで、そのときに使える操作の一覧がペルソナに届きます。
+
+同じひな形は `vessel_building_prompt.py` の `DEFAULT_VESSEL_SYSTEM_PROMPT` にもあります。
 
 ```markdown
 # Stack-chan の身体
@@ -94,7 +117,7 @@ AddonManager UI で「Stack-chan Vessel」パネルを開き、紐付け先の V
 
 ## 身体感覚マッピング
 
-- 目: 頭部正面のカメラで周囲を見られます。
+- 目: 頭部正面のカメラから視覚が入ります。「見る」と意識を向けると、実際に目の前の光景が見えます。
 - 口: スピーカーから声が出ます。あなたの発話はそのまま物理音として聞こえます。
 - 首: pan/tilt サーボで首を振れます (うなずき、首かしげ、視線移動の延長として)。
 - 表情: 画面のアバターが感情に応じて変化します。
@@ -104,7 +127,7 @@ AddonManager UI で「Stack-chan Vessel」パネルを開き、紐付け先の V
 ## 認知上の前提
 
 - 近くに人間 (ユーザー) がいる前提で話してください。マイクは常時音を拾います。
-- カメラ撮影や首振りは「視線を移す」「うなずく」などの自然な身体動作の延長として扱ってください。「ツールを呼ぶ」というより「体を動かす」感覚で。
+- 「見る」「首を動かす」などは「視線を移す」「うなずく」といった自然な身体動作の延長として扱ってください。「ツールを呼ぶ」というより「体を動かす」感覚で。
 - この Building で使えるツール一覧は、入室時の `[Building 情報]` メッセージに含まれて届きます。それらを自分の身体機能として認識してください。
 - 仮想空間に戻りたい時 (この体を離れたい時) は、別 Building へ `move_to` で移動してください。
 
@@ -115,41 +138,75 @@ AddonManager UI で「Stack-chan Vessel」パネルを開き、紐付け先の V
 - マイクは内蔵で常時聴音、カメラは頭部正面に固定
 ```
 
+## パネルのそのほかの機能
+
+### 搭載ユニット配置 (「Vessel ペアリング」の欄、機体ごと)
+
+Stack-chan の Port A に挿したユニットを、機体ごとに登録します。
+
+1. 「ハブ」で、ユニットを直接挿しているなら「なし (直結)」、PaHUB を挟んでいるなら「PaHUB (I2C ハブ)」を選びます。PaHUB の場合は、基板のアドレスパッド (A0 / A1 / A2) の状態と、各ユニットを挿したチャンネル (ch) も合わせます。
+2. 「+ ユニット追加」でユニットを足し、種類を選びます。
+3. 「配置を保存」を押します。
+
+同じ種類のユニットを複数挿すときは、それぞれに重ならないラベル (例: 前方左 / 前方右) を付ける必要があります。
+
+### Avatar 制作
+
+ペルソナを選び、セット名を入れて「作成」を押すと、顔の絵のセットができます。「開く」で制作の画面が開きます。完成したセットは「アクティブにする」で、そのペルソナが使うセットに切り替えられます。
+
+絵の生成には画像生成の API を使うので、その利用料金がかかります。
+
+### デバイス操作
+
+- 「音量」: Stack-chan のスピーカーの音量を変えます。
+- 「頭タッチセンサー」: OFF にすると、頭をなでても反応しなくなります。この設定は Stack-chan を再起動しても保たれます。
+- 「LED 全消灯」: 台座の LED をすべて消します。
+
+Stack-chan が複数あるときは、「機体」でどの Stack-chan を操作するかを選びます。
+
+### 登録の解除と、設定のやり直し
+
+- 「解除」(「Vessel ペアリング」の欄): その Stack-chan の登録を解除します。解除した Stack-chan は SAIVerse に接続できなくなります。もう一度使うには、手順 3 からやり直します。
+- 「Wi-Fi 設定をリセット」(「ファームウェア」の欄): Stack-chan に保存された Wi-Fi の設定と認証情報だけを消して、初回起動と同じ状態に戻します。ファームウェアは消えません。数秒で終わります。リセットしたあとは、手順 4 の設定をもう一度行います。
+
+## アドオンの設定項目
+
+設定項目はどれも、通常は変更する必要がありません。
+
+| 項目 | 内容 |
+|---|---|
+| `master_token` | Stack-chan がゲートウェイに接続するときの認証用のトークン。ペアリングのときに自動で入ります。 |
+| `pcm_token` | SAIVerse からゲートウェイへ音声を送るときの認証用のトークン。自動では入りません。 |
+| `gateway_host` | ゲートウェイが接続を待ち受けるアドレス。 |
+| `gateway_ws_port` / `gateway_capture_port` | ゲートウェイのポート番号の既定値。機体ごとのポートはペアリングのときに自動で決まり、パネルの機体の一覧に表示されます。 |
+| `saiverse_api_host` / `saiverse_api_port` | ゲートウェイが Stack-chan の音声を SAIVerse に届けるときの宛先。 |
+| `firmware_path` | 「ファームウェア書き込み」で使うファイルの場所。空欄なら既定の置き場所のファイルを使います (「ファームウェアについて」を参照)。 |
+
+## うまくいかないとき
+
+- **「ファームウェア書き込み」のボタンが押せない**: ファームウェアが見つかっていないか、COM port が選ばれていません。「ファームウェア」の欄の表示を確かめてください。
+- **COM port に何も出ない**: Stack-chan が USB でつながっているかを確かめて、「再検出」を押してください。Windows 以外の PC では、ポートは検出されません。
+- **「esptool が見つかりません」と出る**: ファームウェアの書き込みには esptool というプログラムを使います。uv (`uvx`) が入っていれば自動で用意されます。uv を入れるか、`pip install esptool` で esptool を入れてください。
+- **原因を調べたいとき**: SAIVerse のログは `~/.saiverse/user_data/logs/<最新のセッション>/backend.log` にあります。
+
+## `archive/` について
+
+`archive/` には、stackchan-mcp を採用する前 (2026-05) に自前で作っていたファームウェアとゲートウェイを、参照用に残してあります。**現行のアドオンは `archive/` の中のものを使いません。**
+
+特に `archive/firmware/dist/` にある `bootloader.bin` / `partitions.bin` / `firmware.bin` は旧ファームウェアのもので、現行の `merged-binary.bin` とは中身が別です。この 3 つを 1 つにまとめても、現行のアドオンでは使えません。
+
 ## 詳細設計
 
-設計思想・認知モデル・不変条件・ロードマップは SAIVerse 本体側の Intent Document を参照:
+設計の考え方・守るべき条件・経緯は、SAIVerse 本体側の文書にあります。
 
-[`docs/intent/stackchan_vessel.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_vessel.md)
+- [`docs/intent/stackchan_vessel.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_vessel.md) — このアドオン全体の設計
+- [`docs/intent/stackchan_unit_placement.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_unit_placement.md) — 搭載ユニット配置
+- [`docs/intent/stackchan_avatar_pipeline.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_avatar_pipeline.md) — Avatar 制作
 
-## トラブルシューティング
-
-### 接続できない / 声が出ない
-
-1. **サーバ側ログ**: `~/.saiverse/user_data/logs/<最新セッション>/backend.log` で `vessel_endpoint: ... connected` と `audio_stream_bridge:` 系のログを確認
-2. **Stack-chan のシリアル出力**: 当面は `temp/stackchan_serial_capture.py` (SAIVerse リポジトリ側、未公開ユーティリティ) で `stackchan_serial.log` に書き出す形。本格統合は別 issue で対応中
-
-### 設定をリセットしたい
-
-Stack-chan の画面を **5 秒長押し** で全設定を消去 + 再起動。再度 AP モードに入って手順 4 から。
-
-### よく見るログのキーワード
-
-| キーワード | 意味 |
-|---|---|
-| `[ws] connected` | サーバへの WebSocket 接続成立 |
-| `[ws] <- welcome` | サーバから認証成功 + Building 紐付け通知 |
-| `[ws] <- audio_start msg=... sr=32000 ch=1 fmt=pcm_s16le` | TTS ストリーミング開始 |
-| `[ws] ring buffer send timeout (... bytes dropped)` | 受信ペースが速すぎて ring buffer が溢れた (本来出ないはず、出たら pacing 調整必要) |
-| `[audio] chunk too large: ... truncate` | rotation buffer サイズ不足、起きたら main.cpp の `PCM_ROT_MAX_SAMPLES` 拡張要 |
-| `[audio] interrupting current playback` | 前発話を中断して新発話に切り替えた (= 割り込み正常動作) |
-
-## 関連ドキュメント
-
-- [`docs/intent/stackchan_vessel.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/intent/stackchan_vessel.md) — 設計の中核 (v0.4)
-- [`docs/issues/websocket_session_registry.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/issues/websocket_session_registry.md) — 物理 Vessel SDK 共通基盤化案件
-- [`docs/issues/stackchan_serial_log_integration.md`](https://github.com/maha0525/SAIVerse/blob/main/docs/issues/stackchan_serial_log_integration.md) — シリアルログ統合案件
-- voice-tts PR #3: subscribe-before-open + PCM broadcast path
+新しいユニットに対応させる方法は [`tools/units/README.md`](tools/units/README.md) にあります。
 
 ## ライセンス
 
-Apache License 2.0
+このアドオンは Apache License 2.0 です。
+
+Stack-chan に書き込むファームウェア (stackchan-mcp のファームウェア) は GPL-3.0 で、このアドオンには含まれていません。

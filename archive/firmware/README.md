@@ -1,4 +1,13 @@
-# Stack-chan Vessel Firmware
+# Stack-chan Vessel Firmware (旧・自前ファームウェア)
+
+> **これは現行のアドオンが使うファームウェアではない。** stackchan-mcp を
+> 採用する前 (2026-05) に自前で書いていたファームウェアを、参照用に残して
+> あるものである。現行の「ファームウェア書き込み」が使うのは、本家
+> (kisaragi-mochi/stackchan-mcp) が配っている `merged-binary.bin` で、この
+> フォルダの `dist/` にある 3 つのファイルとは中身が別である。経緯は
+> `../README.md`、現行の入手のしかたは addon ルートの `../../README.md` を
+> 参照。以下は当時の記述のままで、書かれている手順は現行のアドオンでは
+> 使えない。
 
 SAIVerse Stack-chan Vessel アドオン用 ESP32-S3 ファームウェア。
 
@@ -71,4 +80,4 @@ cp .pio/build/m5stack-cores3/firmware.bin   ../dist/
 
 Apache License 2.0 (Stack-chan エコシステムと整合)。
 
-依存ライブラリのライセンス: `../NOTICE` を参照。
+依存ライブラリのライセンス: `../../NOTICE` を参照。
