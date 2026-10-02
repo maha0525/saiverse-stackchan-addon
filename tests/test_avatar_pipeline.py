@@ -68,9 +68,9 @@ class AvatarPipelineStorageTests(unittest.TestCase):
         # avatar_pipeline モジュールを fresh ロード。
         self.ap = _load_avatar_pipeline()
 
-        # get_addon_storage_path を patch して tempdir を返す。
+        # get_addon_data_dir を patch して tempdir を返す。
         self._patch = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch.start()
@@ -288,7 +288,7 @@ class StageExecutorHookTests(unittest.TestCase):
 
         self.ap = _load_avatar_pipeline()
         self._patch = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch.start()
@@ -361,9 +361,9 @@ class ApiRoutesTests(unittest.TestCase):
         self.api = _load_api_routes()
         self.ap = sys.modules["avatar_pipeline"]
 
-        # avatar_pipeline の get_addon_storage_path を patch。
+        # avatar_pipeline の get_addon_data_dir を patch。
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -564,7 +564,7 @@ class AvatarGeneratorTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -832,7 +832,7 @@ class AvatarFinalizerTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -1269,7 +1269,7 @@ class ZipImportTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -1459,15 +1459,15 @@ class AvatarLoaderActiveSetTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
         self.addCleanup(self._patch_storage.stop)
 
-        # avatar_loader 内の get_addon_storage_path も patch (= 同名 import で別 module attribute)。
+        # avatar_loader 内の get_addon_data_dir も patch (= 同名 import で別 module attribute)。
         self._patch_loader_storage = patch.object(
-            self.loader, "get_addon_storage_path",
+            self.loader, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_loader_storage.start()
@@ -1512,7 +1512,7 @@ class QualityAspectRatioTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -2033,7 +2033,7 @@ class UploadFaceImageTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -2187,7 +2187,7 @@ class CacheBusterTouchTests(unittest.TestCase):
         )
 
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
@@ -2272,7 +2272,7 @@ class PerSetExecutionLockTests(unittest.TestCase):
 
         self.ap = _load_avatar_pipeline()
         self._patch_storage = patch.object(
-            self.ap, "get_addon_storage_path",
+            self.ap, "get_addon_data_dir",
             lambda addon_name: self.storage_root,
         )
         self._patch_storage.start()
