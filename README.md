@@ -84,19 +84,23 @@ Stack-chan に書き込むファームウェア (`merged-binary.bin`) は、**GP
 2. 「スタックチャンを追加」を押します。
 3. 「Gateway URL」と「Token」が表示されます。次の手順で Stack-chan に入力するので、控えておきます。Token は「コピー」のボタンでコピーできます。
 
-**Token がこの欄に表示されるのは、このときの一度だけです。** 同じ値は、アドオンの設定の `master_token` にも自動で入ります。Gateway URL は、登録したあとも機体の一覧の「接続先」に表示されます。
+**Token がこの欄に表示されるのは、このときの一度だけです。** 同じ値は、アドオンの設定の `master_token` にも自動で入ります。Token はすべての Stack-chan で共通です。2 台目以降をペアリングしたり、同じ Stack-chan をペアリングし直したりしても、Token は 1 台目のときと同じ値のままで、ほかの Stack-chan の設定をやり直す必要はありません。Gateway URL は、登録したあとも機体の一覧の「接続先」に表示されます。
 
 登録した Building は Vessel Building になり、同時に入れるペルソナは 1 人になります。すでに別の Stack-chan と結びついている Building には登録できません。
 
 ### 4. Stack-chan に Wi-Fi と接続先を設定する
 
 1. スマホか PC を、Stack-chan が立てている Wi-Fi スポットにつなぎます。
-2. Stack-chan のセットアップ画面で、次の 4 つを入力して保存します。
-   - 自宅の Wi-Fi の SSID
-   - 自宅の Wi-Fi のパスワード
-   - 手順 3 で表示された Gateway URL
-   - 手順 3 で表示された Token
-3. Stack-chan が再起動し、自宅の Wi-Fi を通って SAIVerse につながります。
+2. Stack-chan のセットアップ画面を開きます。画面は「Wi-Fi」と「Advanced」の二つのタブに分かれていて、**接続先と Token は「Advanced」タブにあります。保存のボタンもタブごとに別です。**
+3. 先に「Advanced」タブを開いて、次の二つを入れ、そのタブの保存のボタンを押します。「Configuration saved」と出れば保存できています。
+   - 「WebSocket Gateway URL」: 手順 3 で表示された Gateway URL
+   - 「Gateway Token」: 手順 3 で表示された Token
+4. 「Wi-Fi」タブで自宅の Wi-Fi を選び、パスワードを入れて接続します。
+5. Stack-chan が自宅の Wi-Fi を通って SAIVerse につながります。
+
+セットアップ画面を開き直すと、「Gateway Token」の欄はいつも空で表示されます。保存した Token を画面に出さない作りのためで、保存できていれば欄の中に薄い字で「トークン設定済み」と出ます。「WebSocket Gateway URL」の欄は、保存できていれば値が入った状態で表示されます。
+
+**接続先は必ず入れてください。** 接続先が空のままだと、Stack-chan は家の LAN の中から接続先を自動で探します。Stack-chan を複数台使っている場合、別の Stack-chan 用の接続先につながってしまうことがあります。
 
 ### 5. ペルソナを Stack-chan に降ろす
 

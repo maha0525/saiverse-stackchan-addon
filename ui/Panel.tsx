@@ -34,7 +34,8 @@ interface AddonPanelProps {
     /**
      * Panel 内部で AddonConfig を書き換えた場合に呼ぶ callback。
      * 呼ぶと親 AddonManagerModal が再 fetch して ParamsSection を最新値で
-     * 再描画する。 ペアリング操作 (master_token rotate) で必須。
+     * 再描画する。 ペアリング操作 (1 台目のペアリングで master_token が
+     * 新しく入る) のあとに呼ぶ。
      */
     onConfigChanged?: () => void | Promise<void>;
 }
@@ -506,8 +507,9 @@ function VesselPairingSection({
             setSelectedBuildingId("");
             await fetchVessels();
             onVesselsChanged?.();
-            // AddonConfig.master_token / vessel_building_id を内部更新したので、
-            // 親 (AddonManagerModal) に通知して ParamsSection を最新値で再描画。
+            // ペアリングで AddonConfig.master_token を書いた (1 台目なら新しい値、
+            // 2 台目以降は既存と同じ値) ので、 親 (AddonManagerModal) に通知して
+            // ParamsSection を最新値で再描画。
             try {
                 await onConfigChanged?.();
             } catch {

@@ -1128,11 +1128,13 @@ def _update_addon_config_after_pair(
     *,
     master_token: str,
 ) -> None:
-    """AddonConfig.params_json の master_token を更新。
+    """AddonConfig.params_json に master_token を書く。
 
     ペアリング操作時に、 gateway env が参照する共有 master_token
     (mcp_servers.json の ``${addon.saiverse-stackchan-addon.master_token}``)
-    を最新の発行値に同期する。 Building ↔ vessel の紐付けは vessels.db
+    にペアリングで使った値を書く。 2 台目以降は pair_vessel が既存の
+    master_token を使い回すので、 書く値は元と同じ (= 実質は変わらない)。
+    新しい値になるのは 1 台目のペアリング (master_token がまだ無いとき) だけ。 Building ↔ vessel の紐付けは vessels.db
     (`bound_building_id`) が真実の source なので、 ここでは扱わない
     (旧 single-vessel 時代の `vessel_building_id` param は撤去済み)。
 
@@ -1231,10 +1233,15 @@ def pair_vessel(
         )
 
         db.commit()
+        # 実際に起きたほうだけを書く。 既存の master_token を使い回したときに
+        # 「更新した」と書くと、 読んだ人が「Token が変わった (他の機体の
+        # Token も古くなった)」と誤解する (2026-10-04 に実際に誤読した)。
         LOGGER.info(
             "pair_vessel: vessel_id=%s building_id=%s persona_id=%s "
-            "(AddonConfig master_token auto-updated)",
+            "master_token=%s",
             vessel_id, req.building_id, req.persona_id,
+            "reused (unchanged, shared by all vessels)" if existing_master
+            else "generated (first pairing)",
         )
     finally:
         db.close()
