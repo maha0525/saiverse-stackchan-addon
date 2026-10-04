@@ -45,6 +45,7 @@ if _PACK_DIR not in sys.path:
     sys.path.insert(0, _PACK_DIR)
 
 from saiverse.addon_deps import get_manager  # noqa: E402
+from saiverse.occupancy_manager import is_redirect_notice  # noqa: E402
 from vessel_manager import get_vessel_manager  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -87,8 +88,15 @@ def _drain_stream_sync(stream) -> None:
     経路 (= 通常のチャット履歴 streaming) でユーザーに届く。
     """
     try:
-        for _chunk in stream:
-            pass
+        for chunk in stream:
+            # 本体が発言を断ったとき (現在地の照合など) は、 エラーの JSON
+            # イベントが 1 つ流れて終わる。 ここで捨てるとログに何も残らず、
+            # 機体に話しかけた人からは「返事が来ない」としか見えない。
+            if '"type": "error"' in str(chunk):
+                LOGGER.warning(
+                    "audio_input_relay: SAIVerse refused the device voice: %s",
+                    str(chunk).strip(),
+                )
     except Exception:
         LOGGER.exception("audio_input_relay: stream drain raised")
 
@@ -235,6 +243,45 @@ async def receive_device_audio(request: Request) -> dict:
         "<system>ｽﾀｯｸﾁｬﾝから音声入力を受信しました。"
         "添付の音声を聴いて応答してください。</system>"
     )
+
+    # --- 発言契機入室 ---
+    # 機体に話しかけたユーザーは、 その機体の Vessel Building にいる。 SAIVerse
+    # 本体は「ユーザーは自分がいる Building にだけ発言できる」を守っていて、
+    # 画面から別の Building へ発言したときは /chat/utter が先にユーザーを
+    # 移してから発言を届ける (docs/intent/building_memory_unified.md §C-2
+    # 「発言した瞬間に入室」)。 機体の声も同じ手順を通す。 これが無いと、
+    # 画面で別の Building を開いている間は、 声が現在地の照合で断られる。
+    target_building_id = vessel.bound_building_id
+    current_building_id = manager.state.user_current_building_id
+    if current_building_id != target_building_id:
+        LOGGER.info(
+            "audio_input_relay: moving user %s -> %s before injecting device "
+            "voice (vessel=%s)",
+            current_building_id, target_building_id, vessel.vessel_id,
+        )
+        moved, move_msg = await asyncio.to_thread(
+            manager.move_user, target_building_id,
+        )
+        if not moved:
+            LOGGER.warning(
+                "audio_input_relay: could not move user to %s, device voice "
+                "not delivered: %s", target_building_id, move_msg,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Could not move the user to the vessel building: {move_msg}",
+            )
+        if is_redirect_notice(move_msg):
+            # Region の入口で止まった (docs/intent/region.md §2.5)。 内部のつもり
+            # の発言を入口で言わせないため、 /chat/utter と同じく送らない。
+            LOGGER.warning(
+                "audio_input_relay: move to %s stopped at an entrance, device "
+                "voice not delivered: %s", target_building_id, move_msg,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Moving to the vessel building stopped at an entrance: {move_msg}",
+            )
 
     try:
         stream = manager.handle_user_input_stream(
