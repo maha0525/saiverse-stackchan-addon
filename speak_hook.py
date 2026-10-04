@@ -52,8 +52,10 @@ LOGGER = logging.getLogger(__name__)
 
 ADDON_NAME = "saiverse-stackchan-addon"
 
-# voice-tts の PCM サンプルレート。GPT-SoVITS の出力に合わせて 32 kHz。
-# stackchan-mcp gateway 側で 16 kHz にリサンプルされる。
+# voice-tts の PCM サンプルレートの既定値 (GPT-SoVITS の出力の 32 kHz)。
+# 実際の値はエンジンごとに違う (OpenAI / ElevenLabs は 24 kHz) ので、
+# 発話ごとに voice-tts の get_pcm_stream_info から読む。読めなかったときだけ
+# この値を使う。stackchan-mcp gateway は受け取った値から 16 kHz にリサンプルする。
 _VOICE_TTS_SAMPLE_RATE = 32000
 
 
@@ -159,6 +161,36 @@ def _load_addon_params() -> dict:
             "stackchan speak_hook: failed to load addon params: %s", exc
         )
         return {}
+
+
+def _resolve_sample_rate(get_pcm_stream_info, message_id: str, default: int) -> int:
+    """この発話の PCM のサンプルレートを voice-tts から読む。
+
+    読めないとき (voice-tts が古く get_pcm_stream_info を持たない、または
+    stream の情報がまだ無い) は ``default`` を返す。
+    """
+    if get_pcm_stream_info is None:
+        return default
+    try:
+        info = get_pcm_stream_info(message_id)
+    except Exception as exc:
+        LOGGER.warning(
+            "stackchan speak_hook[%s]: get_pcm_stream_info failed: %s; "
+            "falling back to %d Hz",
+            message_id, exc, default,
+        )
+        return default
+    if not info:
+        LOGGER.warning(
+            "stackchan speak_hook[%s]: PCM stream info unavailable; "
+            "falling back to %d Hz",
+            message_id, default,
+        )
+        return default
+    sample_rate = int(info[0])
+    if sample_rate <= 0:
+        return default
+    return sample_rate
 
 
 def _wait_first_chunk(queue, timeout_s: float = 60.0) -> bytes | None:
@@ -387,7 +419,7 @@ def _post_pcm_in_background(
                         message_id, _time.monotonic() - wait_start,
                     )
 
-        subscribe_pcm, _ = _load_voice_tts_subscribe()
+        subscribe_pcm, get_pcm_stream_info = _load_voice_tts_subscribe()
         if subscribe_pcm is None:
             return
 
@@ -420,6 +452,13 @@ def _post_pcm_in_background(
                 message_id,
             )
             return
+
+        # 最初の chunk が届いた時点で voice-tts は open_pcm_stream 済みなので、
+        # この発話の実際のサンプルレートが読める。既定値のまま送ると、
+        # 24 kHz のエンジンの音が 32/24 倍の速さと高さで再生されてしまう。
+        sample_rate = _resolve_sample_rate(
+            get_pcm_stream_info, message_id, sample_rate
+        )
 
         # requests は標準ライブラリじゃないが、SAIVerse 本体で広く使われて
         # いるので addon でも利用可能と仮定する。Phase 1' 着手前に確認済み。
