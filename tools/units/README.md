@@ -5,7 +5,7 @@
 ## 前提
 
 - **stackchan-mcp firmware** に Port A I2C 汎用 tool (`self.i2c.scan` / `read` / `write` / `write_read`) が実装されていること
-  - upstream PR #195 (kPropertyTypeArray) + #196 (Port A bus + I2C tools) の merge 後、 もしくは fork `dev/integration` で先行利用
+  - 本家に取り込み済み (本家 PR #195 kPropertyTypeArray + #196 Port A bus + I2C tools)。 アドオンが自動でダウンロードする本家のファームウェアに入っている
 - Stack-chan device がペアリング済み、 SAIVerse の MCP client が gateway subprocess を正常起動できる状態
 - 機体管理 UI でその機体に capability (= 搭載ユニット集合) を設定できる状態。 v0.10 マルチ機体では「Unit を有効化」 は addon 単一トグルではなく **機体ごとの capability** で持つ (= ENV III を積んだ機体にだけ ENV III spell が出る、 intent K-5 / 不変条件 #14)
 - Unit を Grove Port A に物理接続済み (PaHub 経由で複数同時 OK、 アドレス衝突に注意)
@@ -280,7 +280,7 @@ await conn.call_tool("i2c_read",
     {"addr": 0x57, "n_bytes": 3, "scl_speed_hz": 100000})
 ```
 
-`scl_speed_hz` property は firmware 側 (`temp/stackchan-mcp` の `boards/stackchan/stackchan.cc`、 `self.i2c.read/write/write_read` の 3 tool) に実装されています。 **未対応の旧 firmware では未知 arg として無視される**ので、 古いファームのまま動かすと 400 kHz のままで遅い Unit は動きません (= firmware 更新 + flash が前提)。 症状の切り分けには `i2c_scan` を使い、 「scan には出るが read/write が INVALID_STATE」 なら速度問題と判断できます。
+`scl_speed_hz` property は firmware 側 (本家 stackchan-mcp の `firmware/main/boards/stackchan/stackchan.cc`、 `self.i2c.read/write/write_read` の 3 tool。 本家 PR #319) に実装されています。 **未対応の旧 firmware では未知 arg として無視される**ので、 古いファームのまま動かすと 400 kHz のままで遅い Unit は動きません (= firmware 更新 + flash が前提)。 症状の切り分けには `i2c_scan` を使い、 「scan には出るが read/write が INVALID_STATE」 なら速度問題と判断できます。
 
 ### 戻り値型は `str` か `(str, dict)`、 4-tuple は NG
 

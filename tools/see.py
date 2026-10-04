@@ -90,7 +90,7 @@ def see(
 
     # gateway の capture_server.py が返す JSON ペイロードを期待する。
     # 想定形式: {"image_path": "...", "size_bytes": N, "question": "..."}
-    # IMU ブランチ以降の gateway は take_photo の返答に画像本体も同梱する
+    # 本家 gateway 0.18.0 以降 (本家 PR #373) は take_photo の返答に画像本体も同梱する
     # (JSON テキスト + image ブロックの 2 部構成)。mcp_client 側の文字列化で
     # 画像は "[binary: N bytes]" の行になるため、行ごとに走査して最初に
     # JSON として読める行を採用する。実画像は image_path から自前で読む
