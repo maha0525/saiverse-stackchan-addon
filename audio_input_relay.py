@@ -234,15 +234,15 @@ async def receive_device_audio(request: Request) -> dict:
     # 本文は metadata.media[] の Ogg/Opus が主で、 ペルソナ (Gemini) は
     # inline_data で「音」を直接理解する。 ただし SAIVerse 本体
     # (manager/runtime.py の handle_user_input_stream) は空 text を
-    # 「入力が空でした」 として弾くガードを持つので、 音声受信を示す
-    # 短い system 文をユーザーメッセージとして同送する (memory
-    # feedback_system_tag_design.md: role='user' + <system>...</system>
-    # 形式)。 これで本体ガードを通過しつつ、 ペルソナには「ｽﾀｯｸﾁｬﾝ経由で
-    # 音声が届いた」 という来歴も伝わる。
-    audio_intro_text = (
-        "<system>ｽﾀｯｸﾁｬﾝから音声入力を受信しました。"
-        "添付の音声を聴いて応答してください。</system>"
-    )
+    # 「入力が空でした」 として弾くガードを持つので、 音声の置き場を示す
+    # 短い placeholder をユーザーメッセージとして同送する。 これで本体
+    # ガードを通過しつつ、 ペルソナには「ｽﾀｯｸﾁｬﾝ経由で音声が届いた」
+    # という来歴も伝わる。 SAIVerse v0.3.27 でシステム通知が role=system
+    # へ一本化され、 合言葉の無い <system> タグは「本物の通知ではない」
+    # 印として潰されて届くようになったので、 タグで囲む旧形式は使わない
+    # (これはシステム通知ではなく、 ユーザーの音声発言の添え書きなので、
+    # メッセンジャーの「[音声メッセージ]」と同じ地の文の placeholder にする)。
+    audio_intro_text = "(ｽﾀｯｸﾁｬﾝからの音声入力です。音声を聴いて応答してください)"
 
     # --- 発言契機入室 ---
     # 機体に話しかけたユーザーは、 その機体の Vessel Building にいる。 SAIVerse
