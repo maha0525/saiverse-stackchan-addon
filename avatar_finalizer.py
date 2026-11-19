@@ -631,6 +631,9 @@ def upload_face_image(
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cropped.save(out_path, format="PNG")
+    synced_stage3 = ap.sync_existing_stage3_base_copies(
+        mgr, persona_id, set_name, ap.STAGE_FACE, "face", out_path,
+    )
 
     # metadata の aspect_ratio は「実際に切り出した矩形」 から導出する
     # (= ②③ も同アス比で生成)。 UI のセレクト値 (target_aspect) と crop
@@ -664,6 +667,98 @@ def upload_face_image(
         "target_aspect": effective_aspect,
         "requested_aspect": target_aspect,
         "cropped_size": [cw, ch],
+        "synced_stage3_targets": synced_stage3,
+    }
+
+
+def valid_stage_targets(stage_id: str) -> set[str]:
+    """② / ③ の個別アップロードで許可される target 名の集合を返す。"""
+    if stage_id == ap.STAGE_EXPRESSIONS:
+        return set(ap.EXPRESSION_NAMES)
+    if stage_id == ap.STAGE_MATRIX:
+        return {
+            f"{face}_{eyes}_{mouth}"
+            for face in ap.FACE_NAMES
+            for eyes in ap.EYES_STATES
+            for mouth in ap.MOUTH_SHAPES
+        }
+    if stage_id == ap.STAGE_LAYERED:
+        return (
+            {f"eyes_{state}" for state in ap.EYES_STATES}
+            | {f"mouth_{shape}" for shape in ap.MOUTH_SHAPES}
+        )
+    raise ValueError(
+        f"Stage {stage_id!r} does not support per-target upload "
+        f"(allowed: {ap.STAGE_EXPRESSIONS}, {ap.STAGE_MATRIX}, {ap.STAGE_LAYERED})"
+    )
+
+
+def upload_stage_target_image(
+    mgr: ap.AvatarPipelineManager,
+    persona_id: str,
+    set_name: str,
+    stage_id: str,
+    target: str,
+    image_bytes: bytes,
+) -> dict[str, Any]:
+    """② 表情差分 / ③ 目・口差分の特定 target に自前画像を直接アップロードする。
+
+    アップロード画像は PIL で RGB に正規化して `wip/<stage_id>/<target>.png`
+    に保存し、 `metadata.updated_at` を touch する (= frontend の cache buster
+    `?t=${updated_at}` を即時更新するため)。
+    """
+    allowed_targets = valid_stage_targets(stage_id)
+    if target not in allowed_targets:
+        raise ValueError(
+            f"Invalid target {target!r} for stage {stage_id!r}"
+        )
+
+    meta = mgr.read_metadata(persona_id, set_name)
+    if meta is None:
+        raise FileNotFoundError(f"WIP not found: {persona_id}/{set_name}")
+
+    if stage_id == ap.STAGE_MATRIX and meta.mode != "matrix":
+        raise ValueError(
+            f"Stage {stage_id!r} is only valid for mode='matrix' "
+            f"(set mode is {meta.mode!r})"
+        )
+    if stage_id == ap.STAGE_LAYERED and meta.mode != "layered":
+        raise ValueError(
+            f"Stage {stage_id!r} is only valid for mode='layered' "
+            f"(set mode is {meta.mode!r})"
+        )
+
+    Image = _pil_image()
+    import io
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            rgb = im.convert("RGB")
+            w, h = rgb.size
+    except Exception as exc:
+        raise ValueError(f"Invalid image data: {exc}")
+
+    out_path = mgr.stage_dir(persona_id, set_name, stage_id) / f"{target}.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rgb.save(out_path, format="PNG")
+    synced_stage3 = ap.sync_existing_stage3_base_copies(
+        mgr, persona_id, set_name, stage_id, target, out_path,
+    )
+    mgr.touch_updated_at(persona_id, set_name)
+
+    size_bytes = out_path.stat().st_size
+    LOGGER.info(
+        "avatar_finalizer: stage target upload persona=%s set=%s "
+        "stage=%s target=%s size=%dx%d bytes=%d synced_stage3=%s -> %s",
+        persona_id, set_name, stage_id, target, w, h, size_bytes,
+        synced_stage3, out_path,
+    )
+    return {
+        "stage_id": stage_id,
+        "target": target,
+        "path": str(out_path),
+        "size": [w, h],
+        "size_bytes": size_bytes,
+        "synced_stage3_targets": synced_stage3,
     }
 
 
@@ -908,6 +1003,8 @@ __all__ = [
     "expected_trimmed_filenames",
     "import_trimmed_zip",
     "upload_face_image",
+    "valid_stage_targets",
+    "upload_stage_target_image",
     "analyze_image",
     "closest_supported_aspect",
     "upload_reference_image",

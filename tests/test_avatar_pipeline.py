@@ -753,14 +753,15 @@ class AvatarGeneratorTests(unittest.TestCase):
         )
 
     def test_regenerate_matrix_base_uses_copy(self) -> None:
-        """base (eyes=open, mouth=closed) は generate せずコピーで再現。"""
+        """base (eyes=open, mouth=face のベース口状態) は generate せずコピーで再現。"""
         self.mgr.execute_stage("air_test", "default", self.ap.STAGE_FACE)
         self.mgr.execute_stage("air_test", "default", self.ap.STAGE_EXPRESSIONS)
         self._gen_calls.clear()
 
+        # happy のデフォルトベース口状態は half
         result = self.mgr.regenerate_target(
             "air_test", "default", self.ap.STAGE_MATRIX,
-            target="happy_open_closed",
+            target="happy_open_half",
         )
         # generate は呼ばれない (= base コピー)。
         self.assertEqual(len(self._gen_calls), 0)
@@ -1542,10 +1543,9 @@ class QualityAspectRatioTests(unittest.TestCase):
     def test_metadata_has_new_fields_with_defaults(self) -> None:
         self.mgr.create_set("air_test", "default", mode="matrix")
         meta = self.mgr.read_metadata("air_test", "default")
-        # Default 確定 2026-05-17 (= まはー検証で gpt_image_2 / low が安価かつ
-        # 目パチ口パク用途で十分品質と判明)。
+        # Default は本体最新ラインナップの高速高品質モデル gpt_image_2_6_flare / low。
         self.assertEqual(meta.image_quality, "low")
-        self.assertEqual(meta.image_model, "gpt_image_2")
+        self.assertEqual(meta.image_model, "gpt_image_2_6_flare")
         self.assertEqual(meta.aspect_ratio, "1:1")
         self.assertEqual(meta.stage_quality_overrides, {})
         self.assertEqual(meta.stage_aspect_overrides, {})
@@ -1650,7 +1650,7 @@ class QualityAspectRatioTests(unittest.TestCase):
         self.assertEqual(len(self._gen_kwargs), 1)
 
     def test_matrix_only_target_base_uses_copy(self) -> None:
-        """matrix の base (open/closed) は copy で生成なし。"""
+        """matrix の base (open / face_base_mouth) は copy で生成なし。"""
         self.mgr.create_set("air_test", "matrix_set", mode="matrix")
         self.mgr.execute_stage(
             "air_test", "matrix_set", self.ap.STAGE_FACE,
@@ -1661,7 +1661,7 @@ class QualityAspectRatioTests(unittest.TestCase):
         self._gen_kwargs.clear()
         result = self.mgr.execute_stage(
             "air_test", "matrix_set", self.ap.STAGE_MATRIX,
-            params={"only_target": "happy_open_closed"},
+            params={"only_target": "happy_open_half"},
         )
         self.assertEqual(len(result["files"]), 1)
         self.assertTrue(result["files"][0].get("copied_from_base"))
@@ -1859,7 +1859,7 @@ class QualityAspectRatioTests(unittest.TestCase):
         with patch.object(self.gen, "_generate_one", fake):
             self.mgr.execute_stage(
                 "air_test", "default", self.ap.STAGE_MATRIX,
-                params={"only_target": "happy_open_half"},
+                params={"only_target": "sad_open_half"},
             )
         self.assertEqual(len(prompts), 1)
         # eyes=open なので eyes プロンプト ("eyes fully open") は入らない。
@@ -1868,7 +1868,7 @@ class QualityAspectRatioTests(unittest.TestCase):
         self.assertIn("lips slightly parted", prompts[0])
 
     def test_mouth_closed_prompt_omitted_in_matrix(self) -> None:
-        """mouth=closed のセル → mouth プロンプト省略。"""
+        """ベース口状態 (= sad は closed) と同じ mouth のセル → mouth プロンプト省略。"""
         self.mgr.create_set("air_test", "default", mode="matrix")
         self.mgr.execute_stage("air_test", "default", self.ap.STAGE_FACE)
         self.mgr.execute_stage(
@@ -1884,10 +1884,10 @@ class QualityAspectRatioTests(unittest.TestCase):
         with patch.object(self.gen, "_generate_one", fake):
             self.mgr.execute_stage(
                 "air_test", "default", self.ap.STAGE_MATRIX,
-                params={"only_target": "happy_half_closed"},
+                params={"only_target": "sad_half_closed"},
             )
         self.assertEqual(len(prompts), 1)
-        # mouth=closed なので mouth プロンプト ("mouth closed") は入らない。
+        # sad のベース口=closed と一致するので mouth プロンプトは入らない。
         self.assertNotIn("mouth closed, lips fully together", prompts[0])
         # eyes=half は変更対象 → プロンプト入る。
         self.assertIn("eyes half closed", prompts[0])
@@ -1910,12 +1910,12 @@ class QualityAspectRatioTests(unittest.TestCase):
             # eyes=half (≠ open) → hint 入る
             self.mgr.execute_stage(
                 "air_test", "default", self.ap.STAGE_MATRIX,
-                params={"only_target": "happy_half_closed"},
+                params={"only_target": "sad_half_closed"},
             )
             # eyes=open → hint 入らない
             self.mgr.execute_stage(
                 "air_test", "default", self.ap.STAGE_MATRIX,
-                params={"only_target": "happy_open_half"},
+                params={"only_target": "sad_open_half"},
             )
         self.assertIn("最大開き状態", prompts[0])
         self.assertNotIn("最大開き状態", prompts[1])
@@ -2356,6 +2356,422 @@ class PerSetExecutionLockTests(unittest.TestCase):
             overlapping[0],
             "different sets should run concurrently",
         )
+
+
+class UploadStageTargetImageTests(unittest.TestCase):
+    """② 表情差分 / ③ 目・口差分の per-target 自前画像アップロード経路。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.storage_root = Path(self._tmpdir.name)
+
+        self.ap = _load_avatar_pipeline()
+        self.fin = _load_module(
+            "avatar_finalizer", _ADDON_DIR / "avatar_finalizer.py",
+        )
+        self.routes = _load_module(
+            "api_routes", _ADDON_DIR / "api_routes.py",
+        )
+
+        self._patch_storage = patch.object(
+            self.ap, "get_addon_data_dir",
+            lambda addon_name: self.storage_root,
+        )
+        self._patch_storage.start()
+        self.addCleanup(self._patch_storage.stop)
+
+        self.ap._singleton = None
+        self.mgr = self.ap.get_avatar_pipeline_manager()
+        self.mgr.create_set("air_test", "matrix_set", mode="matrix")
+        self.mgr.create_set("air_test", "layered_set", mode="layered")
+
+    def _make_image_bytes(
+        self, w: int, h: int, fmt: str = "PNG", color=(120, 80, 200),
+    ) -> bytes:
+        import io
+        from PIL import Image
+        im = Image.new("RGB", (w, h), color)
+        buf = io.BytesIO()
+        im.save(buf, format=fmt)
+        return buf.getvalue()
+
+    def test_upload_stage02_expression_converts_jpeg_to_png_and_touches_updated_at(
+        self,
+    ) -> None:
+        import time
+        from PIL import Image
+
+        before = self.mgr.read_metadata("air_test", "matrix_set").updated_at
+        time.sleep(0.002)
+        jpg = self._make_image_bytes(320, 240, fmt="JPEG")
+        result = self.fin.upload_stage_target_image(
+            self.mgr, "air_test", "matrix_set",
+            self.ap.STAGE_EXPRESSIONS, "happy", jpg,
+        )
+        self.assertEqual(result["stage_id"], self.ap.STAGE_EXPRESSIONS)
+        self.assertEqual(result["target"], "happy")
+        self.assertEqual(result["size"], [320, 240])
+        out_path = Path(result["path"])
+        self.assertEqual(out_path.name, "happy.png")
+        self.assertTrue(out_path.exists())
+        with Image.open(out_path) as im:
+            self.assertEqual(im.format, "PNG")
+            self.assertEqual(im.size, (320, 240))
+        after = self.mgr.read_metadata("air_test", "matrix_set").updated_at
+        self.assertGreater(after, before)
+
+    def test_upload_stage03_matrix_and_layered(self) -> None:
+        png = self._make_image_bytes(256, 256)
+        r_mat = self.fin.upload_stage_target_image(
+            self.mgr, "air_test", "matrix_set",
+            self.ap.STAGE_MATRIX, "happy_half_open", png,
+        )
+        self.assertTrue(Path(r_mat["path"]).exists())
+
+        r_base = self.fin.upload_stage_target_image(
+            self.mgr, "air_test", "matrix_set",
+            self.ap.STAGE_MATRIX, "idle_open_closed", png,
+        )
+        self.assertTrue(Path(r_base["path"]).exists())
+
+        r_lay = self.fin.upload_stage_target_image(
+            self.mgr, "air_test", "layered_set",
+            self.ap.STAGE_LAYERED, "eyes_half", png,
+        )
+        self.assertTrue(Path(r_lay["path"]).exists())
+
+    def test_upload_validation_errors(self) -> None:
+        png = self._make_image_bytes(64, 64)
+        # 許可されない stage_id
+        with self.assertRaises(ValueError):
+            self.fin.upload_stage_target_image(
+                self.mgr, "air_test", "matrix_set",
+                self.ap.STAGE_TRIMMED, "idle_open_closed", png,
+            )
+        # 不正な target (パストラバーサル含む)
+        with self.assertRaises(ValueError):
+            self.fin.upload_stage_target_image(
+                self.mgr, "air_test", "matrix_set",
+                self.ap.STAGE_EXPRESSIONS, "../evil", png,
+            )
+        # mode 不一致 (layered セットに 03_matrix をアップ)
+        with self.assertRaises(ValueError):
+            self.fin.upload_stage_target_image(
+                self.mgr, "air_test", "layered_set",
+                self.ap.STAGE_MATRIX, "idle_open_closed", png,
+            )
+        # mode 不一致 (matrix セットに 03_layered をアップ)
+        with self.assertRaises(ValueError):
+            self.fin.upload_stage_target_image(
+                self.mgr, "air_test", "matrix_set",
+                self.ap.STAGE_LAYERED, "eyes_open", png,
+            )
+        # 壊れた画像データ
+        with self.assertRaises(ValueError):
+            self.fin.upload_stage_target_image(
+                self.mgr, "air_test", "matrix_set",
+                self.ap.STAGE_EXPRESSIONS, "sad", b"not-an-image",
+            )
+        # 存在しないセット
+        with self.assertRaises(FileNotFoundError):
+            self.fin.upload_stage_target_image(
+                self.mgr, "air_test", "missing_set",
+                self.ap.STAGE_EXPRESSIONS, "sad", png,
+            )
+
+    def test_api_routes_stage_upload_and_existing_face_upload_preserved(
+        self,
+    ) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(self.routes.router)
+        client = TestClient(app)
+
+        png = self._make_image_bytes(160, 120)
+
+        # 既存 ① 01_face/upload が引き続きクロップ付きハンドラにマッチすること
+        res_face = client.post(
+            "/avatar_sets/air_test/matrix_set/stages/01_face/upload",
+            data={"target_aspect": "4:3"},
+            files={"file": ("face.png", png, "image/png")},
+        )
+        self.assertEqual(res_face.status_code, 200, res_face.text)
+        self.assertEqual(res_face.json()["target_aspect"], "4:3")
+
+        # ② 02_expressions/upload
+        res_expr = client.post(
+            "/avatar_sets/air_test/matrix_set/stages/02_expressions/upload",
+            data={"target": "happy"},
+            files={"file": ("happy.png", png, "image/png")},
+        )
+        self.assertEqual(res_expr.status_code, 200, res_expr.text)
+        self.assertEqual(res_expr.json()["target"], "happy")
+
+        # 配信エンドポイントから取得できること
+        res_img = client.get(
+            "/avatar_sets/air_test/matrix_set/files/02_expressions/happy.png",
+        )
+        self.assertEqual(res_img.status_code, 200)
+        self.assertEqual(res_img.headers["content-type"], "image/png")
+
+        # ③ 03_matrix/upload
+        res_mat = client.post(
+            "/avatar_sets/air_test/matrix_set/stages/03_matrix/upload",
+            data={"target": "happy_closed_open"},
+            files={"file": ("frame.png", png, "image/png")},
+        )
+        self.assertEqual(res_mat.status_code, 200, res_mat.text)
+
+        # 不正な target は 400
+        res_bad = client.post(
+            "/avatar_sets/air_test/matrix_set/stages/02_expressions/upload",
+            data={"target": "unknown_expr"},
+            files={"file": ("x.png", png, "image/png")},
+        )
+        self.assertEqual(res_bad.status_code, 400)
+
+        # 空ファイルは 400
+        res_empty = client.post(
+            "/avatar_sets/air_test/matrix_set/stages/02_expressions/upload",
+            data={"target": "happy"},
+            files={"file": ("empty.png", b"", "image/png")},
+        )
+        self.assertEqual(res_empty.status_code, 400)
+
+    def test_upload_stage02_syncs_existing_stage03_matrix_base_only(self) -> None:
+        old_png = self._make_image_bytes(64, 64, color=(10, 10, 10))
+        new_png = self._make_image_bytes(64, 64, color=(200, 50, 50))
+
+        # happy (= デフォルトベース口: half) は ③ に既存あり、sad は ③ にまだ無い状態を作る
+        happy_s3 = (
+            self.mgr.stage_dir("air_test", "matrix_set", self.ap.STAGE_MATRIX)
+            / "happy_open_half.png"
+        )
+        happy_s3.parent.mkdir(parents=True, exist_ok=True)
+        happy_s3.write_bytes(old_png)
+
+        res_happy = self.fin.upload_stage_target_image(
+            self.mgr, "air_test", "matrix_set",
+            self.ap.STAGE_EXPRESSIONS, "happy", new_png,
+        )
+        self.assertEqual(res_happy["synced_stage3_targets"], ["happy_open_half"])
+        happy_s2 = Path(res_happy["path"])
+        self.assertEqual(happy_s3.read_bytes(), happy_s2.read_bytes())
+
+        res_sad = self.fin.upload_stage_target_image(
+            self.mgr, "air_test", "matrix_set",
+            self.ap.STAGE_EXPRESSIONS, "sad", new_png,
+        )
+        self.assertEqual(res_sad["synced_stage3_targets"], [])
+        sad_s3 = (
+            self.mgr.stage_dir("air_test", "matrix_set", self.ap.STAGE_MATRIX)
+            / "sad_open_closed.png"
+        )
+        self.assertFalse(sad_s3.exists())
+
+    def test_upload_stage01_syncs_existing_stage03_bases_matrix_and_layered(
+        self,
+    ) -> None:
+        old_png = self._make_image_bytes(64, 64, color=(20, 20, 20))
+        new_png = self._make_image_bytes(64, 64, color=(30, 180, 90))
+
+        # matrix: idle_open_closed が既存
+        idle_s3 = (
+            self.mgr.stage_dir("air_test", "matrix_set", self.ap.STAGE_MATRIX)
+            / "idle_open_closed.png"
+        )
+        idle_s3.parent.mkdir(parents=True, exist_ok=True)
+        idle_s3.write_bytes(old_png)
+
+        res_mat = self.fin.upload_face_image(
+            self.mgr, "air_test", "matrix_set", new_png, target_aspect="1:1",
+        )
+        self.assertEqual(res_mat["synced_stage3_targets"], ["idle_open_closed"])
+        self.assertEqual(idle_s3.read_bytes(), Path(res_mat["path"]).read_bytes())
+
+        # layered: eyes_open と mouth_closed が既存
+        layered_dir = self.mgr.stage_dir(
+            "air_test", "layered_set", self.ap.STAGE_LAYERED,
+        )
+        layered_dir.mkdir(parents=True, exist_ok=True)
+        (layered_dir / "eyes_open.png").write_bytes(old_png)
+        (layered_dir / "mouth_closed.png").write_bytes(old_png)
+
+        res_lay = self.fin.upload_face_image(
+            self.mgr, "air_test", "layered_set", new_png, target_aspect="1:1",
+        )
+        self.assertEqual(
+            res_lay["synced_stage3_targets"], ["eyes_open", "mouth_closed"],
+        )
+        face_bytes = Path(res_lay["path"]).read_bytes()
+        self.assertEqual((layered_dir / "eyes_open.png").read_bytes(), face_bytes)
+        self.assertEqual((layered_dir / "mouth_closed.png").read_bytes(), face_bytes)
+
+
+class ImageModelLineupTests(unittest.TestCase):
+    """本体 image_generator.py の最新 ModelType とアドオンの dispatch が一致すること。"""
+
+    def test_backend_dispatch_matches_image_generator_models(self) -> None:
+        from typing import get_args
+        gen = _load_module(
+            "avatar_generator", _ADDON_DIR / "avatar_generator.py",
+        )
+        ig = gen._get_image_generator()
+        core_models = set(get_args(ig.ModelType))
+        self.assertEqual(set(gen._BACKEND_DISPATCH.keys()), core_models)
+        for model, func_name in gen._BACKEND_DISPATCH.items():
+            self.assertTrue(
+                callable(getattr(ig, func_name, None)),
+                f"Missing backend function {func_name} for model {model}",
+            )
+
+    def test_nano_banana_2_1_passes_model_id_kwarg(self) -> None:
+        from types import SimpleNamespace
+        gen = _load_module(
+            "avatar_generator", _ADDON_DIR / "avatar_generator.py",
+        )
+        captured: dict = {}
+
+        def fake_nb2(**kwargs):
+            captured.update(kwargs)
+            return b"png", "image/png"
+
+        fake_ig = SimpleNamespace(_generate_with_nano_banana_2=fake_nb2)
+        with patch.object(gen, "_get_image_generator", return_value=fake_ig):
+            gen._generate_one(prompt="test", model="nano_banana_2_1")
+        self.assertEqual(captured.get("model_id"), "gemini-nano-banana-2.1")
+
+
+class FaceBaseMouthTests(unittest.TestCase):
+    """表情ごとのベース口状態 (closed / half / open) の汎用挙動テスト。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.storage_root = Path(self._tmpdir.name)
+
+        self.ap = _load_avatar_pipeline()
+        self.gen = _load_module(
+            "avatar_generator", _ADDON_DIR / "avatar_generator.py",
+        )
+        self.routes = _load_module(
+            "api_routes", _ADDON_DIR / "api_routes.py",
+        )
+        self._patch_storage = patch.object(
+            self.ap, "get_addon_data_dir",
+            lambda addon_name: self.storage_root,
+        )
+        self._patch_storage.start()
+        self.addCleanup(self._patch_storage.stop)
+
+        self.ap._singleton = None
+        self.mgr = self.ap.get_avatar_pipeline_manager()
+        self.gen.register_avatar_executors(self.mgr)
+        self.mgr.create_set("air_test", "default", mode="matrix")
+
+    def test_defaults_and_custom_expression_fallback(self) -> None:
+        meta = self.mgr.read_metadata("air_test", "default")
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "idle"), "closed")
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "happy"), "half")
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "thinking"), "closed")
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "sad"), "closed")
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "surprised"), "open")
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "embarrassed"), "closed")
+        # 将来追加されるカスタム表情は未設定なら "closed"、設定すればその値を返す
+        self.assertEqual(self.ap.resolve_face_base_mouth(meta, "wink"), "closed")
+        updated = self.mgr.update_metadata(
+            "air_test", "default",
+            face_base_mouths={**meta.face_base_mouths, "wink": "open"},
+        )
+        self.assertEqual(self.ap.resolve_face_base_mouth(updated, "wink"), "open")
+
+    def test_stage02_prompt_reflects_face_base_mouth(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake(prompt, model, input_image_paths=None,
+                 aspect_ratio="1:1", quality="high"):
+            if "Surprised expression" in prompt:
+                captured["surprised"] = prompt
+            elif "Smiling brightly" in prompt:
+                captured["happy"] = prompt
+            elif "Sad expression" in prompt:
+                captured["sad"] = prompt
+            return (b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, "image/png")
+
+        with patch.object(self.gen, "_generate_one", fake):
+            self.mgr.execute_stage("air_test", "default", self.ap.STAGE_FACE)
+            self.mgr.execute_stage("air_test", "default", self.ap.STAGE_EXPRESSIONS)
+
+        self.assertIn("mouth clearly open", captured["surprised"])
+        self.assertIn("mouth slightly open", captured["happy"])
+        self.assertIn("mouth closed", captured["sad"])
+
+    def test_stage03_matrix_uses_per_face_base_mouth_for_copy_and_prompt(
+        self,
+    ) -> None:
+        prompts_by_call: list[str] = []
+
+        def fake(prompt, model, input_image_paths=None,
+                 aspect_ratio="1:1", quality="high"):
+            prompts_by_call.append(prompt)
+            return (b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, "image/png")
+
+        with patch.object(self.gen, "_generate_one", fake):
+            self.mgr.execute_stage("air_test", "default", self.ap.STAGE_FACE)
+            self.mgr.execute_stage("air_test", "default", self.ap.STAGE_EXPRESSIONS)
+            prompts_by_call.clear()
+
+            # surprised のベースは open/open → コピーで生成なし
+            res_base = self.mgr.execute_stage(
+                "air_test", "default", self.ap.STAGE_MATRIX,
+                params={"only_target": "surprised_open_open"},
+            )
+            self.assertTrue(res_base["files"][0].get("copied_from_base"))
+            self.assertEqual(len(prompts_by_call), 0)
+
+            # surprised の half/open → mouth=open はベースと同じなので mouth 指示省略
+            self.mgr.execute_stage(
+                "air_test", "default", self.ap.STAGE_MATRIX,
+                params={"only_target": "surprised_half_open"},
+            )
+            self.assertEqual(len(prompts_by_call), 1)
+            self.assertNotIn("mouth open, lips clearly apart", prompts_by_call[0])
+            self.assertIn("eyes half closed", prompts_by_call[0])
+
+            # surprised の open/closed → mouth=closed はベース(open)と違うので指示が入る
+            prompts_by_call.clear()
+            self.mgr.execute_stage(
+                "air_test", "default", self.ap.STAGE_MATRIX,
+                params={"only_target": "surprised_open_closed"},
+            )
+            self.assertEqual(len(prompts_by_call), 1)
+            self.assertIn("mouth closed, lips fully together", prompts_by_call[0])
+            self.assertNotIn("eyes fully open", prompts_by_call[0])
+
+    def test_patch_metadata_validates_face_base_mouths(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(self.routes.router)
+        client = TestClient(app)
+
+        res_ok = client.patch(
+            "/avatar_sets/air_test/default/metadata",
+            json={"face_base_mouths": {"happy": "open", "custom_face": "half"}},
+        )
+        self.assertEqual(res_ok.status_code, 200, res_ok.text)
+        self.assertEqual(res_ok.json()["face_base_mouths"]["happy"], "open")
+        self.assertEqual(res_ok.json()["face_base_mouths"]["custom_face"], "half")
+
+        res_bad = client.patch(
+            "/avatar_sets/air_test/default/metadata",
+            json={"face_base_mouths": {"happy": "e"}},
+        )
+        self.assertEqual(res_bad.status_code, 400)
 
 
 if __name__ == "__main__":

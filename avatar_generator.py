@@ -83,19 +83,23 @@ DEFAULT_TEMPLATES: dict[str, Any] = {
         ),
         "thinking": (
             "Thoughtful expression, slight tilt of head, "
-            "eyes focused on a distant point, lips slightly pursed"
+            "eyes focused on a distant point"
         ),
         "sad": (
-            "Sad expression, downcast eyes, slight frown, lips drawn together"
+            "Sad expression, downcast eyes, slight frown"
         ),
         "surprised": (
-            "Surprised expression, eyes wide open, eyebrows raised, "
-            "mouth slightly open in astonishment"
+            "Surprised expression, eyes wide open, eyebrows raised"
         ),
         "embarrassed": (
-            "Embarrassed expression, slight blush on cheeks, "
-            "eyes averted, lips slightly pursed"
+            "Embarrassed expression, slight blush on cheeks, eyes averted"
         ),
+    },
+    # ①/② のベース画像生成時に、表情ごとの face_base_mouths 設定に応じて自動付与する口指示。
+    "base_mouth": {
+        "closed": "mouth closed, lips gently together",
+        "half": "mouth slightly open, lips gently parted halfway",
+        "open": "mouth clearly open, lips apart",
     },
     "eyes": {
         "open": "eyes fully open",
@@ -151,12 +155,23 @@ def _get_image_generator():
 
 
 # backend 名 → image_generator 内の private 関数名 mapping。
+# 本体 builtin_data/tools/image_generator.py の ModelType と揃える。
 _BACKEND_DISPATCH = {
+    "gpt_image_2_6_flare": "_generate_with_gpt_image_2_6_flare",
+    "gpt_image_2_6_sunburst": "_generate_with_gpt_image_2_6_sunburst",
+    "gpt_image_2_5_flare": "_generate_with_gpt_image_2_5_flare",
+    "gpt_image_2_5_sunburst": "_generate_with_gpt_image_2_5_sunburst",
+    "gpt_image_2": "_generate_with_gpt_image_2",
+    "gpt_image_1_5": "_generate_with_gpt_image_1_5",
+    "nano_banana_2_1": "_generate_with_nano_banana_2",
     "nano_banana_2": "_generate_with_nano_banana_2",
     "nano_banana_pro": "_generate_with_nano_banana_pro",
-    "gpt_image_1_5": "_generate_with_gpt_image_1_5",
-    "gpt_image_2": "_generate_with_gpt_image_2",
     "grok_imagine": "_generate_with_grok_imagine",
+}
+
+# backend 固有の追加キーワード引数 (= nano_banana_2_1 は model_id 指定で呼ぶ)。
+_BACKEND_EXTRA_KWARGS: dict[str, dict[str, Any]] = {
+    "nano_banana_2_1": {"model_id": "gemini-nano-banana-2.1"},
 }
 
 
@@ -203,12 +218,14 @@ def _generate_one(
         prompt,
     )
 
+    extra_kwargs = _BACKEND_EXTRA_KWARGS.get(model, {})
     try:
         result = func(
             prompt=prompt,
             aspect_ratio=aspect_ratio,
             quality=quality,
             input_image_paths=input_image_paths,
+            **extra_kwargs,
         )
     except Exception as exc:
         # OpenAI / Anthropic / Gemini SDK の例外は response body / message を
@@ -298,6 +315,17 @@ def _get_mouth_prompt(meta: ap.AvatarSetMetadata, mouth_shape: str) -> str:
         if isinstance(val, str) and val.strip():
             return val
     return DEFAULT_TEMPLATES["mouth"].get(mouth_shape, "")
+
+
+def _get_base_mouth_prompt(meta: ap.AvatarSetMetadata, face: str) -> str:
+    """①/② のベース画像生成時に、表情のデフォルト口状態に応じた指示を返す。"""
+    base_mouth = ap.resolve_face_base_mouth(meta, face)
+    custom = meta.extra_prompts.get("base_mouth", {})
+    if isinstance(custom, dict):
+        val = custom.get(base_mouth)
+        if isinstance(val, str):
+            return val.strip()
+    return DEFAULT_TEMPLATES["base_mouth"].get(base_mouth, "")
 
 
 def _resolve_quality(meta: ap.AvatarSetMetadata, stage_id: str) -> str:
@@ -456,7 +484,8 @@ def generate_stage_face(
     override = params.get("extra_prompt")
     if isinstance(override, str) and override.strip():
         extra = override
-    prompt = _build_prompt(meta.common_prompt, extra)
+    base_mouth_prompt = _get_base_mouth_prompt(meta, "idle")
+    prompt = _build_prompt(meta.common_prompt, extra, base_mouth_prompt)
     if not prompt:
         raise ValueError(
             "Empty prompt: both common_prompt and extra_prompt are missing"
@@ -474,6 +503,9 @@ def generate_stage_face(
     )
     out_path = _stage_face_file(mgr, persona_id, set_name)
     _write_png(out_path, image_bytes, mime)
+    ap.sync_existing_stage3_base_copies(
+        mgr, persona_id, set_name, ap.STAGE_FACE, "face", out_path,
+    )
 
     if isinstance(override, str) and override.strip():
         _persist_extra_prompt_override(
@@ -533,7 +565,8 @@ def generate_stage_expressions(
         futures = {}
         for expr in targets:
             extra = _get_extra_prompt(meta, ap.STAGE_EXPRESSIONS, expr)
-            prompt = _build_prompt(meta.common_prompt, extra)
+            base_mouth_prompt = _get_base_mouth_prompt(meta, expr)
+            prompt = _build_prompt(meta.common_prompt, extra, base_mouth_prompt)
             futures[ex.submit(
                 _generate_one,
                 prompt=prompt,
@@ -550,6 +583,9 @@ def generate_stage_expressions(
                     mgr, persona_id, set_name, expr,
                 )
                 _write_png(out_path, image_bytes, mime)
+                ap.sync_existing_stage3_base_copies(
+                    mgr, persona_id, set_name, ap.STAGE_EXPRESSIONS, expr, out_path,
+                )
                 results.append({
                     "target": expr, "path": str(out_path),
                 })
@@ -630,8 +666,9 @@ def generate_stage_matrix(
             and parts[2] in ap.MOUTH_SHAPES
         ):
             tasks: list[tuple[str, str, str]] = []
-            # base (open/closed) を選んでも生成しない (= コピー対応)。
-            if parts[1] == "open" and parts[2] == "closed":
+            # base (eyes=open, mouth=base_mouth) を選んでも生成しない (= コピー対応)。
+            base_mouth = ap.resolve_face_base_mouth(meta, parts[0])
+            if parts[1] == "open" and parts[2] == base_mouth:
                 # base = ②/① の画像をコピーして対応。
                 src = base_paths[parts[0]]
                 dst = _stage_matrix_file(
@@ -655,9 +692,10 @@ def generate_stage_matrix(
         # 通常: 生成タスク (= face_filter / skip_existing 適用後)。
         tasks = []
         for face in allowed_faces:
+            base_mouth = ap.resolve_face_base_mouth(meta, face)
             for eyes in ap.EYES_STATES:
                 for mouth in ap.MOUTH_SHAPES:
-                    if eyes == "open" and mouth == "closed":
+                    if eyes == "open" and mouth == base_mouth:
                         continue  # base はコピーで対応 (後段)
                     if skip_existing:
                         expected = _stage_matrix_file(
@@ -677,16 +715,17 @@ def generate_stage_matrix(
         # ③ プロンプト構築の意図 (まはー検証 2026-05-17):
         # - common_prompt 不使用 (= 元画像にないアクセサリの差分追加防止)
         # - face は端的化 (= ②長文テンプレとの矛盾で 2 枚並べ事故防止)
-        # - eyes=open / mouth=closed のセルは該当プロンプト省略
+        # - eyes=open / mouth=base_mouth のセルは該当プロンプト省略
         #   (= 参照画像と同じ状態を「触る指示」 で AI に変更余地を渡さない)
         # - eyes != "open" のセルに eye_modify_hint 追加
         #   (= 参照画像が最大開き状態だと明示、 happy で half>open 事故防止)
         face_label = _stage3_face_label(face)
+        base_mouth = ap.resolve_face_base_mouth(meta, face)
         extra_eyes = (
             _get_eyes_prompt(meta, eyes) if eyes != "open" else ""
         )
         extra_mouth = (
-            _get_mouth_prompt(meta, mouth) if mouth != "closed" else ""
+            _get_mouth_prompt(meta, mouth) if mouth != base_mouth else ""
         )
         eye_hint = eye_modify_hint if eyes != "open" else ""
         per_target_key = f"{face}_{eyes}_{mouth}"
@@ -733,21 +772,22 @@ def generate_stage_matrix(
                     "error": str(exc),
                 })
 
-    # base = (eyes=open, mouth=closed) を copy。
+    # base = (eyes=open, mouth=base_mouth) を copy。
     # 適用範囲: only_target 指定なし、 face_filter で絞られた face のみ。
     # skip_existing なら既存ファイルは copy しない。
     if not isinstance(only_target, str) or not only_target:
         for face in allowed_faces:
             src = base_paths[face]
+            base_mouth = ap.resolve_face_base_mouth(meta, face)
             dst = _stage_matrix_file(
-                mgr, persona_id, set_name, face, "open", "closed",
+                mgr, persona_id, set_name, face, "open", base_mouth,
             )
             if skip_existing and dst.exists():
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dst)
             results.append({
-                "target": f"{face}_open_closed",
+                "target": f"{face}_open_{base_mouth}",
                 "path": str(dst),
                 "copied_from_base": True,
             })
@@ -792,10 +832,10 @@ def generate_stage_layered(
 
     only_target = params.get("only_target")
     skip_existing = bool(params.get("skip_existing", False))
-    # eyes=open と mouth=closed は ① 元画像 (face.png) を copy で対応
-    # (= 参照画像と同じ状態、 AI に「触る指示」 を渡さないことで安定 +
-    # コスト削減、 まはー検証 2026-05-17)。
-    COPY_PAIRS = {("eyes", "open"), ("mouth", "closed")}
+    # eyes=open と mouth=idle のベース口状態は ① 元画像 (face.png) を copy で対応
+    # (= 参照画像と同じ状態、 AI に「触る指示」 を渡さないことで安定 + コスト削減)。
+    idle_base_mouth = ap.resolve_face_base_mouth(meta, "idle")
+    COPY_PAIRS = {("eyes", "open"), ("mouth", idle_base_mouth)}
     tasks: list[tuple[str, str]] = []
     copy_tasks: list[tuple[str, str]] = []
 
@@ -982,7 +1022,8 @@ def regenerate_target(
         extra = override_text or _get_extra_prompt(
             meta, ap.STAGE_EXPRESSIONS, target,
         )
-        prompt = _build_prompt(meta.common_prompt, extra)
+        base_mouth_prompt = _get_base_mouth_prompt(meta, target)
+        prompt = _build_prompt(meta.common_prompt, extra, base_mouth_prompt)
         image_bytes, mime = _generate_one(
             prompt=prompt, model=meta.image_model,
             input_image_paths=[face_path],
@@ -993,6 +1034,9 @@ def regenerate_target(
             mgr, persona_id, set_name, target,
         )
         _write_png(out_path, image_bytes, mime)
+        ap.sync_existing_stage3_base_copies(
+            mgr, persona_id, set_name, ap.STAGE_EXPRESSIONS, target, out_path,
+        )
         if override_text:
             _persist_extra_prompt_override(
                 mgr, persona_id, set_name,
@@ -1025,7 +1069,8 @@ def regenerate_target(
         if not base_path.exists():
             raise FileNotFoundError(f"Base image not found: {base_path}")
         # base 自体は generate せず copy で再現。
-        if eyes == "open" and mouth == "closed":
+        base_mouth = ap.resolve_face_base_mouth(meta, face)
+        if eyes == "open" and mouth == base_mouth:
             out_path = _stage_matrix_file(
                 mgr, persona_id, set_name, face, eyes, mouth,
             )
@@ -1037,13 +1082,13 @@ def regenerate_target(
                 "copied_from_base": True,
             }
         # ③ matrix: 通常生成と同じプロンプト構築ロジック (= _do_one と整合):
-        # eyes=open / mouth=closed プロンプト省略、 eyes!=open に eye_modify_hint。
+        # eyes=open / mouth=base_mouth プロンプト省略、 eyes!=open に eye_modify_hint。
         face_label = _stage3_face_label(face)
         extra_eyes = (
             _get_eyes_prompt(meta, eyes) if eyes != "open" else ""
         )
         extra_mouth = (
-            _get_mouth_prompt(meta, mouth) if mouth != "closed" else ""
+            _get_mouth_prompt(meta, mouth) if mouth != base_mouth else ""
         )
         extra_per_target = override_text or _get_extra_prompt(
             meta, ap.STAGE_MATRIX, target,
@@ -1093,11 +1138,12 @@ def regenerate_target(
         face_path = _stage_face_file(mgr, persona_id, set_name)
         if not face_path.exists():
             raise FileNotFoundError(f"Stage 01_face not found: {face_path}")
-        # eyes=open / mouth=closed は copy 対応 (= ① face と同じ状態、
-        # AI に変更余地を渡さない、 まはー検証 2026-05-17)。
+        # eyes=open / mouth=idle のベース口状態は copy 対応 (= ① face と同じ状態、
+        # AI に変更余地を渡さない)。
+        idle_base_mouth = ap.resolve_face_base_mouth(meta, "idle")
         is_copy_pair = (
             (kind == "eyes" and name == "open")
-            or (kind == "mouth" and name == "closed")
+            or (kind == "mouth" and name == idle_base_mouth)
         )
         out_path = _stage_layered_file(
             mgr, persona_id, set_name, kind, name,

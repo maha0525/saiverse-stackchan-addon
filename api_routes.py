@@ -49,13 +49,14 @@ router = APIRouter()
 class CreateSetRequest(BaseModel):
     mode: str = "matrix"
     common_prompt: str = ""
-    image_model: str = "nano_banana_2"
+    image_model: str = "gpt_image_2_6_flare"
 
 
 class UpdateMetadataRequest(BaseModel):
     """metadata の任意フィールド更新。 未指定フィールドは変更しない。"""
     common_prompt: Optional[str] = None
     extra_prompts: Optional[dict] = None
+    face_base_mouths: Optional[dict] = None
     trim_rect: Optional[dict] = None
     trim_rect_overrides: Optional[dict] = None
     parallelism: Optional[int] = None
@@ -157,7 +158,7 @@ def _unhandled(operation: str, exc: Exception) -> HTTPException:
                 f"{_OPENAI_BILLING_URL} で残高 / limit を確認し、 必要なら "
                 "チャージ or hard limit 引き上げ。 "
                 "もしくは Debug 設定で image_model を別 backend に切替 "
-                "(= nano_banana_2 / nano_banana_pro / grok_imagine)。"
+                "(= nano_banana_2_1 / nano_banana_2 / nano_banana_pro / grok_imagine)。"
             ),
         )
     # OpenAI insufficient_quota / rate_limit_exceeded も chain 続行は
@@ -625,6 +626,53 @@ async def upload_face(
             _mgr(), persona_id, set_name, contents,
             target_aspect=target_aspect,
             crop_rect=crop_rect,
+        )
+    except FileNotFoundError as exc:
+        LOGGER.warning("api_routes: %s NOT_FOUND: %s", op, exc)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc),
+        )
+    except ValueError as exc:
+        LOGGER.warning("api_routes: %s BAD_REQUEST: %s", op, exc)
+        raise _wrap_value_error(exc)
+    except Exception as exc:
+        raise _unhandled(op, exc)
+    LOGGER.info("api_routes: %s OK path=%s", op, result.get("path"))
+    return result
+
+
+@router.post(
+    "/avatar_sets/{persona_id}/{set_name}/stages/{stage_id}/upload"
+)
+async def upload_stage_target(
+    persona_id: str,
+    set_name: str,
+    stage_id: str,
+    target: str = Form(
+        ...,
+        description="アップロード対象の target 名 (例: happy / idle_half_open / eyes_half)",
+    ),
+    file: UploadFile = File(...),
+) -> dict:
+    """② 表情差分 / ③ 目・口差分の特定 target に自前画像を直接アップロードする。
+
+    注意: `stages/01_face/upload` より後に定義しているため、`01_face` は既存の
+    クロップ付きアップロード経路にマッチする。
+    """
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Empty upload",
+        )
+    op = (
+        f"upload_stage_target(persona={persona_id}, set={set_name}, "
+        f"stage={stage_id}, target={target}, bytes={len(contents)})"
+    )
+    LOGGER.info("api_routes: %s RECV", op)
+    try:
+        from avatar_finalizer import upload_stage_target_image
+        result = upload_stage_target_image(
+            _mgr(), persona_id, set_name, stage_id, target, contents,
         )
     except FileNotFoundError as exc:
         LOGGER.warning("api_routes: %s NOT_FOUND: %s", op, exc)

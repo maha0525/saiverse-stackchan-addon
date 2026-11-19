@@ -70,6 +70,19 @@ EYES_STATES = ["open", "half", "closed"]
 # 口状態 (Phase 4.5-a の AvatarSet mouth_index と対応)。
 MOUTH_SHAPES = ["closed", "half", "open", "e", "u"]
 
+# ベース画像 (①/②) のデフォルト口状態として選択可能な値。
+# 目は常に open をベースとし、口は表情ごとに closed / half / open から選べる。
+VALID_BASE_MOUTHS = ("closed", "half", "open")
+# 標準表情のデフォルト口状態 (将来追加されるカスタム表情は "closed" にフォールバック)。
+DEFAULT_FACE_BASE_MOUTHS: dict[str, str] = {
+    "idle": "closed",
+    "happy": "half",
+    "thinking": "closed",
+    "sad": "closed",
+    "surprised": "open",
+    "embarrassed": "closed",
+}
+
 # matrix mode の総枚数 (= 6 表情 × 目 3 × 口 5)。
 MATRIX_TOTAL_FRAMES = len(FACE_NAMES) * len(EYES_STATES) * len(MOUTH_SHAPES)
 
@@ -111,6 +124,12 @@ class AvatarSetMetadata:
     # 段階別の追加自由文。 stage_id -> target -> extra text。
     # 例: extra_prompts["02_expressions"]["happy"] = "smiling brightly"
     extra_prompts: dict[str, dict[str, str]] = field(default_factory=dict)
+    # 表情ごとのベース口状態 (face_name -> "closed" | "half" | "open")。
+    # ①/② のベース画像はこの口状態で生成・配置され、 ③ では
+    # `{face}_open_{base_mouth}` がベースコピー枠になる (将来のカスタム表情にも対応)。
+    face_base_mouths: dict[str, str] = field(
+        default_factory=lambda: dict(DEFAULT_FACE_BASE_MOUTHS)
+    )
     # ④ 一括トリミングの矩形 (元画像サイズに対する絶対座標)。
     trim_rect: Optional[dict[str, int]] = None
     # ④ per-target トリミング矩形 (target name → rect dict)。
@@ -121,10 +140,8 @@ class AvatarSetMetadata:
     # 並列度 (= ③ の生成で同時に投げる API リクエスト数)。
     parallelism: int = 5
     # 生成 backend モデル (= image_generator の ModelType)。
-    # default = gpt_image_2: まはー検証で「low でも余裕で綺麗、 5 枚 $0.10
-    # で安価、 SAIVerse ユーザー層は OpenAI API key 持ってる前提」 で確定
-    # (2026-05-17)。 nano_banana 系へ切替は Debug フラグから可能。
-    image_model: str = "gpt_image_2"
+    # default = gpt_image_2_6_flare (本体最新ラインナップの高速高品質モデル)。
+    image_model: str = "gpt_image_2_6_flare"
     # 生成解像度 (image_generator の QualityType: "low" / "medium" / "high" / "auto")。
     # default = low: gpt_image_2 で low でも目パチ口パク用途で十分な品質
     # (= まはー検証)。 nano_banana 系に切替えた場合は high 推奨。
@@ -295,7 +312,7 @@ class AvatarPipelineManager:
         set_name: str,
         mode: str = "matrix",
         common_prompt: str = "",
-        image_model: str = "gpt_image_2",
+        image_model: str = "gpt_image_2_6_flare",
     ) -> SetInfo:
         """新規セットを作成 (= WIP のみ、 確定品はまだ無い)。
 
@@ -405,6 +422,8 @@ class AvatarPipelineManager:
             for key, value in updates.items():
                 if not hasattr(meta, key):
                     raise ValueError(f"Unknown metadata field: {key!r}")
+                if key == "face_base_mouths":
+                    value = validate_face_base_mouths(value)
                 setattr(meta, key, value)
             meta.updated_at = _utcnow_iso()
             self._write_metadata(persona_id, set_name, meta)
@@ -707,6 +726,84 @@ def _stage_order_for_mode(mode: str) -> list[str]:
     return STAGE_ORDER_MATRIX
 
 
+def validate_face_base_mouths(mapping: Any) -> dict[str, str]:
+    """`face_base_mouths` の検証 (キーは任意の非空表情名、値は closed/half/open)。"""
+    if not isinstance(mapping, dict):
+        raise ValueError("face_base_mouths must be a dict")
+    cleaned: dict[str, str] = {}
+    for face, mouth in mapping.items():
+        if not isinstance(face, str) or not face.strip():
+            raise ValueError(f"Invalid face name in face_base_mouths: {face!r}")
+        if mouth not in VALID_BASE_MOUTHS:
+            raise ValueError(
+                f"Invalid base mouth {mouth!r} for face {face!r} "
+                f"(allowed: {list(VALID_BASE_MOUTHS)})"
+            )
+        cleaned[face.strip()] = mouth
+    return cleaned
+
+
+def resolve_face_base_mouth(
+    meta: Optional[AvatarSetMetadata], face: str,
+) -> str:
+    """表情 `face` のベース口状態 (closed / half / open) を解決する。
+
+    meta.face_base_mouths に有効値があればそれを返し、未設定なら
+    DEFAULT_FACE_BASE_MOUTHS にフォールバック (未知のカスタム表情は "closed")。
+    """
+    if meta is not None and isinstance(meta.face_base_mouths, dict):
+        val = meta.face_base_mouths.get(face)
+        if val in VALID_BASE_MOUTHS:
+            return val
+    return DEFAULT_FACE_BASE_MOUTHS.get(face, "closed")
+
+
+def sync_existing_stage3_base_copies(
+    mgr: AvatarPipelineManager,
+    persona_id: str,
+    set_name: str,
+    source_stage_id: str,
+    target: str,
+    src_path: Path,
+) -> list[str]:
+    """①/② のベース画像更新時、③ に既存のベースコピーがあれば同期更新する。
+
+    まだ ③ に該当ファイルが無い場合 (= ③ 未着手) は何もしない。
+    戻り値は同期更新した target 名のリスト。
+    """
+    meta = mgr.read_metadata(persona_id, set_name)
+    if meta is None or not src_path.exists():
+        return []
+
+    dst_specs: list[tuple[str, str]] = []
+    if meta.mode == "matrix":
+        if source_stage_id == STAGE_FACE and target == "face":
+            base_mouth = resolve_face_base_mouth(meta, "idle")
+            dst_specs.append((STAGE_MATRIX, f"idle_open_{base_mouth}"))
+        elif source_stage_id == STAGE_EXPRESSIONS and target:
+            base_mouth = resolve_face_base_mouth(meta, target)
+            dst_specs.append((STAGE_MATRIX, f"{target}_open_{base_mouth}"))
+    elif meta.mode == "layered":
+        if source_stage_id == STAGE_FACE and target == "face":
+            idle_mouth = resolve_face_base_mouth(meta, "idle")
+            dst_specs.append((STAGE_LAYERED, "eyes_open"))
+            dst_specs.append((STAGE_LAYERED, f"mouth_{idle_mouth}"))
+
+    synced: list[str] = []
+    for dst_stage, dst_target in dst_specs:
+        dst_path = (
+            mgr.stage_dir(persona_id, set_name, dst_stage) / f"{dst_target}.png"
+        )
+        if dst_path.exists():
+            shutil.copyfile(src_path, dst_path)
+            synced.append(dst_target)
+            LOGGER.info(
+                "avatar_pipeline: synced existing stage3 base %s/%s -> %s/%s",
+                source_stage_id, target, dst_stage, dst_target,
+            )
+    return synced
+
+
 # ----- Singleton accessor -----
 
 _singleton: Optional[AvatarPipelineManager] = None
@@ -734,6 +831,8 @@ __all__ = [
     "EXPRESSION_NAMES",
     "EYES_STATES",
     "MOUTH_SHAPES",
+    "VALID_BASE_MOUTHS",
+    "DEFAULT_FACE_BASE_MOUTHS",
     "MATRIX_TOTAL_FRAMES",
     "VALID_MODES",
     "AvatarSetMetadata",
@@ -742,4 +841,7 @@ __all__ = [
     "StageOutputInfo",
     "AvatarPipelineManager",
     "get_avatar_pipeline_manager",
+    "validate_face_base_mouths",
+    "resolve_face_base_mouth",
+    "sync_existing_stage3_base_copies",
 ]

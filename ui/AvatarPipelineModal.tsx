@@ -27,6 +27,7 @@ interface SetMetadata {
     mode: "matrix" | "layered";
     common_prompt: string;
     extra_prompts: Record<string, Record<string, string>>;
+    face_base_mouths?: Record<string, string>;
     trim_rect: TrimRect | null;
     trim_rect_overrides: Record<string, TrimRect>;
     parallelism: number;
@@ -88,13 +89,13 @@ const STAGE_LABELS: Record<string, string> = {
 
 const STAGE_DESCRIPTIONS: Record<string, string> = {
     "01_face":
-        "ベースになる「目を開けて口を閉じた」 1 枚を作る。生成 or 既存画像のアップロード。",
+        "ベースになる 1 枚を作る（目=open、口はベース口設定に従う）。生成 or 既存画像のアップロード。",
     "02_expressions":
-        "idle 以外の 5 表情 (happy / thinking / sad / surprised / embarrassed) のベース画像を作る。",
+        "idle 以外の 5 表情 (happy / thinking / sad / surprised / embarrassed) のベース画像を作る。表情ごとのベース口状態の設定や自前画像のアップロードも可能。",
     "03_matrix":
-        "6 表情 × 3 目状態 × 5 口形状 = 84 枚をまとめて作る。眼開・口閉の 6 枚は ①② から自動コピー。",
+        "6 表情 × 3 目状態 × 5 口形状 = 84 枚をまとめて作る。各表情のベース口状態（①②で設定）の 6 枚は ①② から自動コピー。各枠で自前画像のアップロードも可能。",
     "03_layered":
-        "目 3 枚 + 口 5 枚 = 8 枚のレイヤーを作る。実機で face レイヤーに重ねて表示。",
+        "目 3 枚 + 口 5 枚 = 8 枚のレイヤーを作る。実機で face レイヤーに重ねて表示。各枠で自前画像のアップロードも可能。",
     "04_trimmed":
         "全画像を 160×120 にトリム。avatar.bin に出力して Vessel 内なら自動転送。",
 };
@@ -107,13 +108,45 @@ const EXPRESSION_NAMES = [
 ];
 const EYES_STATES = ["open", "half", "closed"];
 const MOUTH_SHAPES = ["closed", "half", "open", "e", "u"];
-// 並び順 = dropdown 表示順 + 新規セット作成時の初期値 (= 配列先頭)。
-// backend default も "gpt_image_2" (avatar_pipeline.py:127)。
-const IMAGE_MODELS = [
-    "gpt_image_2", "gpt_image_1_5",
-    "nano_banana_2", "nano_banana_pro", "grok_imagine",
+type BaseMouthState = "closed" | "half" | "open";
+const BASE_MOUTH_OPTIONS: { value: BaseMouthState; label: string }[] = [
+    { value: "closed", label: "閉じ (closed)" },
+    { value: "half", label: "半開き (half)" },
+    { value: "open", label: "開き (open)" },
 ];
-const IMAGE_QUALITIES = ["low", "medium", "high", "auto"];
+const DEFAULT_FACE_BASE_MOUTHS: Record<string, BaseMouthState> = {
+    idle: "closed",
+    happy: "half",
+    thinking: "closed",
+    sad: "closed",
+    surprised: "open",
+    embarrassed: "closed",
+};
+
+function resolveFaceBaseMouth(
+    metadata: SetMetadata | null | undefined,
+    face: string,
+): BaseMouthState {
+    const val = metadata?.face_base_mouths?.[face];
+    if (val === "closed" || val === "half" || val === "open") return val;
+    return DEFAULT_FACE_BASE_MOUTHS[face] ?? "closed";
+}
+// 並び順 = dropdown 表示順 + 新規セット作成時の初期値 (= 配列先頭)。
+// backend default も "gpt_image_2_6_flare" (avatar_pipeline.py)。
+// 本体 builtin_data/tools/image_generator.py の ModelType と揃える。
+const IMAGE_MODELS = [
+    "gpt_image_2_6_flare",
+    "gpt_image_2_6_sunburst",
+    "gpt_image_2_5_flare",
+    "gpt_image_2_5_sunburst",
+    "gpt_image_2",
+    "gpt_image_1_5",
+    "nano_banana_2_1",
+    "nano_banana_2",
+    "nano_banana_pro",
+    "grok_imagine",
+];
+const IMAGE_QUALITIES = ["low", "medium", "high", "xhigh", "max", "auto"];
 const SUPPORTED_ASPECTS = [
     "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "4:5", "5:4",
 ];
@@ -256,6 +289,10 @@ export default function AvatarPipelineModal({
     const [faceMode, setFaceMode] = useState<"generate" | "upload">("generate");
     const [busy, setBusy] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [finalizeNotice, setFinalizeNotice] = useState<{
+        kind: "success" | "warning";
+        message: string;
+    } | null>(null);
     const [lightbox, setLightbox] = useState<{
         url: string; alt: string;
     } | null>(null);
@@ -438,8 +475,39 @@ export default function AvatarPipelineModal({
         runApi(`${STAGE_LABELS[stageId]} 完了マーク`, () =>
             callJson("POST", `/stages/${stageId}/complete`));
 
-    const finalize = () => runApi("⑤ 確定化中", () =>
-        callJson("POST", "/finalize"));
+    const finalize = async () => {
+        setFinalizeNotice(null);
+        const res = await runApi("⑤ 確定化中...", () =>
+            callJson("POST", "/finalize")) as {
+                frames?: number;
+                bytes?: number;
+                auto_transferred?: boolean;
+                auto_transfer_detail?: { error?: string } | null;
+            } | null;
+        if (!res) return null;
+        const frames = res.frames ?? 0;
+        const sizeMb = typeof res.bytes === "number"
+            ? `${(res.bytes / (1024 * 1024)).toFixed(2)} MB`
+            : "";
+        const summary = `${frames} 枚${sizeMb ? ` / ${sizeMb}` : ""}`;
+        if (res.auto_transferred) {
+            setFinalizeNotice({
+                kind: "success",
+                message: `✓ 確定化しました（${summary}）— 実機への転送も完了しました。`,
+            });
+        } else if (res.auto_transfer_detail?.error) {
+            setFinalizeNotice({
+                kind: "warning",
+                message: `✓ 確定化しました（${summary}）— 実機への自動転送に失敗しました（次回入室時に再転送されます）: ${res.auto_transfer_detail.error}`,
+            });
+        } else {
+            setFinalizeNotice({
+                kind: "success",
+                message: `✓ 確定化しました（${summary}）— 次回 Vessel 入室時に実機へ自動転送されます。`,
+            });
+        }
+        return res;
+    };
 
     // 手動 transfer は当面 UI から外す (= まはー検証 2026-05-17、
     // ⑤ finalize 時に Vessel 内ペルソナに自動転送される)。 backend
@@ -475,6 +543,22 @@ export default function AvatarPipelineModal({
                 form.append("crop_height", String(cropRect.height));
             }
             const url = `${baseUrl}/stages/01_face/upload`;
+            const res = await fetch(url, { method: "POST", body: form });
+            if (!res.ok) {
+                const errorBody = await res.json().catch(() => null);
+                throw new Error(errorBody?.detail ?? `HTTP ${res.status}`);
+            }
+            return res.json();
+        });
+
+    const uploadStageTarget = (
+        stageId: string, target: string, file: File,
+    ) =>
+        runApi(`${target} アップロード (${file.name})`, async () => {
+            const form = new FormData();
+            form.append("target", target);
+            form.append("file", file);
+            const url = `${baseUrl}/stages/${encodeURIComponent(stageId)}/upload`;
             const res = await fetch(url, { method: "POST", body: form });
             if (!res.ok) {
                 const errorBody = await res.json().catch(() => null);
@@ -535,15 +619,33 @@ export default function AvatarPipelineModal({
         }>;
     };
 
+    const [finalizingAction, setFinalizingAction] = useState<
+        "finalize" | "chain" | null
+    >(null);
+
+    const handleFinalizeClick = async () => {
+        setFinalizingAction("finalize");
+        try {
+            await finalize();
+        } finally {
+            setFinalizingAction(null);
+        }
+    };
+
     const runFinalChain = async () => {
-        // ④⑤ チェーン。 ⑥ 転送は ⑤ で Vessel 内なら自動実行
-        // (= まはー検証 2026-05-17、 手動 transfer は撤去)。
+        // ④⑤ チェーン。 ⑥ 転送は ⑤ で Vessel 内なら自動実行。
         const trimStage = stages[stages.length - 1];
         if (!trimStage) return;
-        const trimResult = await executeStage(trimStage.stage_id);
-        if (!trimResult) return;
-        await markCompleted(trimStage.stage_id);
-        await finalize();
+        setFinalizingAction("chain");
+        setFinalizeNotice(null);
+        try {
+            const trimResult = await executeStage(trimStage.stage_id);
+            if (!trimResult) return;
+            await markCompleted(trimStage.stage_id);
+            await finalize();
+        } finally {
+            setFinalizingAction(null);
+        }
     };
 
     const goToStage = (idx: number) => {
@@ -588,9 +690,13 @@ export default function AvatarPipelineModal({
                     <div>
                         <div style={styles.title}>Avatar 制作</div>
                         <div style={styles.subtitle}>
-                            {personaName} / {setName} (mode={info.wip_metadata?.mode})
+                            {personaName} / {setName}（{
+                                info.wip_metadata?.mode === "layered"
+                                    ? "layered: 14枚"
+                                    : "matrix: 90枚"
+                            }）
                             {info.is_active && (
-                                <span style={styles.activeBadge}>active</span>
+                                <span style={styles.activeBadge}>使用中</span>
                             )}
                         </div>
                     </div>
@@ -600,12 +706,11 @@ export default function AvatarPipelineModal({
                 {busy && <div style={styles.busyBox}>● {busy}</div>}
                 {chainStatus && (
                     <div style={styles.chainBox}>
-                        chain 進捗:
-                        完了 {chainStatus.completedCount}/{chainStatus.total}
-                        {chainStatus.running && <span> (実行中)</span>}
+                        生成の進捗: 完了 {chainStatus.completedCount} / {chainStatus.total} 枚
+                        {chainStatus.running && <span>（実行中）</span>}
                         {chainStatus.failedCount > 0 && (
                             <span style={styles.chainFailed}>
-                                {" "}失敗 {chainStatus.failedCount}
+                                {" "}失敗 {chainStatus.failedCount} 件
                                 {chainStatus.failedSamples.length > 0 && (
                                     <span style={styles.subtle}>
                                         {" "}例: {
@@ -622,11 +727,10 @@ export default function AvatarPipelineModal({
                 )}
                 {error && <div style={styles.errorBox}>エラー: {error}</div>}
 
-                {/* 画像生成オプション: ① でアップロードを選んだ時はプロンプ
-                    トやモデル設定が不要なので hide。 ②③④ に進んだ時 or
-                    ① で生成を選んだ時のみ表示する (まはー指摘の「先に
-                    生成/アップロード選んでから表示される流れ」)。 */}
-                {(currentStageIdx > 0 || faceMode === "generate") && (
+                {/* 画像生成オプション: ① でアップロードを選んだ時や、ローカル処理の
+                    ④ トリミング画面では不要なので非表示にする。 */}
+                {currentStage?.stage_id !== "04_trimmed"
+                    && (currentStageIdx > 0 || faceMode === "generate") && (
                     <CommonPromptSection
                         metadata={info.wip_metadata!}
                         debugMode={debugMode}
@@ -671,6 +775,59 @@ export default function AvatarPipelineModal({
                         );
                     })}
                 </div>
+
+                {/* ⑤ 確定化 (= ④ トリミング画面の上部に配置し、スクロールなしで
+                    トリミング→確定化→完了確認まで完結させる)。 */}
+                {currentStage?.stage_id === "04_trimmed" && (
+                    <div style={styles.finalSection}>
+                        <div style={styles.finalTitle}>
+                            ⑤ 確定化・実機転送
+                        </div>
+                        <div style={styles.row}>
+                            <button
+                                onClick={handleFinalizeClick}
+                                disabled={!!busy}
+                                style={
+                                    busy ? styles.btnDisabled : styles.btnPrimary
+                                }
+                            >
+                                {finalizingAction === "finalize"
+                                    ? "確定化中..."
+                                    : "⑤ 確定化（avatar.bin 書き出し）"}
+                            </button>
+                            <button
+                                onClick={runFinalChain}
+                                disabled={!!busy}
+                                style={
+                                    busy ? styles.btnDisabled : styles.btnAccent
+                                }
+                            >
+                                {finalizingAction === "chain"
+                                    ? "トリミング＋確定化中..."
+                                    : "④⑤ 全件トリミング＋確定化"}
+                            </button>
+                        </div>
+                        {finalizeNotice && (
+                            <div
+                                style={
+                                    finalizeNotice.kind === "success"
+                                        ? styles.noticeSuccess
+                                        : styles.noticeWarning
+                                }
+                            >
+                                {finalizeNotice.message}
+                            </div>
+                        )}
+                        <div style={styles.subtle}>
+                            ※ ペルソナが Vessel Building にいる場合は確定化と同時に実機へ自動転送されます。外にいる場合は次回の入室時に自動転送されます。
+                        </div>
+                        {info.has_finalized && (
+                            <div style={styles.subtle}>
+                                確定済み（チェックサム: {info.finalized_checksum?.slice(0, 24)}...）
+                            </div>
+                        )}
+                    </div>
+                )}
 
                 {/* 現在段階の本体 */}
                 <div style={styles.stageBody}>
@@ -721,6 +878,16 @@ export default function AvatarPipelineModal({
                                         currentStage.stage_id,
                                         target, extra,
                                     )}
+                                onUploadTarget={
+                                    currentStage.stage_id !== "04_trimmed"
+                                        ? (target, file) =>
+                                            uploadStageTarget(
+                                                currentStage.stage_id,
+                                                target,
+                                                file,
+                                            )
+                                        : undefined
+                                }
                                 onMarkCompleted={() =>
                                     markCompleted(currentStage.stage_id)}
                                 onUpdateMetadata={updateMetadata}
@@ -734,39 +901,6 @@ export default function AvatarPipelineModal({
                     )}
                 </div>
 
-                {/* ⑤ + 連続実行 (= ④の時に表示)。 ⑥ 転送は ⑤ で自動。 */}
-                {currentStage?.stage_id === "04_trimmed" && (
-                    <div style={styles.finalSection}>
-                        <div style={styles.finalTitle}>
-                            ⑤ 確定化:
-                        </div>
-                        <button
-                            onClick={finalize}
-                            disabled={!!busy}
-                            style={styles.btnPrimary}
-                        >
-                            ⑤ 確定化 (avatar.bin 書き出し)
-                        </button>
-                        <button
-                            onClick={runFinalChain}
-                            disabled={!!busy}
-                            style={styles.btnAccent}
-                        >
-                            ④⑤ 連続実行
-                        </button>
-                        <div style={styles.subtle}>
-                            ※ ペルソナが Vessel Building 内なら ⑤ で
-                            自動 device 転送、 外にいる場合は次の入室で
-                            自動転送される。
-                        </div>
-                        {info.has_finalized && (
-                            <div style={styles.subtle}>
-                                確定品: {info.finalized_checksum?.slice(0, 24)}...
-                            </div>
-                        )}
-                    </div>
-                )}
-
                 {/* Lightbox (= サムネイル拡大表示) */}
                 {lightbox && (
                     <Lightbox
@@ -776,22 +910,39 @@ export default function AvatarPipelineModal({
                     />
                 )}
 
-                {/* ナビ */}
+                {/* ナビ: ① では「前へ」を出さず、④ では「次へ」を出さない */}
                 <div style={styles.navBar}>
-                    <button
-                        onClick={() => goToStage(currentStageIdx - 1)}
-                        disabled={currentStageIdx === 0}
-                        style={styles.btn}
-                    >
-                        ← 前へ
-                    </button>
-                    <button
-                        onClick={() => goToStage(currentStageIdx + 1)}
-                        disabled={currentStageIdx === stages.length - 1}
-                        style={styles.btn}
-                    >
-                        次へ →
-                    </button>
+                    <div>
+                        {currentStageIdx > 0 && (
+                            <button
+                                onClick={() => goToStage(currentStageIdx - 1)}
+                                style={styles.btn}
+                            >
+                                ← 前へ
+                            </button>
+                        )}
+                    </div>
+                    <div>
+                        {currentStageIdx < stages.length - 1 && (() => {
+                            const canAdvance = (currentStage?.files.length ?? 0) > 0;
+                            return (
+                                <button
+                                    onClick={() => goToStage(currentStageIdx + 1)}
+                                    disabled={!canAdvance}
+                                    title={
+                                        canAdvance
+                                            ? undefined
+                                            : "この段階の画像を 1 枚以上用意すると次へ進めます"
+                                    }
+                                    style={
+                                        canAdvance ? styles.btn : styles.btnDisabled
+                                    }
+                                >
+                                    次へ →
+                                </button>
+                            );
+                        })()}
+                    </div>
                 </div>
             </div>
         </Overlay>
@@ -863,13 +1014,10 @@ function AnimationPreviewSection({
         eyes: "open", mouth: "closed",
     });
 
-    // どの段階から画像を取るか決定: 04_trimmed > 03_matrix/03_layered。
-    const sourceStageId = useMemo(() => {
-        const trimmed = stages.find((s) => s.stage_id === "04_trimmed");
-        if (trimmed && trimmed.files.length > 0) return "04_trimmed";
-        if (mode === "matrix") return "03_matrix";
-        return "03_layered";
-    }, [stages, mode]);
+    // ③ 画面内プレビューなので常に現在の ③ 段階 (03_matrix / 03_layered) を参照する。
+    // 以前のように 04_trimmed を優先すると、③ で差し替え・再生成しても
+    // 古いトリミング結果が表示され続けてしまう。
+    const sourceStageId = mode === "matrix" ? "03_matrix" : "03_layered";
 
     const sourceStage = stages.find((s) => s.stage_id === sourceStageId);
     const availableTargets = useMemo(
@@ -1005,8 +1153,7 @@ function AnimationPreviewSection({
             <summary style={styles.sectionTitle}>
                 アニメーションプレビュー
                 <span style={styles.subtle}>
-                    (source: {sourceStageId},
-                    available: {availableTargets.size} frames)
+                    {" "}（{availableTargets.size} 枚読み込み済み）
                 </span>
             </summary>
             <div style={styles.animPreviewLayout}>
@@ -1059,9 +1206,9 @@ function AnimationPreviewSection({
                             style={styles.select}
                         >
                             <option value="blink">瞬き ON</option>
-                            <option value="open">常時 open</option>
-                            <option value="half">常時 half</option>
-                            <option value="closed">常時 closed</option>
+                            <option value="open">開き固定</option>
+                            <option value="half">半開き固定</option>
+                            <option value="closed">閉じ固定</option>
                         </select>
                     </div>
                     <div style={styles.row}>
@@ -1073,11 +1220,11 @@ function AnimationPreviewSection({
                             style={styles.select}
                         >
                             <option value="lipsync">
-                                口パク (open/half/closed)
+                                口パク
                             </option>
-                            <option value="closed">常時 closed</option>
+                            <option value="closed">閉じ固定</option>
                             <option value="all_random">
-                                全ランダム (e/u 含む)
+                                ランダム（あいうえお）
                             </option>
                         </select>
                     </div>
@@ -1104,7 +1251,7 @@ function AnimationPreviewSection({
                             {playing ? "停止" : "▶ 再生"}
                         </button>
                         <span style={styles.subtle}>
-                            current: eyes={current.eyes}, mouth={current.mouth}
+                            表示中: 目={current.eyes} / 口={current.mouth}
                         </span>
                     </div>
                     {availableTargets.size === 0 && (
@@ -1400,7 +1547,7 @@ function CommonPromptSection({
 
 function StagePanel({
     stage, allStages, metadata, imageUrl, onZoom, debugMode, getTemplate,
-    onExecute, onRegenerate, onMarkCompleted, onUpdateMetadata,
+    onExecute, onRegenerate, onUploadTarget, onMarkCompleted, onUpdateMetadata,
     onImportZip,
     chainStatus, setChainStatus, fetchInfo,
 }: {
@@ -1415,6 +1562,7 @@ function StagePanel({
     getTemplate: (stageId: string, target: string) => string;
     onExecute: (params?: object) => Promise<unknown>;
     onRegenerate: (target: string, extraPrompt?: string) => Promise<unknown>;
+    onUploadTarget?: (target: string, file: File) => Promise<unknown>;
     onMarkCompleted: () => Promise<unknown>;
     onUpdateMetadata: (updates: Partial<SetMetadata>) => Promise<unknown>;
     onImportZip?: (file: File, requireComplete: boolean) => Promise<unknown>;
@@ -1584,6 +1732,15 @@ function StagePanel({
         onUpdateMetadata({ extra_prompts: newExtras });
     };
 
+    const updateBaseMouth = (face: string, mouth: BaseMouthState) => {
+        const nextMap = {
+            ...DEFAULT_FACE_BASE_MOUTHS,
+            ...(metadata.face_base_mouths || {}),
+            [face]: mouth,
+        };
+        onUpdateMetadata({ face_base_mouths: nextMap });
+    };
+
     return (
         <div>
             <div style={styles.stageHeader}>
@@ -1592,7 +1749,9 @@ function StagePanel({
                         {STAGE_LABELS[stageId]}
                         {stage.files.length > 0 && (
                             <span style={styles.completedBadge}>
-                                ✓ {stage.files.length} 枚生成済み
+                                {stageId === "04_trimmed"
+                                    ? `✓ ${stage.files.length} 枚トリミング済み`
+                                    : `✓ ${stage.files.length} 枚生成済み`}
                             </span>
                         )}
                     </div>
@@ -1603,55 +1762,71 @@ function StagePanel({
                     )}
                 </div>
                 <div style={styles.stageHeaderActions}>
-                    <button
-                        onClick={async () => {
-                            // ③ は per-target parallel chain (= まはー検証
-                            // 2026-05-17、 502 timeout 圏外、 進捗が target
-                            // 単位で見える)。
-                            if (
-                                stageId === "03_matrix"
-                                || stageId === "03_layered"
-                            ) {
-                                await runMatrixChain(true);
-                                return;
-                            }
-                            await onExecute({ skip_existing: true });
-                        }}
-                        style={styles.btnPrimary}
-                    >
-                        {stage.files.length > 0
-                            ? "未生成のものだけ生成"
-                            : "全件生成"}
-                    </button>
-                    {/* 強制再生成: matrix は face checkbox で対象選択。
-                        layered / ② は即実行 (= 全件上書き)。 */}
-                    {stage.files.length > 0 && (
-                        <button
-                            onClick={() => {
-                                if (stageId === "03_matrix") {
-                                    setForceFacePicker(new Set(FACE_NAMES));
-                                    return;
-                                }
-                                if (
-                                    !confirm(
-                                        "既存ファイルも上書きして全件再生成"
-                                        + " (= API コスト発生)。 続行?",
-                                    )
-                                ) return;
-                                if (stageId === "03_layered") {
-                                    runMatrixChain(false);
-                                    return;
-                                }
-                                onExecute().catch(() => undefined);
-                            }}
-                            style={styles.btn}
+                    {stageId === "04_trimmed" ? (
+                        <AsyncButton
+                            onClick={() => onExecute()}
+                            busyLabel="トリミング中..."
+                            style={styles.btnPrimary}
+                            busyStyle={styles.btnDisabled}
                         >
-                            強制再生成
-                        </button>
+                            {stage.files.length > 0
+                                ? "全件再トリミング"
+                                : "全件トリミング"}
+                        </AsyncButton>
+                    ) : (
+                        <>
+                            <button
+                                onClick={async () => {
+                                    // ③ は per-target parallel chain (= まはー検証
+                                    // 2026-05-17、 502 timeout 圏外、 進捗が target
+                                    // 単位で見える)。
+                                    if (
+                                        stageId === "03_matrix"
+                                        || stageId === "03_layered"
+                                    ) {
+                                        await runMatrixChain(true);
+                                        return;
+                                    }
+                                    await onExecute({ skip_existing: true });
+                                }}
+                                style={styles.btnPrimary}
+                            >
+                                {stage.files.length > 0
+                                    ? "未生成のものだけ生成"
+                                    : "全件生成"}
+                            </button>
+                            {/* 強制再生成: matrix は face checkbox で対象選択。
+                                layered / ② は即実行 (= 全件上書き)。 */}
+                            {stage.files.length > 0 && (
+                                <button
+                                    onClick={() => {
+                                        if (stageId === "03_matrix") {
+                                            setForceFacePicker(new Set(FACE_NAMES));
+                                            return;
+                                        }
+                                        if (
+                                            !confirm(
+                                                "既存ファイルも上書きして全件再生成"
+                                                + " (= API コスト発生)。 続行?",
+                                            )
+                                        ) return;
+                                        if (stageId === "03_layered") {
+                                            runMatrixChain(false);
+                                            return;
+                                        }
+                                        onExecute().catch(() => undefined);
+                                    }}
+                                    style={styles.btn}
+                                >
+                                    強制再生成
+                                </button>
+                            )}
+                        </>
                     )}
                     {/* ② 単発テスト */}
                     {stageId === "02_expressions" && (
-                        <>
+                        <div style={styles.singleTestGroup}>
+                            <span style={styles.subtle}>単発:</span>
                             <select
                                 value={singleExpr}
                                 onChange={(e) =>
@@ -1669,11 +1844,12 @@ function StagePanel({
                             >
                                 単発テスト
                             </button>
-                        </>
+                        </div>
                     )}
                     {/* ③ matrix 単発テスト (= 3 dropdown で組合せ構築) */}
                     {stageId === "03_matrix" && (
-                        <>
+                        <div style={styles.singleTestGroup}>
+                            <span style={styles.subtle}>単発:</span>
                             <select
                                 value={singleFace}
                                 onChange={(e) =>
@@ -1718,11 +1894,12 @@ function StagePanel({
                             >
                                 単発テスト
                             </button>
-                        </>
+                        </div>
                     )}
                     {/* ③ layered 単発テスト */}
                     {stageId === "03_layered" && (
-                        <>
+                        <div style={styles.singleTestGroup}>
+                            <span style={styles.subtle}>単発:</span>
                             <select
                                 value={singleLayered}
                                 onChange={(e) =>
@@ -1740,7 +1917,7 @@ function StagePanel({
                             >
                                 単発テスト
                             </button>
-                        </>
+                        </div>
                     )}
                 </div>
             </div>
@@ -1827,32 +2004,53 @@ function StagePanel({
             const renderCell = (target: string) => {
                 const file = stage.files.find((f) => f.target === target);
                 const extra = stageExtras[target] || "";
-                // ③ matrix では eyes=open && mouth=closed の 6 セルは
-                // ①② から自動 copy される (avatar_generator.py:737-754)。
-                // ③ 実行前でも ①② に base 画像があれば「再利用予定」 と
-                // 分かるよう、 そちらの画像をプレビュー表示する。
+                // ③ matrix では eyes=open && mouth=baseMouth の 6 セルは
+                // ①② から自動 copy される。 ③ 実行前でも ①② に base 画像が
+                // あれば「再利用予定」 と分かるよう、 そちらの画像をプレビュー表示する。
                 const baseReuse = (() => {
                     if (file) return null;
-                    if (stageId !== "03_matrix") return null;
-                    const parts = target.split("_");
-                    if (parts.length !== 3) return null;
-                    const [face, eyes, mouth] = parts;
-                    if (eyes !== "open" || mouth !== "closed") return null;
-                    const baseStageId = face === "idle"
-                        ? "01_face" : "02_expressions";
-                    const baseTarget = face === "idle" ? "face" : face;
-                    const baseStage = allStages.find(
-                        (s) => s.stage_id === baseStageId,
-                    );
-                    if (!baseStage) return null;
-                    const hasBase = baseStage.files.some(
-                        (f) => f.target === baseTarget,
-                    );
-                    if (!hasBase) return null;
-                    return {
-                        url: imageUrl(baseStageId, `${baseTarget}.png`),
-                        label: face === "idle" ? "① 元顔" : "② 表情差分",
-                    };
+                    if (stageId === "03_matrix") {
+                        const parts = target.split("_");
+                        if (parts.length !== 3) return null;
+                        const [face, eyes, mouth] = parts;
+                        const baseMouth = resolveFaceBaseMouth(metadata, face);
+                        if (eyes !== "open" || mouth !== baseMouth) return null;
+                        const baseStageId = face === "idle"
+                            ? "01_face" : "02_expressions";
+                        const baseTarget = face === "idle" ? "face" : face;
+                        const baseStage = allStages.find(
+                            (s) => s.stage_id === baseStageId,
+                        );
+                        if (!baseStage) return null;
+                        const hasBase = baseStage.files.some(
+                            (f) => f.target === baseTarget,
+                        );
+                        if (!hasBase) return null;
+                        return {
+                            url: imageUrl(baseStageId, `${baseTarget}.png`),
+                            label: face === "idle" ? "① 元顔" : "② 表情差分",
+                        };
+                    }
+                    if (stageId === "03_layered") {
+                        const idleMouth = resolveFaceBaseMouth(metadata, "idle");
+                        if (
+                            target !== "eyes_open"
+                            && target !== `mouth_${idleMouth}`
+                        ) {
+                            return null;
+                        }
+                        const faceStage = allStages.find(
+                            (s) => s.stage_id === "01_face",
+                        );
+                        if (!faceStage?.files.some((f) => f.target === "face")) {
+                            return null;
+                        }
+                        return {
+                            url: imageUrl("01_face", "face.png"),
+                            label: "① 元顔",
+                        };
+                    }
+                    return null;
                 })();
                 return (
                     <div key={target} style={styles.targetCell}>
@@ -1877,6 +2075,26 @@ function StagePanel({
                             <div style={styles.previewEmpty}>未生成</div>
                         )}
                         <div style={styles.targetLabel}>{target}</div>
+                        {stageId === "02_expressions" && (
+                            <div style={styles.baseMouthRow}>
+                                <label style={styles.baseMouthLabel}>ベース口:</label>
+                                <select
+                                    value={resolveFaceBaseMouth(metadata, target)}
+                                    onChange={(e) =>
+                                        updateBaseMouth(
+                                            target,
+                                            e.target.value as BaseMouthState,
+                                        )}
+                                    style={styles.selectSmall}
+                                >
+                                    {BASE_MOUTH_OPTIONS.map((opt) => (
+                                        <option key={opt.value} value={opt.value}>
+                                            {opt.label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        )}
                         {stageId !== "04_trimmed" && (
                             <>
                                 <ExtraPromptInput
@@ -1887,20 +2105,41 @@ function StagePanel({
                                     onSave={(val) =>
                                         updateExtra(target, val)}
                                 />
-                                {file && (
-                                    <AsyncButton
-                                        onClick={() =>
-                                            onRegenerate(
-                                                target,
-                                                extra || undefined,
-                                            )}
-                                        busyLabel="生成中..."
-                                        style={styles.regenBtn}
-                                        busyStyle={styles.regenBtnBusy}
-                                    >
-                                        再生成
-                                    </AsyncButton>
-                                )}
+                                <div style={styles.targetCellActions}>
+                                    {file && (
+                                        <AsyncButton
+                                            onClick={() =>
+                                                onRegenerate(
+                                                    target,
+                                                    extra || undefined,
+                                                )}
+                                            busyLabel="生成中..."
+                                            style={styles.regenBtn}
+                                            busyStyle={styles.regenBtnBusy}
+                                        >
+                                            再生成
+                                        </AsyncButton>
+                                    )}
+                                    {!file && baseReuse && (
+                                        <AsyncButton
+                                            onClick={() => onRegenerate(target)}
+                                            busyLabel="コピー中..."
+                                            style={styles.regenBtn}
+                                            busyStyle={styles.regenBtnBusy}
+                                        >
+                                            コピー確定
+                                        </AsyncButton>
+                                    )}
+                                    {onUploadTarget && (
+                                        <TargetUploadButton
+                                            label={file ? "画像差し替え" : "画像アップロード"}
+                                            onUpload={(selectedFile) =>
+                                                onUploadTarget(target, selectedFile)}
+                                            style={styles.regenBtn}
+                                            busyStyle={styles.regenBtnBusy}
+                                        />
+                                    )}
+                                </div>
                             </>
                         )}
                     </div>
@@ -1917,7 +2156,7 @@ function StagePanel({
                             return (
                                 <div key={face} style={styles.matrixFaceGroup}>
                                     <div style={styles.matrixFaceHeader}>
-                                        {face}
+                                        {face} (base: open / {resolveFaceBaseMouth(metadata, face)})
                                     </div>
                                     <div style={styles.targetGrid}>
                                         {faceTargets.map(renderCell)}
@@ -1973,6 +2212,54 @@ function AsyncButton({
         >
             {loading ? busyLabel : children}
         </button>
+    );
+}
+
+// ----- per-target 画像アップロードボタン (= ② / ③ の各セルに配置) -----
+
+function TargetUploadButton({
+    label, onUpload, style, busyStyle, disabled,
+}: {
+    label: string;
+    onUpload: (file: File) => Promise<unknown>;
+    style?: React.CSSProperties;
+    busyStyle?: React.CSSProperties;
+    disabled?: boolean;
+}) {
+    const inputRef = useRef<HTMLInputElement | null>(null);
+    const [uploading, setUploading] = useState(false);
+    const effective = (uploading || disabled) ? busyStyle ?? style : style;
+
+    const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        e.target.value = "";
+        if (!file || uploading) return;
+        setUploading(true);
+        try {
+            await onUpload(file);
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    return (
+        <>
+            <input
+                ref={inputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleChange}
+                style={{ display: "none" }}
+            />
+            <button
+                type="button"
+                disabled={uploading || disabled}
+                onClick={() => inputRef.current?.click()}
+                style={effective}
+            >
+                {uploading ? "アップロード中..." : label}
+            </button>
+        </>
     );
 }
 
@@ -2145,7 +2432,7 @@ function FaceStagePanel({
                 </div>
             </div>
 
-            {/* 経路切替 (= 生成 / アップロード) */}
+            {/* 経路切替 (= 生成 / アップロード) + idle ベース口状態 */}
             <div style={styles.row}>
                 <label style={styles.checkboxLabel}>
                     <input
@@ -2153,7 +2440,7 @@ function FaceStagePanel({
                         checked={mode === "generate"}
                         onChange={() => setMode("generate")}
                     />
-                    生成 (= プロンプト + 任意参照画像)
+                    AI で生成
                 </label>
                 <label style={styles.checkboxLabel}>
                     <input
@@ -2161,8 +2448,27 @@ function FaceStagePanel({
                         checked={mode === "upload"}
                         onChange={() => setMode("upload")}
                     />
-                    アップロード (= 既存画像を直接配置)
+                    手持ちの画像をアップロード
                 </label>
+                <label style={styles.label}>idle ベース口:</label>
+                <select
+                    value={resolveFaceBaseMouth(metadata, "idle")}
+                    onChange={(e) => {
+                        const nextMap = {
+                            ...DEFAULT_FACE_BASE_MOUTHS,
+                            ...(metadata.face_base_mouths || {}),
+                            idle: e.target.value as BaseMouthState,
+                        };
+                        onUpdateMetadata({ face_base_mouths: nextMap });
+                    }}
+                    style={styles.select}
+                >
+                    {BASE_MOUTH_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                        </option>
+                    ))}
+                </select>
             </div>
 
             {debugMode && (
@@ -2456,11 +2762,10 @@ function FaceUploadSubpanel({
             {analysis && imgPreviewUrl && (
                 <>
                     <div style={styles.subtle}>
-                        サイズ: {analysis.width}×{analysis.height}、
-                        推奨アス比: {analysis.suggested_aspect}
+                        元画像サイズ: {analysis.width}×{analysis.height}（推奨の縦横比: {analysis.suggested_aspect}）
                     </div>
                     <div style={styles.row}>
-                        <label style={styles.label}>アス比:</label>
+                        <label style={styles.label}>縦横比:</label>
                         <select
                             value={targetAspect}
                             onChange={(e) => applyAspect(e.target.value)}
@@ -2471,13 +2776,11 @@ function FaceUploadSubpanel({
                             ))}
                         </select>
                         <span style={styles.subtle}>
-                            ②③ は {targetAspect} で生成されます (= crop
-                            枠の実アス比に自動追従)
+                            ②③ も {targetAspect} で生成されます（切り抜き枠の比率に自動追従）
                         </span>
                     </div>
                     <div style={styles.label}>
-                        クロップ範囲 (ドラッグで調整可能、 初期値は中央の
-                        {" "}{targetAspect} 矩形):
+                        切り抜き範囲（ドラッグで位置・サイズを調整可能）:
                     </div>
                     <TrimRectVisualEditor
                         imageSrc={imgPreviewUrl}
@@ -2543,7 +2846,7 @@ function FaceUploadSubpanel({
                             disabled={!file}
                             style={styles.btnPrimary}
                         >
-                            アップロード + 配置
+                            この範囲で配置
                         </button>
                     </div>
                 </>
@@ -2582,7 +2885,7 @@ function ForceFacePicker({
     return (
         <div style={styles.debugBox}>
             <div style={styles.label}>
-                強制再生成する face を選択 (= 既存上書き、 API コスト発生):
+                再生成する表情を選択（既存画像を上書き・API コスト発生）:
             </div>
             <div style={styles.row}>
                 {FACE_NAMES.map((face) => (
@@ -2598,15 +2901,15 @@ function ForceFacePicker({
             </div>
             <div style={styles.row}>
                 <button onClick={() => setAll(true)} style={styles.btn}>
-                    全 ON
+                    すべて選択
                 </button>
                 <button onClick={() => setAll(false)} style={styles.btn}>
-                    全 OFF
+                    すべて解除
                 </button>
                 <span style={styles.subtle}>
-                    生成見込: {estimatedCount} 件 (= 約 ${
+                    生成見込: {estimatedCount} 枚（目安: 約 ${
                         (estimatedCount * 0.02).toFixed(2)
-                    } / GPT-Image-2 low)
+                    }）
                 </span>
             </div>
             <div style={styles.row}>
@@ -2703,14 +3006,11 @@ function Stage3ConstraintEditor({
                         onClick={resetToDefault}
                         style={styles.btn}
                     >
-                        default 文に戻す
+                        初期設定に戻す
                     </button>
                 )}
                 <span style={styles.subtle}>
-                    ポーズ・構図・表す感情の維持を AI に指示する文
-                    (= まはー検証 2026-05-17)。 ③ 段階の全生成プロンプトの
-                    先頭に追加される。 ② の長文表情テンプレは ③ には持ち込ま
-                    ない (= 「sad expression」 など端的に明示のみ)。
+                    ポーズ・構図・表情を変えずに目と口だけ差し替えるよう AI へ伝える共通指示です。③の全生成プロンプトの先頭に自動で追加されます。
                 </span>
             </div>
         </details>
@@ -2748,14 +3048,18 @@ function VariantOverridesSection({
         return onUpdateMetadata({ trim_rect_overrides: next });
     };
 
+    const hasAnyOverride = Object.keys(overrides).length > 0;
+
     return (
-        <details style={styles.section} open>
+        <details style={styles.section} open={hasAnyOverride}>
             <summary style={styles.sectionTitle}>
-                Variant 単位 rect 上書き
+                {mode === "matrix"
+                    ? "表情ごとのトリミング範囲を個別調整"
+                    : "パーツごとのトリミング範囲を個別調整"}
                 <span style={styles.subtle}>
-                    {" "}({mode === "matrix"
-                        ? "face 単位、 同 face の 15 セルは同 rect"
-                        : "target 単位、 14 個別"})
+                    {" "}（{mode === "matrix"
+                        ? "顔の位置がズレる表情だけ個別に調整できます"
+                        : "14 パーツごとに個別に調整できます"}）
                 </span>
             </summary>
             <div style={styles.variantList}>
@@ -2776,8 +3080,13 @@ function VariantOverridesSection({
                             onRunVariantTrim(variantKey)}
                         runLabel={
                             mode === "matrix"
-                                ? `${variantKey} の 14-15 セルを trim`
-                                : `${variantKey} を trim`
+                                ? `${variantKey} の全差分（15枚）をトリミング`
+                                : `${variantKey} をトリミング`
+                        }
+                        collapsedRunLabel={
+                            mode === "matrix"
+                                ? "この表情だけトリミング"
+                                : "このパーツだけトリミング"
                         }
                     />
                 ))}
@@ -2788,7 +3097,7 @@ function VariantOverridesSection({
 
 function VariantTrimRow({
     variantKey, defaultRect, overrides, sampleImageUrl,
-    onSaveOverride, onRunVariantTrim, runLabel,
+    onSaveOverride, onRunVariantTrim, runLabel, collapsedRunLabel,
 }: {
     variantKey: string;
     defaultRect: TrimRect | null;
@@ -2797,6 +3106,7 @@ function VariantTrimRow({
     onSaveOverride: (rect: TrimRect | null) => Promise<unknown>;
     onRunVariantTrim: () => Promise<unknown>;
     runLabel: string;
+    collapsedRunLabel: string;
 }) {
     const existing = overrides[variantKey];
     const [expanded, setExpanded] = useState<boolean>(!!existing);
@@ -2846,21 +3156,21 @@ function VariantTrimRow({
             <div style={styles.variantRowCollapsed}>
                 <span style={styles.variantLabel}>{variantKey}</span>
                 <span style={styles.subtle}>
-                    {existing ? "(上書き設定済み)" : "(default 使用)"}
+                    {existing ? "（個別設定あり）" : "（共通設定を使用）"}
                 </span>
                 <button
                     onClick={() => setExpanded(true)}
                     style={styles.btn}
                 >
-                    {existing ? "編集" : "rect 上書き"}
+                    {existing ? "調整を編集" : "個別に調整"}
                 </button>
                 <AsyncButton
                     onClick={onRunVariantTrim}
-                    busyLabel="trim 中..."
+                    busyLabel="トリミング中..."
                     style={styles.btnAccent}
                     busyStyle={styles.btnDisabled}
                 >
-                    単発 trim
+                    {collapsedRunLabel}
                 </AsyncButton>
             </div>
         );
@@ -2922,7 +3232,7 @@ function VariantTrimRow({
             <div style={styles.row}>
                 <AsyncButton
                     onClick={onRunVariantTrim}
-                    busyLabel="trim 中..."
+                    busyLabel="トリミング中..."
                     style={styles.btnAccent}
                     busyStyle={styles.btnDisabled}
                 >
@@ -2933,7 +3243,7 @@ function VariantTrimRow({
                         onClick={() => onSaveOverride(null)}
                         style={styles.btn}
                     >
-                        上書き削除
+                        共通設定に戻す
                     </button>
                 )}
                 <button
@@ -3312,17 +3622,15 @@ function TrimRectVisualEditor({
                         checked={lockAspect}
                         onChange={(e) => onLockAspectChange(e.target.checked)}
                     />
-                    {lockAspectRatio} アス比固定{
+                    縦横比 {lockAspectRatio} で固定{
                         lockAspectRatio === "4:3"
-                            ? " (= ⑤ 160×120 出力で歪まない)"
+                            ? "（実機画面 160×120 で歪まない）"
                             : ""
                     }
                 </label>
                 {imgNatural && displayRect && (
                     <span style={styles.subtle}>
-                        画像 {imgNatural.w}×{imgNatural.h} /
-                        rect ({displayRect.x},{displayRect.y})
-                        {displayRect.width}×{displayRect.height}
+                        元画像 {imgNatural.w}×{imgNatural.h} / 切り抜き {displayRect.width}×{displayRect.height}（位置: {displayRect.x}, {displayRect.y}）
                     </span>
                 )}
             </div>
@@ -3446,8 +3754,7 @@ function TrimRectEditor({
     return (
         <div style={styles.trimSection}>
             <div style={styles.label}>
-                トリミング矩形 (= 編集中プレビュー画像での座標、 他の画像
-                にはサイズ比でスケールして適用、 自動保存):
+                全体のトリミング範囲（ドラッグで位置・サイズを調整・自動保存）:
             </div>
             <TrimRectVisualEditor
                 imageSrc={sampleImageUrl}
@@ -3500,13 +3807,12 @@ function ZipImportSection({
     const expectedCount = mode === "matrix" ? 90 : 14;
 
     return (
-        <div style={styles.trimSection}>
-            <div style={styles.label}>
-                zip / フォルダ直接投入 (= ①②③ をスキップして手持ち画像で
-                ④ から開始):
-            </div>
+        <details style={styles.section}>
+            <summary style={styles.sectionTitle}>
+                上級者向け: トリミング済み ZIP を一括投入
+            </summary>
             <div style={styles.subtle}>
-                zip 内に {expectedCount} 個の PNG (= mode={mode}) が必要。
+                ZIP 内に {expectedCount} 枚の PNG（{mode} モード）が必要です。
                 ファイル名規約: {
                     mode === "matrix"
                         ? "{face}_{eyes}_{mouth}.png"
@@ -3526,7 +3832,7 @@ function ZipImportSection({
                         checked={requireComplete}
                         onChange={(e) => setRequireComplete(e.target.checked)}
                     />
-                    完全性チェック (= 不足あればエラー)
+                    全枚数が揃っているかチェック
                 </label>
                 <button
                     onClick={() => file && onImport(file, requireComplete)}
@@ -3538,7 +3844,7 @@ function ZipImportSection({
                     投入
                 </button>
             </div>
-        </div>
+        </details>
     );
 }
 
@@ -3758,9 +4064,9 @@ const styles: Record<string, React.CSSProperties> = {
     },
     stageHeader: {
         display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        marginBottom: "8px",
+        flexDirection: "column",
+        gap: "8px",
+        marginBottom: "10px",
     },
     stageHeaderTitle: {
         fontSize: "13px",
@@ -3772,7 +4078,20 @@ const styles: Record<string, React.CSSProperties> = {
         marginTop: "2px",
         lineHeight: 1.4,
     },
-    stageHeaderActions: { display: "flex", gap: "6px" },
+    stageHeaderActions: {
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: "8px",
+    },
+    singleTestGroup: {
+        display: "inline-flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: "6px",
+        paddingLeft: "8px",
+        borderLeft: "1px solid var(--border-color)",
+    },
     completedBadge: {
         marginLeft: "8px",
         padding: "1px 6px",
@@ -3897,6 +4216,31 @@ const styles: Record<string, React.CSSProperties> = {
         fontSize: "10px",
         boxSizing: "border-box",
     },
+    targetCellActions: {
+        display: "flex",
+        flexWrap: "wrap",
+        gap: "4px",
+        justifyContent: "center",
+    },
+    baseMouthRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "4px",
+        marginBottom: "4px",
+    },
+    baseMouthLabel: {
+        color: "var(--text-secondary)",
+        fontSize: "10px",
+    },
+    selectSmall: {
+        padding: "2px 4px",
+        background: "var(--bg-secondary)",
+        color: "var(--text-primary)",
+        border: "1px solid var(--border-color)",
+        borderRadius: "3px",
+        fontSize: "10px",
+    },
     regenBtn: {
         padding: "3px 6px",
         background: "var(--bg-tertiary)",
@@ -3964,6 +4308,24 @@ const styles: Record<string, React.CSSProperties> = {
         fontWeight: 600,
         color: "var(--stackchan-success-soft-fg)",
     },
+    noticeSuccess: {
+        padding: "6px 10px",
+        background: "var(--bg-secondary)",
+        color: "var(--stackchan-success-soft-fg)",
+        border: "1px solid var(--stackchan-success-border)",
+        borderRadius: "4px",
+        fontSize: "11px",
+        fontWeight: 500,
+    },
+    noticeWarning: {
+        padding: "6px 10px",
+        background: "var(--stackchan-warning-soft-bg)",
+        color: "var(--stackchan-warning-soft-fg)",
+        border: "1px solid var(--stackchan-warning-border)",
+        borderRadius: "4px",
+        fontSize: "11px",
+        fontWeight: 500,
+    },
     navBar: {
         display: "flex",
         justifyContent: "space-between",
@@ -3979,6 +4341,7 @@ const styles: Record<string, React.CSSProperties> = {
         borderRadius: "3px",
         cursor: "pointer",
         fontSize: "11px",
+        whiteSpace: "nowrap",
     },
     btnPrimary: {
         padding: "4px 12px",
@@ -3988,6 +4351,7 @@ const styles: Record<string, React.CSSProperties> = {
         borderRadius: "3px",
         cursor: "pointer",
         fontSize: "11px",
+        whiteSpace: "nowrap",
     },
     btnAccent: {
         padding: "4px 12px",
@@ -3997,6 +4361,7 @@ const styles: Record<string, React.CSSProperties> = {
         borderRadius: "3px",
         cursor: "pointer",
         fontSize: "11px",
+        whiteSpace: "nowrap",
     },
     btnDisabled: {
         padding: "4px 12px",
@@ -4007,6 +4372,7 @@ const styles: Record<string, React.CSSProperties> = {
         cursor: "not-allowed",
         fontSize: "11px",
         opacity: 0.6,
+        whiteSpace: "nowrap",
     },
     subtle: {
         color: "var(--text-secondary)",
