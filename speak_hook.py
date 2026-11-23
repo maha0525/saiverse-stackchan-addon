@@ -58,6 +58,18 @@ ADDON_NAME = "saiverse-stackchan-addon"
 # この値を使う。stackchan-mcp gateway は受け取った値から 16 kHz にリサンプルする。
 _VOICE_TTS_SAMPLE_RATE = 32000
 
+# gateway への PCM POST の待ち時間 (requests の timeout=(connect, read))。
+# requests が使う urllib3 は、接続中だけでなく **body を送っている間も**
+# 一つ目の connect の値をソケットの待ち時間に使い、二つ目の read の値は
+# 送り終えて返事を待つ段階にだけ効く。gateway は受け取った音を再生の速さ
+# (20 ms ごと) でしか読まないので、再生より速く音を作るエンジン (ElevenLabs
+# など) では送り出しが詰まり、詰まりが connect の値を超えた瞬間に切れる
+# (2026-11-23、connect=5 で 5 秒を超える発話が約 5.0 秒で切れた報告)。
+# だから connect にも発話の最大長 (5 分) ぶんを入れる。送り先は SAIVerse が
+# 同じ PC で起動した gateway (127.0.0.1) なので、繋がらないときはすぐ断られ、
+# 接続を長く待つ場面は無い。
+_PCM_POST_TIMEOUT = (300, 300)
+
 
 # ----- vessel 単位 in-flight POST tracking (Phase 1: FIFO wait chain) -----
 
@@ -499,7 +511,8 @@ def _post_pcm_in_background(
                     abort_event=state.abort_requested,
                 ),
                 headers=headers,
-                timeout=(5, 300),  # connect 5s, read 300s (発話最大 5 分想定)
+                # 送信中にも connect の値が効く。理由は _PCM_POST_TIMEOUT の説明。
+                timeout=_PCM_POST_TIMEOUT,
             )
             LOGGER.debug(
                 "stackchan speak_hook[%s]: POST returned status=%d after %.2fs",
