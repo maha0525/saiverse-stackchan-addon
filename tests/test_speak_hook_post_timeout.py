@@ -12,6 +12,8 @@ requests が使う urllib3 は body を送っている間も一つ目 (connect) 
 (2) speak_hook が渡す値なら、その詰まりで切れないこと、を確かめる。
 """
 import importlib.util
+import logging
+import queue
 import socket
 import sys
 import threading
@@ -93,17 +95,67 @@ def test_connect_timeout_governs_the_upload():
     thread.join(timeout=15)
 
 
-def test_speak_hook_timeout_survives_a_stalled_upload():
+def test_speak_hook_timeout_survives_a_stalled_upload(monkeypatch, caplog):
+    """speak_hook の送信処理そのものを、読むのを止めた受け手へ向けて走らせる。"""
     speak_hook = _load_speak_hook()
     connect, read = speak_hook._PCM_POST_TIMEOUT
     # 発話の最大長 (5 分) の詰まりに耐える値であること。
     assert connect >= 300 and read >= 300
 
-    port, thread = _start_stalling_server()
-    resp = requests.post(
-        f"http://127.0.0.1:{port}/pcm",
-        data=_body(),
-        timeout=speak_hook._PCM_POST_TIMEOUT,
+    pcm_queue: "queue.Queue" = queue.Queue()
+    for piece in _body():
+        pcm_queue.put(piece)
+    pcm_queue.put(None)
+    monkeypatch.setattr(
+        speak_hook,
+        "_load_voice_tts_subscribe",
+        lambda: (lambda message_id: pcm_queue, lambda message_id: (24000, 1)),
     )
-    assert resp.status_code == 200
+
+    # 送信中の待ち時間が _STALL_SECONDS より短ければ、ここで切れる。
+    monkeypatch.setattr(speak_hook, "_PCM_POST_TIMEOUT", (_STALL_SECONDS * 2, 30))
+
+    port, thread = _start_stalling_server()
+    state = speak_hook._ActivePostState(message_id="msg-1", pulse_id="p-1")
+    with caplog.at_level(logging.INFO, logger=speak_hook.LOGGER.name):
+        speak_hook._post_pcm_in_background(
+            "msg-1", "", f"http://127.0.0.1:{port}/pcm",
+            speak_hook._VOICE_TTS_SAMPLE_RATE, "vessel-1", state, None,
+        )
     thread.join(timeout=15)
+    assert state.completed.is_set()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("PCM POST done" in m for m in messages), messages
+    assert not any("request error" in m for m in messages), messages
+
+
+def test_speak_hook_passes_its_timeout_to_requests(monkeypatch):
+    """送信処理が _PCM_POST_TIMEOUT を requests に渡していること。"""
+    speak_hook = _load_speak_hook()
+    pcm_queue: "queue.Queue" = queue.Queue()
+    pcm_queue.put(b"\x01\x00" * 160)
+    pcm_queue.put(None)
+    monkeypatch.setattr(
+        speak_hook,
+        "_load_voice_tts_subscribe",
+        lambda: (lambda message_id: pcm_queue, lambda message_id: (24000, 1)),
+    )
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+
+    def fake_post(url, data, headers, timeout):
+        seen["timeout"] = timeout
+        b"".join(data)
+        return _Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    state = speak_hook._ActivePostState(message_id="msg-1", pulse_id="p-1")
+    speak_hook._post_pcm_in_background(
+        "msg-1", "", "http://127.0.0.1:1/pcm",
+        speak_hook._VOICE_TTS_SAMPLE_RATE, "vessel-1", state, None,
+    )
+    assert seen["timeout"] == speak_hook._PCM_POST_TIMEOUT
+    assert seen["timeout"][0] >= 300
